@@ -24,7 +24,10 @@ skill inventory and skill-package contract suites remain in Magician's own
 
 This first extraction is based on Magician revision
 `aef928c000138fea035eea034118f8c23db582ed`, runtime package `0.1.73`.
-Production Rust source and portable fixtures were moved without execution changes.
+Execution modules and portable fixtures were moved without behavior changes.
+The additive `source_bytes` module exposes actual compiled source bytes for
+consumer-owned attestations, replacing brittle sibling-checkout paths. It never
+freezes an old digest; the consumer retains its existing source-review policy.
 No checks or tests were run during extraction, by explicit owner instruction;
 compilation, runtime behavior, performance, and platform qualification remain
 unverified. The workflow is manual-only and has not been dispatched.

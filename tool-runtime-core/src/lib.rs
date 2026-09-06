@@ -34,6 +34,7 @@ pub mod profile_selection;
 pub mod registry;
 pub mod replay;
 pub mod scoped_paths;
+pub mod source_bytes;
 pub mod strategy_adapter;
 pub mod tool_discovery;
 
