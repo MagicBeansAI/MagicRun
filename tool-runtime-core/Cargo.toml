@@ -1,0 +1,26 @@
+[package]
+name = "tool-runtime-core"
+version = "0.1.73"
+edition = "2021"
+authors = ["MagicBeansAI"]
+description = "Shared local tool runtime primitives for capability loading and matching"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+blake3 = "1.0"
+libc = "0.2"
+portable-pty = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tempfile = "3.8"
+tokio = { version = "1.0", features = ["sync"] }
+tracing = "0.1"
+url = "2"
+walkdir = "2.0"
+zeroize = "1"
+
+[dev-dependencies]
+static_assertions = "1"

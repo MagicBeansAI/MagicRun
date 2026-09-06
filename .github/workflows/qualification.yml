@@ -1,0 +1,18 @@
+name: Manual extraction qualification
+# Deliberately no push/PR triggers: the extraction owner requested no checks or tests.
+# Enabling automatic qualification is a later, explicit verification decision.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: make check
+      - run: make test

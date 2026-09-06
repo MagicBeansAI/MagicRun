@@ -1,0 +1,27 @@
+{
+  "_comment": "Baseline counts transferred unchanged from Magician aef928c. This is preserved review debt, not evidence that these paths were fixed or requalified during extraction.",
+  "total_violations": 11,
+  "files": {
+    "tool-runtime-core/src/bin/tool-runtime-classification.rs": {
+      "hand_rolled_atomic_write": 1
+    },
+    "tool-runtime-core/src/bin/tool-runtime-inventory.rs": {
+      "hand_rolled_atomic_write": 1
+    },
+    "tool-runtime-core/src/bin/tool-runtime-replay.rs": {
+      "hand_rolled_atomic_write": 1
+    },
+    "tool-runtime-core/src/credential_filesystem.rs": {
+      "hand_rolled_atomic_write": 4
+    },
+    "tool-runtime-core/src/credential_profile_store.rs": {
+      "hand_rolled_atomic_write": 1
+    },
+    "tool-runtime-core/src/credential_status_cache.rs": {
+      "hand_rolled_atomic_write": 1
+    },
+    "tool-runtime-core/src/scoped_paths.rs": {
+      "hand_rolled_atomic_write": 2
+    }
+  }
+}

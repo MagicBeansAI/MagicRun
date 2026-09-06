@@ -1,0 +1,82 @@
+{
+  "id": "macos-ui-automation::call",
+  "skill_id": "macos-ui-automation",
+  "action_name": "call",
+  "runtime_owner": "skill_adapter",
+  "approval_class": "native_ui_control",
+  "auth_strategies": [
+    "native_permission"
+  ],
+  "profile": {
+    "policy": "none",
+    "source": "none",
+    "selector": null,
+    "fixed_alias": null
+  },
+  "dispatch": {
+    "kind": "primitive_process",
+    "program": "python3",
+    "provider_name": null,
+    "prefix_args": [
+      "{skill_runtime_root}/scripts/cua_call.py"
+    ],
+    "action_args": [],
+    "argument_mode": "explicit_mappings",
+    "mappings": [
+      {
+        "type": "positional",
+        "param": "action_name"
+      },
+      {
+        "type": "positional",
+        "param": "args_json"
+      },
+      {
+        "type": "flag",
+        "flag": "--screenshot-out-file",
+        "param": "screenshot_out_file"
+      }
+    ],
+    "action_suffix_args": [],
+    "implementation_suffix_args": []
+  },
+  "parameters": [
+    {
+      "name": "action_name",
+      "value_kind": "string",
+      "required": true
+    },
+    {
+      "name": "args_json",
+      "value_kind": "string",
+      "required": false
+    },
+    {
+      "name": "screenshot_out_file",
+      "value_kind": "string",
+      "required": false
+    },
+    {
+      "name": "timeout_secs",
+      "value_kind": "integer",
+      "required": false
+    }
+  ],
+  "environment": {
+    "required_names": [],
+    "bindings": [],
+    "mapping_names": []
+  },
+  "cwd": null,
+  "stdin": {
+    "accepted": true,
+    "parameter_declared": false
+  },
+  "timeout": {
+    "default_secs": 30,
+    "source": "action",
+    "caller_override_supported": true
+  },
+  "output_class": "tool_output",
+  "ignored_legacy_fields": []
+}
