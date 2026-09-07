@@ -14,5 +14,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - run: make test-build-paths
+      - run: make test-architecture
       - run: make check
       - run: make test

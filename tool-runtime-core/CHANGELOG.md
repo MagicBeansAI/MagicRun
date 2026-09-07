@@ -10,6 +10,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Current development version: `0.1.73`._
 
+### Development tooling and documentation
+
+- Add the versioned runtime architecture diagram and a reviewed source/document
+  fingerprint baseline, with a drift gate in `make check` and synthetic tests.
+- Route Makefile Cargo artifacts to SSD1 when available, preserving explicit
+  overrides and a checkout-local fallback. Add isolated build-routing tests.
+- Runtime source, API and consumer-owned attestations are unchanged by these
+  tooling/documentation updates; the crate version remains `0.1.73`.
+
+The inherited entries below include consumer-owned inventory and integration
+tests. Those paths and historical results belong to Magician's workspace, not
+to the portable library's current qualification.
+
 ### Fixed - the adapter inventory test asserted on gitignored artifacts (0.1.73)
 
 - `active_adapter_inventory_names_only_existing_or_materializable_owned_sources`
@@ -72,8 +85,6 @@ _Current development version: `0.1.73`._
   lowering validates each value on its way into the envelope. Adding a nullable
   type, or coercing `null` to a declared default during lowering, would reopen
   the hole in every canonical-JSON adapter at once; this now goes red first.
-  Investigation and proof:
-  `docs/plans/2026-08-15-explicit-null-defeats-adapter-bounds.md`.
 
 ### Changed
 
@@ -253,7 +264,7 @@ _Current development version: `0.1.73`._
 
 ### Changed
 
-- Completed Phase 7 inventory/classification/replay support for QR/device, remote MCP,
+- Added inventory/classification/replay support for QR/device, remote MCP,
   browser/native, unauthenticated, and remaining secret-backed tool families.
 - Classification now diagnoses an inconsistent source join instead of relying on an
   internal panic invariant.
@@ -265,10 +276,11 @@ _Current development version: `0.1.73`._
 
 ### Verification
 
-- `make check-all` passes with the Phase 5G, service-name, generated-artifact, workspace
-  compile, frontend, and iOS gates enabled. The canonical Rust run passes all 10,158
-  executed tests with 14 explicitly skipped, followed by a clean Rust doctest pass.
+- Historical consumer-workspace verification recorded service-name,
+  generated-artifact, workspace compile, frontend and iOS gates passing, plus
+  10,158 executed Rust tests, 14 explicitly skipped and a clean Rust doctest pass.
+  These are not standalone MagicRun test counts or results for the current source.
 
 ---
 
-Older entries: [`docs/archive/changelogs/tool-runtime-core.md`](../docs/archive/changelogs/tool-runtime-core.md)
+Earlier consumer-specific release history is not included in this repository.
