@@ -3,7 +3,7 @@
   "project": "MagicRun",
   "architecture_version": "0.1.73",
   "document": "docs/architecture.md",
-  "document_sha256": "b25818265a488b23e5fb0cd6bc618a893afdda9a98d3c2b8b8916378305501b1",
+  "document_sha256": "dcc0fbc12b75aceaa0f5e08ccb8d1e396c967f7e0f43cc35ef36333c261dc4f8",
   "component_versions": {
     "tool-runtime-core": "0.1.73"
   },

@@ -54,8 +54,9 @@ a ready-to-run agent application or a credential vault.
 | **Browser credential fills** | **Not provided here** | MagicVault owns its standalone CDP and extension delivery adapters. Browser-profile helpers in this crate are not a browser-fill surface. |
 | **New HTTP requests / running stateful services** | **No dedicated delivery surface** | A host may govern a CLI that makes requests, but that is process execution—not a secure HTTP broker or generic live credential-refresh adapter. |
 
-The boundary matters: process primitives in MagicRun do **not** mean MagicVault
-already exposes `secure_new_process` or `secure_new_http`. See the
+MagicVault's standalone `0.4.0` integration uses this crate's existing public
+coordinator for `secure_new_process`; its HTTP adapter is separate. MagicRun
+itself still supplies no standalone secret-injection service. See the
 [architecture and integration limits](docs/architecture.md).
 
 ## Quick start
@@ -162,7 +163,9 @@ or credential backends.
 ### MagicRun, MagicVault and Magician
 
 - **MagicRun** owns reusable tool-execution primitives.
-- **MagicVault** owns credential custody and standalone browser-delivery surfaces.
+- **MagicVault** owns credential custody and standalone browser/process/HTTP
+  delivery surfaces, including human approval, fixed profiles and receipt-only
+  model output. Its process adapter uses MagicRun's public coordinator.
 - **Magician** supplies the integrated application, policy and execution ownership.
 
 A builder may connect a vault to MagicRun through the resolver boundary.

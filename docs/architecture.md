@@ -2,8 +2,10 @@
 
 Architecture version: `0.1.73`
 
-Baseline tag: `architecture/v0.1.73` — an immutable architecture reference, not
-a package-release announcement.
+Original immutable baseline tag: `architecture/v0.1.73`. The current reviewed
+source/document fingerprints are in [architecture-baseline.json](architecture-baseline.json).
+Consumer documentation can evolve without changing runtime source or moving the
+original tag; this document does not announce a new package release.
 
 MagicRun is the `tool-runtime-core` Rust library for trusted execution hosts.
 It is not a credential vault, a standalone agent daemon, or a generic
@@ -83,8 +85,10 @@ supervisor, launch an unrelated service, or silently replace a consumer's runtim
   not supplied merely by linking the crate.
 - **No new public surface by implication:** inventory/classification/replay helper
   binaries are development tools, not MagicVault's `secure_new_process` or an MCP
-  secret-injection service. MagicVault's standalone process/HTTP effects remain
-  unimplemented even though this library contains process primitives.
+  secret-injection service. MagicVault's standalone 0.4.0 process adapter now
+  invokes this existing public coordinator; MagicVault owns fixed destination
+  profiles, human consent, custody, durable audit and receipt-only agent output.
+  Its HTTP adapter is separate. No MagicRun runtime/API change is required.
 - **Recipient access is real:** environment/stdin/files/PTY can contain material
   inside the authorized execution boundary. Document the actual output and
   bridge mediation contract; never claim universal credential invisibility.
