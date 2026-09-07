@@ -12,6 +12,9 @@ _Current development version: `0.1.73`._
 
 ### Development tooling and documentation
 
+- Rework the public README around the product, with capability and host-integration
+  tables, source/build quick starts, a read-only Rust example, security boundaries
+  and an explicit distinction between language edition and compiler version.
 - Add the versioned runtime architecture diagram and a reviewed source/document
   fingerprint baseline, with a drift gate in `make check` and synthetic tests.
 - Route Makefile Cargo artifacts to SSD1 when available, preserving explicit
