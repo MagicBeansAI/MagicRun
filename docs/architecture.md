@@ -135,6 +135,9 @@ The ABI and categories follow Apple's XNU
 and [`reason.h`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/sys/reason.h).
 This is diagnostic evidence, not a stable production API or proof of a signal's
 sender. Unknown codes remain closed `Other` categories and require review.
+Every namespace defined in that reviewed header has a named category (including
+`INVALID`); unknown namespace values remain `OtherNamespace`. A catch-all result
+from an older decoder cannot be retrospectively assigned one of the new names.
 
 This diagnostic does change the literal batch source bytes. Consumer-owned
 source attestations must therefore change on a reviewed dependency upgrade;

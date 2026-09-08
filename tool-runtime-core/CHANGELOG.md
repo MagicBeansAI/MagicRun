@@ -12,6 +12,10 @@ _Current development version: `0.1.73`._
 
 ### Test-only process investigation
 
+- Name every namespace in the reviewed Apple header, including its invalid
+  category, with complete mapping coverage and unknown-value refusal. The first
+  consumer CI recurrence reached the prior decoder's catch-all; that failure is
+  retained and this classifier correction is not a process runtime fix.
 - Add a macOS owned-child exit-reason observation before cleanup/reap: one
   parent-only fixed-size query per captured signal exit, closed OS reason
   categories and explicit unavailable/malformed outcomes. No payload, raw code

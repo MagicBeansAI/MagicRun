@@ -3,7 +3,7 @@
   "project": "MagicRun",
   "architecture_version": "0.1.73",
   "document": "docs/architecture.md",
-  "document_sha256": "8c140074d88ae828a76f8c9f002b7f9e24694a4ebf4fb07a373115a6cea1725e",
+  "document_sha256": "b370b92fece74813be6a1fb183aae70551ca2f7066108608e0e81ae73796566c",
   "component_versions": {
     "tool-runtime-core": "0.1.73"
   },
@@ -47,7 +47,7 @@
     "tool-runtime-core/src/mcp_catalog_projection.rs": "0b68fc9261b0953d50af23bb00a8fee005c433b50ebea871e840337c77ea5a25",
     "tool-runtime-core/src/native_permission_adapter.rs": "6c6bd54f67781299a14d855e75118b273cee06cf159be039367953f61f03481a",
     "tool-runtime-core/src/phase3_qualification.rs": "21a0c18bdf781050f39ae27b881355c5f5f7ab82c99c24d65736e90e99f9df85",
-    "tool-runtime-core/src/process_test_diagnostics.rs": "19e908aee19bbf249b02472518b577c1ddbce1f62c9903f00aaffd68e0e181d2",
+    "tool-runtime-core/src/process_test_diagnostics.rs": "cd37669804671cab31c9e64d2592becc838dc44c5e7183d2f69ccc61f2344239",
     "tool-runtime-core/src/profile_selection.rs": "d69f0bf0a27435c3fe75d8a1c12f33dc3c8097025037d7a3cb829beb59850883",
     "tool-runtime-core/src/registry/mod.rs": "5a2219c3185cdd8fdf9e18255c140c16d4c917106232f1c6faf7cfc8a141de47",
     "tool-runtime-core/src/registry/types.rs": "e2399307716158051f98b4880a7c1ecfaefee72d18a664f2a0d06cbb3e5936f8",
