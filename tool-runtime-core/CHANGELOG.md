@@ -12,6 +12,12 @@ _Current development version: `0.1.73`._
 
 ### Test-only process investigation
 
+- Add a macOS owned-child exit-reason observation before cleanup/reap: one
+  parent-only fixed-size query per captured signal exit, closed OS reason
+  categories and explicit unavailable/malformed outcomes. No payload, raw code
+  or process identity is retained; normal builds do not query or include it.
+  Add scope, bounds, decoder and real self-signal regression coverage. This is
+  additional evidence collection, not a fix or a signal-sender attribution.
 - Add bounded, thread-scoped child wait/signal/cleanup observations under an
   explicit debug compiler cfg. Normal builds omit them; standard release builds
   reject the cfg. No output bytes, credentials, paths, PIDs or raw exit codes

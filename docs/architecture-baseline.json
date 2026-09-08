@@ -3,7 +3,7 @@
   "project": "MagicRun",
   "architecture_version": "0.1.73",
   "document": "docs/architecture.md",
-  "document_sha256": "ec843f31eee1d72c442296af142f28cdb4ff18d8f49cf184eb672d9356a6f7d6",
+  "document_sha256": "8c140074d88ae828a76f8c9f002b7f9e24694a4ebf4fb07a373115a6cea1725e",
   "component_versions": {
     "tool-runtime-core": "0.1.73"
   },
@@ -30,7 +30,7 @@
     "tool-runtime-core/src/credential_profile_store.rs": "1814a7c7f37a0603f4c65b841b4ae9db8220848f559053a29e97404415ee1a85",
     "tool-runtime-core/src/credential_profiles.rs": "4c3de2d4dffc75b581d04c0d9f7c3baf6f1e3f8ce5a67d0769824334fb0ebb42",
     "tool-runtime-core/src/credential_status_cache.rs": "399881232caf6d19691e43b4dd60e7fa50f1e801dc2a36e7d84cd1b553acb500",
-    "tool-runtime-core/src/governed_batch_process.rs": "13ebaa0018be12f0a999179abc22126419f6a917a148c2594a4832964c829ed6",
+    "tool-runtime-core/src/governed_batch_process.rs": "737e7c842101994cb8c6e950364bff4fb01d212de98bfd8962a7939fb4c00c6b",
     "tool-runtime-core/src/governed_execution.rs": "fc40d78097f3f1f4329c72190008b9a1e1e9c6cb724536075de680914f07ed69",
     "tool-runtime-core/src/governed_execution_authority.rs": "6bb95c0a07ca0906b93cc24b155c5050bcc903827e438e1eaaafb2de13f7347c",
     "tool-runtime-core/src/governed_execution_coordinator.rs": "bf9b7445f55f4e524a8f7cd5b265fb3cdcc5c05eda1d67b0259412072da9c368",
@@ -47,7 +47,7 @@
     "tool-runtime-core/src/mcp_catalog_projection.rs": "0b68fc9261b0953d50af23bb00a8fee005c433b50ebea871e840337c77ea5a25",
     "tool-runtime-core/src/native_permission_adapter.rs": "6c6bd54f67781299a14d855e75118b273cee06cf159be039367953f61f03481a",
     "tool-runtime-core/src/phase3_qualification.rs": "21a0c18bdf781050f39ae27b881355c5f5f7ab82c99c24d65736e90e99f9df85",
-    "tool-runtime-core/src/process_test_diagnostics.rs": "3546c1a61fcaa1cbace11a80b5ac7ad4683ea233bc51407c5975e08114d29b71",
+    "tool-runtime-core/src/process_test_diagnostics.rs": "19e908aee19bbf249b02472518b577c1ddbce1f62c9903f00aaffd68e0e181d2",
     "tool-runtime-core/src/profile_selection.rs": "d69f0bf0a27435c3fe75d8a1c12f33dc3c8097025037d7a3cb829beb59850883",
     "tool-runtime-core/src/registry/mod.rs": "5a2219c3185cdd8fdf9e18255c140c16d4c917106232f1c6faf7cfc8a141de47",
     "tool-runtime-core/src/registry/types.rs": "e2399307716158051f98b4880a7c1ecfaefee72d18a664f2a0d06cbb3e5936f8",

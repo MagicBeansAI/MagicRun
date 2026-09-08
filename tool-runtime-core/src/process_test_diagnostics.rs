@@ -57,6 +57,61 @@ pub struct WaitObservation {
     pub normal_success: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExitReason {
+    Observed(OsReason),
+    NoReason,
+    Denied,
+    NoSuchProcess,
+    Unsupported,
+    InvalidSize,
+    OtherError,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OsReason {
+    Signal(Signal),
+    Jetsam,
+    CodesigningInvalidSignature,
+    CodesigningInvalidPage,
+    CodesigningTaskAccessPort,
+    CodesigningLaunchConstraint,
+    CodesigningOther,
+    Exec(ExecReason),
+    DynamicLoader,
+    PrivacyControl,
+    Watchdog,
+    Guard,
+    Sandbox,
+    Security,
+    EndpointSecurity,
+    OtherNamespace,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecReason {
+    BadMachO,
+    SugidFailure,
+    ActivateThreadState,
+    StackAllocation,
+    AppleStringInit,
+    CopyoutStrings,
+    CopyoutDynamicLinker,
+    SecurityPolicy,
+    TaskgatedOther,
+    FairplayDecrypt,
+    Decrypt,
+    Upx,
+    No32BitExec,
+    WrongPlatform,
+    MainFdAllocation,
+    CopyoutRosetta,
+    SetDyldInfo,
+    MachineThread,
+    BadSpawnAttributes,
+    NoX86Exec,
+    MapExecFailure,
+    Other,
+}
+
 /// Closed categories only: no PIDs, raw exit codes, paths, argv, streams,
 /// environment, credentials or arbitrary strings. Deliberately not Serialize.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,6 +123,7 @@ pub struct Snapshot {
     pub wait_errors: u32,
     pub nonzero_waits: u32,
     pub last_wait: Option<WaitObservation>,
+    pub os_exit_reason: Option<ExitReason>,
     pub cleanup_before_reap: bool,
     pub termination_cleanup: bool,
     pub group_term_attempts: u32,
@@ -181,7 +237,7 @@ pub(crate) fn wait_observation(pid: libc::id_t, info: &libc::siginfo_t) {
         };
         let status = unsafe { info.si_status() };
         s.nonzero_waits = s.nonzero_waits.saturating_add(1);
-        s.last_wait = Some(WaitObservation {
+        let observation = WaitObservation {
             owned_child: observed_pid as libc::id_t == pid,
             child_notification: info.si_signo == libc::SIGCHLD,
             code,
@@ -191,8 +247,191 @@ pub(crate) fn wait_observation(pid: libc::id_t, info: &libc::siginfo_t) {
             )
             .then(|| signal(status)),
             normal_success: (code == WaitCode::Exited).then_some(status == 0),
-        });
+        };
+        s.last_wait = Some(observation);
+        record_exit_reason(s, pid, observation, query_exit_reason);
     });
+}
+
+// Called only inside an active capture, after successful WNOWAIT observation.
+// The owned unreaped child pins its identity. Never query normal exits, other
+// processes or repeated observations; the snapshot stores no PID or raw code.
+#[cfg(unix)]
+fn record_exit_reason(
+    snapshot: &mut Snapshot,
+    pid: libc::id_t,
+    observation: WaitObservation,
+    query: impl FnOnce(libc::pid_t) -> ExitReason,
+) {
+    if snapshot.os_exit_reason.is_some()
+        || !observation.owned_child
+        || !observation.child_notification
+        || !matches!(observation.code, WaitCode::Killed | WaitCode::Dumped)
+    {
+        return;
+    }
+    if let Ok(pid) = libc::pid_t::try_from(pid) {
+        if pid > 0 {
+            snapshot.os_exit_reason = Some(query(pid));
+        }
+    }
+}
+#[cfg(all(unix, not(target_os = "macos")))]
+fn query_exit_reason(_: libc::pid_t) -> ExitReason {
+    ExitReason::Unsupported
+}
+#[cfg(target_os = "macos")]
+fn query_exit_reason(pid: libc::pid_t) -> ExitReason {
+    macos_exit_reason::query(pid)
+}
+
+#[cfg(target_os = "macos")]
+mod macos_exit_reason {
+    use super::{signal, ExecReason, ExitReason, OsReason, Signal};
+
+    // XNU f6217f891ac0bb64f3d375211650a4c1ff8ca1ea:
+    // bsd/sys/proc_info_private.h (flavor), proc_info.h (packed ABI), reason.h
+    // (namespace/code), bsd/kern/proc_info.c (parent-only zombie lookup).
+    // Private flavor: diagnostics only. No dependency on it in normal builds.
+    const FLAVOR: libc::c_int = 25; // PROC_PIDEXITREASONBASICINFO, never full INFO.
+    const SIZE: usize = 24;
+
+    pub(super) fn query(pid: libc::pid_t) -> ExitReason {
+        // Packed ABI: u32 namespace, u64 code, u64 flags, u32 payload size.
+        // A byte buffer avoids unaligned Rust field references. Do not request
+        // or follow a payload pointer; flags and payload length are discarded.
+        let mut bytes = [0u8; SIZE];
+        // SAFETY: caller has just observed this exact owned child with WNOWAIT
+        // and has not reaped it. Kernel writes at most the supplied 24 bytes.
+        let count =
+            unsafe { libc::proc_pidinfo(pid, FLAVOR, 0, bytes.as_mut_ptr().cast(), SIZE as i32) };
+        let errno = if count <= 0 {
+            std::io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        };
+        decode(count, errno, &bytes)
+    }
+
+    fn decode(count: i32, errno: Option<i32>, bytes: &[u8; SIZE]) -> ExitReason {
+        if count <= 0 {
+            return match errno {
+                Some(libc::ENOENT) => ExitReason::NoReason,
+                Some(libc::EACCES | libc::EPERM) => ExitReason::Denied,
+                Some(libc::ESRCH) => ExitReason::NoSuchProcess,
+                Some(libc::EINVAL | libc::ENOTSUP | libc::ENOSYS) => ExitReason::Unsupported,
+                _ => ExitReason::OtherError,
+            };
+        }
+        if count != SIZE as i32 {
+            return ExitReason::InvalidSize;
+        }
+        let namespace = u32::from_ne_bytes(bytes[0..4].try_into().unwrap());
+        let code = u64::from_ne_bytes(bytes[4..12].try_into().unwrap());
+        let reason = match namespace {
+            1 => OsReason::Jetsam,
+            2 => OsReason::Signal(i32::try_from(code).map(signal).unwrap_or(Signal::Other)),
+            3 => match code {
+                1 => OsReason::CodesigningInvalidSignature,
+                2 => OsReason::CodesigningInvalidPage,
+                3 => OsReason::CodesigningTaskAccessPort,
+                4 => OsReason::CodesigningLaunchConstraint,
+                _ => OsReason::CodesigningOther,
+            },
+            6 => OsReason::DynamicLoader,
+            9 => OsReason::Exec(match code {
+                1 => ExecReason::BadMachO,
+                2 => ExecReason::SugidFailure,
+                3 => ExecReason::ActivateThreadState,
+                4 => ExecReason::StackAllocation,
+                5 => ExecReason::AppleStringInit,
+                6 => ExecReason::CopyoutStrings,
+                7 => ExecReason::CopyoutDynamicLinker,
+                8 => ExecReason::SecurityPolicy,
+                9 => ExecReason::TaskgatedOther,
+                10 => ExecReason::FairplayDecrypt,
+                11 => ExecReason::Decrypt,
+                12 => ExecReason::Upx,
+                13 => ExecReason::No32BitExec,
+                14 => ExecReason::WrongPlatform,
+                15 => ExecReason::MainFdAllocation,
+                16 => ExecReason::CopyoutRosetta,
+                17 => ExecReason::SetDyldInfo,
+                18 => ExecReason::MachineThread,
+                19 => ExecReason::BadSpawnAttributes,
+                20 => ExecReason::NoX86Exec,
+                21 => ExecReason::MapExecFailure,
+                _ => ExecReason::Other,
+            }),
+            11 => OsReason::PrivacyControl,
+            20 => OsReason::Watchdog,
+            23 => OsReason::Guard,
+            25 => OsReason::Sandbox,
+            26 => OsReason::Security,
+            27 => OsReason::EndpointSecurity,
+            _ => OsReason::OtherNamespace,
+        };
+        ExitReason::Observed(reason)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn fixture(namespace: u32, code: u64) -> [u8; SIZE] {
+            let mut bytes = [0xff; SIZE]; // flags/payload size must be ignored.
+            bytes[..4].copy_from_slice(&namespace.to_ne_bytes());
+            bytes[4..12].copy_from_slice(&code.to_ne_bytes());
+            bytes
+        }
+        #[test]
+        fn packed_bytes_are_classified_without_retaining_raw_codes_or_payloads() {
+            for (namespace, code, reason) in [
+                (2, libc::SIGKILL as u64, OsReason::Signal(Signal::Kill)),
+                (
+                    2,
+                    (1u64 << 32) + libc::SIGKILL as u64,
+                    OsReason::Signal(Signal::Other),
+                ),
+                (3, 1, OsReason::CodesigningInvalidSignature),
+                (3, 2, OsReason::CodesigningInvalidPage),
+                (3, 3, OsReason::CodesigningTaskAccessPort),
+                (3, 4, OsReason::CodesigningLaunchConstraint),
+                (3, u64::MAX, OsReason::CodesigningOther),
+                (9, 8, OsReason::Exec(ExecReason::SecurityPolicy)),
+                (9, 21, OsReason::Exec(ExecReason::MapExecFailure)),
+                (9, u64::MAX, OsReason::Exec(ExecReason::Other)),
+                (u32::MAX, u64::MAX, OsReason::OtherNamespace),
+            ] {
+                assert_eq!(
+                    decode(SIZE as i32, None, &fixture(namespace, code)),
+                    ExitReason::Observed(reason)
+                );
+            }
+        }
+        #[test]
+        fn unavailable_and_malformed_results_never_decode_stale_bytes() {
+            let bytes = fixture(2, libc::SIGKILL as u64);
+            for (errno, expected) in [
+                (libc::ENOENT, ExitReason::NoReason),
+                (libc::EACCES, ExitReason::Denied),
+                (libc::EPERM, ExitReason::Denied),
+                (libc::ESRCH, ExitReason::NoSuchProcess),
+                (libc::EINVAL, ExitReason::Unsupported),
+                (libc::ENOTSUP, ExitReason::Unsupported),
+                (libc::ENOSYS, ExitReason::Unsupported),
+                (libc::EIO, ExitReason::OtherError),
+                (libc::EINTR, ExitReason::OtherError), // no retry
+            ] {
+                for count in [0, -1] {
+                    assert_eq!(decode(count, Some(errno), &bytes), expected);
+                }
+            }
+            for count in [1, 12, 23, 25, i32::MAX] {
+                assert_eq!(decode(count, None, &bytes), ExitReason::InvalidSize);
+            }
+            assert_eq!(decode(0, None, &bytes), ExitReason::OtherError);
+        }
+    }
 }
 pub(crate) fn wait_error(interrupted: bool) {
     update(|s| {
@@ -252,8 +491,68 @@ pub(crate) fn reaped(result: &std::io::Result<std::process::ExitStatus>) {
 mod tests {
     use super::*;
     static_assertions::assert_not_impl_any!(Capture: Send, Sync, Clone);
+    #[cfg(unix)]
+    #[test]
+    fn exit_reason_queries_require_an_owned_signal_exit_and_are_bounded() {
+        let observed = WaitObservation {
+            owned_child: true,
+            child_notification: true,
+            code: WaitCode::Killed,
+            signal: Some(Signal::Kill),
+            normal_success: None,
+        };
+        let mut snapshot = Snapshot::default();
+        for rejected in [
+            WaitObservation {
+                owned_child: false,
+                ..observed
+            },
+            WaitObservation {
+                child_notification: false,
+                ..observed
+            },
+            WaitObservation {
+                code: WaitCode::Exited,
+                ..observed
+            },
+            WaitObservation {
+                code: WaitCode::Stopped,
+                ..observed
+            },
+            WaitObservation {
+                code: WaitCode::Continued,
+                ..observed
+            },
+        ] {
+            record_exit_reason(&mut snapshot, 1, rejected, |_| {
+                panic!("query outside scope")
+            });
+        }
+        record_exit_reason(&mut snapshot, 0, observed, |_| panic!("zero PID"));
+        record_exit_reason(&mut snapshot, u32::MAX, observed, |_| {
+            panic!("unrepresentable PID")
+        });
+        assert_eq!(snapshot.os_exit_reason, None);
+        record_exit_reason(&mut snapshot, 1, observed, |_| ExitReason::Denied);
+        record_exit_reason(&mut snapshot, 1, observed, |_| {
+            panic!("query repeated after denial")
+        });
+        assert_eq!(snapshot.os_exit_reason, Some(ExitReason::Denied));
+        let mut dumped = Snapshot::default();
+        record_exit_reason(
+            &mut dumped,
+            1,
+            WaitObservation {
+                code: WaitCode::Dumped,
+                ..observed
+            },
+            |_| ExitReason::NoReason,
+        );
+        assert_eq!(dumped.os_exit_reason, Some(ExitReason::NoReason));
+    }
     #[test]
     fn thread_scope_refuses_nesting_and_does_not_keep_unregistered_work() {
+        update(|_| panic!("uncaptured work must not run an observer query"));
         update(|s| s.spawned_children = 99);
         let first = Capture::start().unwrap();
         assert_eq!(first.snapshot(), Snapshot::default());

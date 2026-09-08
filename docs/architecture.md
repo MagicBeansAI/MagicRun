@@ -116,6 +116,26 @@ code, command, path, environment, stream bytes or credential is retained or
 printed. Signal diagnostics never select a process to terminate or alter the
 existing cleanup decision. Observing a signal does not identify its sender.
 
+For an owned signal-terminated child, the macOS observer makes at most one
+`proc_pidinfo(PROC_PIDEXITREASONBASICINFO)` call per capture, immediately after
+`waitid(WNOWAIT)` and before cleanup/reap. This private flavor supports zombie
+lookup and restricts access to the parent/parent debugger. Its fixed packed
+24-byte record is decoded into closed namespace/code categories; flags and
+payload length are discarded and the payload itself is never requested.
+Unsupported, denied, missing-reason/process and malformed-size results remain
+explicit observations, not execution errors or retry instructions. Other
+platforms record unsupported; ordinary exits and uncaptured work never query.
+No PID, raw namespace/code, payload or growing history is stored. The query
+does not modify waits, timeouts, cleanup, signals or the execution result.
+
+The ABI and categories follow Apple's XNU
+[`proc_info` implementation](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/proc_info.c),
+[`proc_info.h`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/sys/proc_info.h),
+[`private flavor`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/sys/proc_info_private.h)
+and [`reason.h`](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/sys/reason.h).
+This is diagnostic evidence, not a stable production API or proof of a signal's
+sender. Unknown codes remain closed `Other` categories and require review.
+
 This diagnostic does change the literal batch source bytes. Consumer-owned
 source attestations must therefore change on a reviewed dependency upgrade;
 they must never be frozen to preserve old approval. Magician's existing locked

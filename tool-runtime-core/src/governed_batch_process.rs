@@ -1988,8 +1988,8 @@ mod tests {
             let process = fixture.process(vec![], None, 2, 4096, 4096);
             let observation = Capture::start().unwrap();
             let result = GovernedBatchExecutor::execute(process, &GovernedBatchCancellation::new()).unwrap();
-            assert_eq!(result.terminal().terminal(), terminal);
             let snapshot = observation.snapshot();
+            assert_eq!(result.terminal().terminal(), terminal, "expected signal {signal:?}; closed observation {snapshot:?}");
             let before = snapshot.last_wait.expect("before-reap observation");
             assert_eq!(snapshot.spawned_children, 1);
             assert_eq!(snapshot.spawn_group_owned, Some(true));
@@ -1999,6 +1999,12 @@ mod tests {
             assert_eq!(before.normal_success, success);
             assert_eq!(snapshot.reaped_signal, signal);
             assert_eq!(snapshot.reaped_normal_success, success);
+            #[cfg(target_os = "macos")]
+            assert_eq!(snapshot.os_exit_reason, signal.map(|signal| {
+                crate::process_test_diagnostics::ExitReason::Observed(
+                    crate::process_test_diagnostics::OsReason::Signal(signal),
+                )
+            }));
             assert!(snapshot.cleanup_before_reap && !snapshot.termination_cleanup);
             assert_eq!(snapshot.group_term_attempts, 0);
             assert_eq!(snapshot.group_kill_attempts, 1);
