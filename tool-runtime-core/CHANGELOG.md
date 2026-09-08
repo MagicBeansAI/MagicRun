@@ -8,9 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.73`._
+_Current development version: `0.1.74`._
 
-### Test-only process investigation
+### macOS non-jailed batch launch
+
+- Use `posix_spawn` with an open-directory file action, explicit argv/env and
+  stdio, close-by-default descriptors, and a new process group. No userspace
+  fork, shell fallback or retry is introduced. macOS 10.15+ is required for this
+  backend; unavailable support fails the operation closed. Existing jailed
+  launches, PTY behavior and non-macOS backends are unchanged.
+- Preserve executable/cwd authority, parent footprint limits, output bounds,
+  cancellation and wait-before-cleanup settlement. New C-string copies zeroize
+  on drop; original authorized inputs are validated directly, not read back
+  from Command's potentially substituted malformed strings.
+- Add real no-fork positive-control, cwd replacement, closed-stdio, inheritable
+  descriptor, malformed-input, spawn-error and native-child ownership tests.
+  Diagnostic snapshots distinguish native spawn from the historical callback
+  probe; native launch does not fabricate callback completion.
+- Include the new production backend in the existing macOS batch source
+  fingerprint. Consumer upgrades still require a fresh source-attestation
+  review; no Magician checkout or dependency is updated automatically.
+
+### Earlier test-only process investigation (`0.1.73`)
 
 - Add a macOS-only shared atomic pre-exec stage probe for active synthetic
   captures. Child writes require no allocation, locks, logging or descriptors;

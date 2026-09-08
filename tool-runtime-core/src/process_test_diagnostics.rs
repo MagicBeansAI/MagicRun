@@ -29,6 +29,12 @@ pub enum PreExecStage {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnMethod {
+    StandardCommand,
+    MacosPosixSpawn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
     Kill,
     Terminate,
@@ -166,6 +172,7 @@ pub enum ExecReason {
 /// environment, credentials or arbitrary strings. Deliberately not Serialize.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
+    pub spawn_method: Option<SpawnMethod>,
     pub pre_exec_stage: Option<PreExecStage>,
     pub spawned_children: u32,
     pub spawn_group_owned: Option<bool>,
@@ -234,6 +241,10 @@ fn update(f: impl FnOnce(&mut Snapshot)) {
             f(snapshot);
         }
     });
+}
+
+pub(crate) fn spawn_method(standard: bool) {
+    update(|snapshot| snapshot.spawn_method = Some(if standard { SpawnMethod::StandardCommand } else { SpawnMethod::MacosPosixSpawn }));
 }
 
 #[cfg(unix)]

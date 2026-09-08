@@ -9,7 +9,7 @@ use std::{
     ffi::OsStr,
     fmt,
     io::{Read, Write},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::{self, Receiver, SyncSender},
@@ -28,6 +28,13 @@ use std::os::unix::{
 
 use serde::Serialize;
 use zeroize::Zeroizing;
+
+#[cfg(target_os = "macos")]
+mod macos_spawn;
+#[cfg(target_os = "macos")]
+use macos_spawn::Child;
+#[cfg(not(target_os = "macos"))]
+use std::process::Child;
 
 use crate::{
     governed_execution::{
@@ -461,35 +468,71 @@ fn execute_spawned(
             return Err(jail_unavailable());
         }
     }
+    #[cfg(target_os = "macos")]
+    let native_launch = if process.jail.is_none() {
+        Some(
+            macos_spawn::Prepared::new(macos_spawn::Request {
+                program: executable.as_path(),
+                arguments: process
+                    .authority
+                    .intent
+                    .command_prefix
+                    .iter()
+                    .chain(process.authority.intent.arguments.iter())
+                    .map(OsStr::new)
+                    .collect(),
+                environment: process
+                    .environment
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_slice()))
+                    .collect(),
+                cwd: cwd.as_ref().map(|cwd| cwd.as_fd()),
+                with_stdin: process.authority.intent.stdin.is_some(),
+            })
+            .map_err(|_| spawn_failed())?,
+        )
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    let standard_launch = native_launch.is_none();
+    #[cfg(not(target_os = "macos"))]
+    let standard_launch = true;
     let mut command = match process.jail.as_ref() {
         Some(jail) => jail.command(&executable).map_err(|_| jail_unavailable())?,
         None => Command::new(executable.as_path()),
     };
-    command
-        .env_clear()
-        .stdin(if process.authority.intent.stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for argument in &process.authority.intent.command_prefix {
-        command.arg(argument);
-    }
-    for argument in process.authority.intent.arguments.iter() {
-        command.arg(argument);
-    }
-    for (name, value) in &process.environment {
-        command.env(name, bytes_as_os_str(value)?);
-    }
-    if let Some(jail) = process.jail.as_ref() {
-        jail.harden_environment(&mut command);
+    if standard_launch {
+        command
+            .env_clear()
+            .stdin(if process.authority.intent.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for argument in &process.authority.intent.command_prefix {
+            command.arg(argument);
+        }
+        for argument in process.authority.intent.arguments.iter() {
+            command.arg(argument);
+        }
+        for (name, value) in &process.environment {
+            command.env(name, bytes_as_os_str(value)?);
+        }
+        if let Some(jail) = process.jail.as_ref() {
+            jail.harden_environment(&mut command);
+        }
     }
     #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
-    let launch_probe = crate::process_test_diagnostics::launch::prepare();
+    let launch_probe = if standard_launch {
+        crate::process_test_diagnostics::launch::prepare()
+    } else {
+        None
+    };
     #[cfg(unix)]
-    {
+    if standard_launch {
         // Only the kernel mechanism is applied here. Under
         // `ParentFootprintWatchdog` the ceiling is held by the collection loop
         // instead, and calling `setrlimit` would fail the spawn outright on the
@@ -503,9 +546,9 @@ fn execute_spawned(
         let jail_limits = process.jail.as_ref().map(GovernedProcessJail::limits);
         #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
         let child_launch_probe = launch_probe.clone(); // parent-only Arc clone
-        // SAFETY: `setrlimit` and `fchdir` are async-signal-safe. The optional
-        // descriptor belongs to the identity-checked handle retained across
-        // `spawn` and is used only in the post-fork, pre-exec child.
+                                                       // SAFETY: `setrlimit` and `fchdir` are async-signal-safe. The optional
+                                                       // descriptor belongs to the identity-checked handle retained across
+                                                       // `spawn` and is used only in the post-fork, pre-exec child.
         unsafe {
             command.pre_exec(move || {
                 #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
@@ -566,6 +609,14 @@ fn execute_spawned(
     }
 
     process.authority.revalidate().map_err(authority_changed)?;
+    #[cfg(magicrun_test_diagnostics)]
+    crate::process_test_diagnostics::spawn_method(standard_launch);
+    #[cfg(target_os = "macos")]
+    let child = match native_launch {
+        Some(prepared) => prepared.spawn(),
+        None => command.spawn().map(Child::from),
+    };
+    #[cfg(not(target_os = "macos"))]
     let child = command.spawn();
     #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
     crate::process_test_diagnostics::launch::record(launch_probe.as_deref());
@@ -593,7 +644,7 @@ fn execute_spawned(
             #[cfg(not(unix))]
             let stdin_fd = None;
             Some((stdin, stdin_fd, value))
-        },
+        }
         None => None,
     };
     let (sender, receiver) = mpsc::sync_channel(STREAM_CHANNEL_DEPTH);
@@ -613,7 +664,7 @@ fn execute_spawned(
             drop(receiver);
             let _ = stop_and_join_readers([stdout_reader]);
             return Err(error);
-        },
+        }
     };
     let stdin_writer = match stdin_writer {
         Some((stdin, stdin_fd, value)) => match spawn_stdin_writer(stdin, stdin_fd, value) {
@@ -623,7 +674,7 @@ fn execute_spawned(
                 drop(receiver);
                 let _ = stop_and_join_readers([stdout_reader, stderr_reader]);
                 return Err(error);
-            },
+            }
         },
         None => None,
     };
@@ -644,7 +695,7 @@ fn execute_spawned(
             watched_memory_bytes: match memory_limit_enforcement() {
                 MemoryLimitEnforcement::ParentFootprintWatchdog => {
                     process.authority.intent.max_memory_bytes
-                },
+                }
                 MemoryLimitEnforcement::KernelAddressSpace | MemoryLimitEnforcement::None => None,
             },
             jail_watch,
@@ -2012,7 +2063,9 @@ mod tests {
             let before = snapshot.last_wait.expect("before-reap observation");
             assert_eq!(snapshot.spawned_children, 1);
             #[cfg(target_os = "macos")]
-            assert_eq!(snapshot.pre_exec_stage, Some(crate::process_test_diagnostics::PreExecStage::CallbackCompleted));
+            assert_eq!(snapshot.spawn_method, Some(crate::process_test_diagnostics::SpawnMethod::MacosPosixSpawn));
+            #[cfg(target_os = "macos")]
+            assert_eq!(snapshot.pre_exec_stage, None);
             assert_eq!(snapshot.spawn_group_owned, Some(true));
             assert!(before.owned_child && before.child_notification);
             assert_eq!(before.code, if signal.is_some() { WaitCode::Killed } else { WaitCode::Exited });
@@ -2047,7 +2100,9 @@ mod tests {
         let snapshot = observation.snapshot();
         assert!(snapshot.termination_cleanup && !snapshot.cleanup_before_reap);
         #[cfg(target_os = "macos")]
-        assert_eq!(snapshot.pre_exec_stage, Some(crate::process_test_diagnostics::PreExecStage::CallbackCompleted));
+        assert_eq!(snapshot.spawn_method, Some(crate::process_test_diagnostics::SpawnMethod::MacosPosixSpawn));
+        #[cfg(target_os = "macos")]
+        assert_eq!(snapshot.pre_exec_stage, None);
         assert_eq!(snapshot.group_term_attempts, 1);
         assert_eq!(snapshot.group_kill_attempts, 1);
         assert!(matches!(snapshot.reaped_signal, Some(Signal::Terminate | Signal::Kill)));
@@ -2202,8 +2257,16 @@ mod tests {
         environment.sort_by(|left, right| left.0.cmp(&right.0));
         let process =
             GovernedBatchProcess::from_authorized_parts_in_jail(parts, environment, jail).unwrap();
+        #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
+        let observation = crate::process_test_diagnostics::Capture::start().unwrap();
         let result =
             GovernedBatchExecutor::execute(process, &GovernedBatchCancellation::new()).unwrap();
+        #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
+        {
+            use crate::process_test_diagnostics::{SpawnMethod, PreExecStage};
+            assert_eq!(observation.snapshot().spawn_method, Some(SpawnMethod::StandardCommand));
+            assert_eq!(observation.snapshot().pre_exec_stage, Some(PreExecStage::CallbackCompleted));
+        }
         assert_eq!(
             result.terminal().terminal(),
             GovernedExecutionTerminal::Success,

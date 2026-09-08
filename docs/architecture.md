@@ -1,6 +1,6 @@
 # MagicRun architecture
 
-Architecture version: `0.1.73`
+Architecture version: `0.1.74`
 
 Original immutable baseline tag: `architecture/v0.1.73`. The current reviewed
 source/document fingerprints are in [architecture-baseline.json](architecture-baseline.json).
@@ -25,7 +25,10 @@ flowchart TB
     material --> batch["Governed batch executor"]
     material --> pty["Governed PTY executor and trusted bridge"]
     jail["Optional process jail"] --> batch
-    batch --> result["Bounded result sealing and credential-output handling"]
+    batch -->|"macOS, no jail"| spawn["Descriptor-bound posix_spawn; no child callback"]
+    batch -->|"Jailed / other platforms"| standard["Existing restricted launch backend"]
+    spawn --> result["Existing bounded collection, result sealing and credential-output handling"]
+    standard --> result
     pty --> result
     result --> audit["Host audit sink"]
     audit --> settlement["Typed terminal settlement"]
@@ -69,7 +72,7 @@ supervisor, launch an unrelated service, or silently replace a consumer's runtim
 | --- | --- |
 | Manifest admission and tool discovery | `manifest*`, `registry`, `inventory`, `tool_discovery`, MCP catalog policy/projection |
 | Exact authorization and execution ownership | `governed_execution_coordinator`, `governed_execution_authority`, `governed_execution` |
-| Batch, PTY, optional jail | `governed_batch_process`, `governed_pty_process`, `governed_process_jail` |
+| Batch, PTY, optional jail | `governed_batch_process` and its macOS spawn backend, `governed_pty_process`, `governed_process_jail` |
 | Credential preparation and placement | `credential_preparation`, `credential_injection`, `credential_materialization`, `credential_filesystem` |
 | Credential lifecycle and profiles | `credential_lifecycle*`, `credential_profiles`, `credential_profile_store`, `profile_selection` |
 | Results and settlement | `governed_execution_result`, coordinator audit/terminal types |
@@ -88,7 +91,8 @@ supervisor, launch an unrelated service, or silently replace a consumer's runtim
   secret-injection service. MagicVault's standalone 0.4.0 process adapter now
   invokes this existing public coordinator; MagicVault owns fixed destination
   profiles, human consent, custody, durable audit and receipt-only agent output.
-  Its HTTP adapter is separate. No MagicRun runtime/API change is required.
+  Its HTTP adapter is separate. The later `0.1.74` non-jailed macOS launch
+  correction changes runtime implementation, not these public entry points.
 - **Recipient access is real:** environment/stdin/files/PTY can contain material
   inside the authorized execution boundary. Document the actual output and
   bridge mediation contract; never claim universal credential invisibility.
@@ -97,6 +101,52 @@ supervisor, launch an unrelated service, or silently replace a consumer's runtim
 - **Consumer attestations track source:** `source_bytes` lets a consumer review
   actual compiled code. Documentation fingerprints below are not a replacement
   for that consumer-owned trust decision.
+
+## macOS non-jailed batch launch
+
+`0.1.74` uses native `posix_spawn` for non-jailed macOS batch commands. The
+previous unconditional `pre_exec` callback forced Rust onto its fork path.
+Apple [recommends combined spawning for framework-using processes](https://developer.apple.com/forums/thread/737464);
+its [syscall wrapper and fchdir action](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/libsyscall/wrappers/spawn/posix_spawn.c)
+avoid executing the parent's userspace fork/at-fork code in a child. This
+eliminates that launch interval, not all possible recipient or OS failures.
+
+The private adapter accepts original authorized argv/environment bytes and the
+absolute executable snapshot. It validates NUL/name ambiguity before copying
+into zeroizing C buffers; no `Command` getter round-trip, PATH search, shell
+fallback or ambient environment is used. The runner revalidates authority and
+checks cancellation/deadline after preparing resources and before dispatch.
+
+An independently owned duplicate of the authorized cwd descriptor feeds
+`posix_spawn_file_actions_addfchdir_np`; no path is re-resolved, including after a
+directory rename/replacement. The function is resolved dynamically: macOS below
+10.15 refuses this operation, never silently reverting to fork. Stdio sources
+are normalized above descriptors 0–2, duplicated into stdio and explicitly
+closed. `POSIX_SPAWN_CLOEXEC_DEFAULT` excludes other descriptors. The inherited
+signal mask and ordinary SIGPIPE reset match the previous runner contract; a
+new process group is established at spawn. No parent cwd/environment changes.
+
+The existing bounded readers/writer, wait-before-cleanup collector, cancellation,
+deadlines and footprint watchdog own execution afterward. A native child caches
+its reaped status, retries interrupted waits only, and never signals a reaped
+identity. An unwinding owner kills/reaps its still-owned group. Darwin spawn
+errors return no child; no uncertain operation is retried. Native launch is not
+used for jail requests: their pre-exec resource limits are not available through
+this backend and must not be silently dropped. PTY and non-macOS paths retain
+their existing behavior and are not newly qualified as fork-free.
+
+Tests cover real cwd replacement, exact argv/env/stdin, malformed input, closed
+stdio, deliberate non-CLOEXEC descriptor isolation, spawn errors and cached reap.
+A dedicated helper registers a fork handler: native launch must not invoke it,
+while a subsequent explicit fork-path positive control must. The exact consumer
+process/HTTP concurrency remains the qualification scenario, without retries or
+longer deadlines. No claim of universal absence of future failures is implied.
+
+The existing macOS `GOVERNED_BATCH_PROCESS` attestation bytes now bundle the
+actual new backend text as well as the outer runner, so existing consumers do
+not accidentally omit delegated execution code. Its fingerprint and the cwd
+authority fingerprint change; a consumer must review those changes on upgrade.
+Magician's source/dependency remains unchanged until its owner chooses to upgrade.
 
 ## Detecting architectural drift
 
@@ -139,7 +189,7 @@ Every namespace defined in that reviewed header has a named category (including
 `INVALID`); unknown namespace values remain `OtherNamespace`. A catch-all result
 from an older decoder cannot be retrospectively assigned one of the new names.
 
-On macOS, an active capture additionally prepares one anonymous `MAP_SHARED`
+For the retained standard-command path on macOS, an active capture prepares one anonymous `MAP_SHARED`
 mapping containing a lock-free atomic byte before spawn. Only the parent
 allocates/clones its owning Arc. The child's existing pre-exec callback performs
 two atomic stores: at entry and immediately before successful return. It never
@@ -157,7 +207,9 @@ not prove exec succeeded, and a returned child handle alone is not proof of exec
 Rust 1.92's [Unix spawn implementation](https://github.com/rust-lang/rust/blob/1.92.0/library/std/src/sys/process/unix/unix.rs)
 treats EOF on the child error pipe as a successful spawn, including child death
 before exec. Its registered callback forces the fork path; no new callback is
-added solely to select a different launch mechanism. The probe follows
+added solely to select a different launch mechanism. Native `posix_spawn` instead
+records `SpawnMethod::MacosPosixSpawn` with no pre-exec stage; it allocates no
+callback probe and must never report `CallbackCompleted`. The probe follows
 [`pre_exec`'s safety boundary](https://doc.rust-lang.org/std/os/unix/process/trait.CommandExt.html#tymethod.pre_exec)
 and [shared mmap inheritance](https://pubs.opengroup.org/onlinepubs/9799919799/functions/mmap.html).
 Synthetic children cover death before/inside/after the callback, callback error,
@@ -167,8 +219,8 @@ and HTTP concurrency, deadlines, cleanup and uncertainty rules are unchanged.
 This diagnostic does change the literal batch source bytes. Consumer-owned
 source attestations must therefore change on a reviewed dependency upgrade;
 they must never be frozen to preserve old approval. Magician's existing locked
-dependency is not changed by this work. Default runtime behavior, production
-API, credential contracts and schema remain unchanged. The optional diagnostic
+dependency is not changed by this work. Enabling the observer does not change
+runtime decisions, production API, credential contracts or schema. The optional diagnostic
 source bytes are exposed only when the same cfg is enabled.
 
 For a local synthetic investigation, use a separate target directory on the
@@ -194,7 +246,7 @@ fail-fast qualification evidence.
 ### Baseline review
 
 [architecture-baseline.json](architecture-baseline.json) binds this document to
-package `tool-runtime-core 0.1.73`, workspace/package manifests and production
+package `tool-runtime-core 0.1.74`, workspace/package manifests and production
 `src/` fingerprints. The local, ignored Cargo lockfile is not a published
 library architecture input. Dependency declarations still participate through
 the manifest fingerprints.

@@ -747,6 +747,12 @@ pub struct GovernedWorkingDirectoryHandle {
 }
 
 impl GovernedWorkingDirectoryHandle {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd;
+        self.file.as_fd()
+    }
+
     #[cfg(unix)]
     pub(crate) fn raw_fd(&self) -> std::os::unix::io::RawFd {
         use std::os::unix::io::AsRawFd;

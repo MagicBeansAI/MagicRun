@@ -1,6 +1,6 @@
 [package]
 name = "tool-runtime-core"
-version = "0.1.73"
+version = "0.1.74"
 edition = "2021"
 authors = ["MagicBeansAI"]
 description = "Shared local tool runtime primitives for capability loading and matching"
