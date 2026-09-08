@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Current development version: `0.1.73`._
 
+### Test-only process investigation
+
+- Add bounded, thread-scoped child wait/signal/cleanup observations under an
+  explicit debug compiler cfg. Normal builds omit them; standard release builds
+  reject the cfg. No output bytes, credentials, paths, PIDs or raw exit codes
+  are retained. Add real normal/nonzero/SIGTERM/SIGKILL classification tests.
+- Default execution and production API are unchanged; this is not a claimed
+  fix for the intermittent MagicVault process failure. Literal batch source
+  fingerprints do change, so consumer attestations require their normal review
+  when upgrading. Existing Magician dependencies are not updated.
+
 ### Development tooling and documentation
 
 - Rework the public README around the product, with capability and host-integration

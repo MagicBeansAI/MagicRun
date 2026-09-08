@@ -7,6 +7,8 @@
 
 pub const GOVERNED_PROCESS_JAIL: &[u8] = include_bytes!("governed_process_jail.rs");
 pub const GOVERNED_BATCH_PROCESS: &[u8] = include_bytes!("governed_batch_process.rs");
+#[cfg(magicrun_test_diagnostics)]
+pub const PROCESS_TEST_DIAGNOSTICS: &[u8] = include_bytes!("process_test_diagnostics.rs");
 pub const GOVERNED_EXECUTION_AUTHORITY: &[u8] = include_bytes!("governed_execution_authority.rs");
 pub const GOVERNED_EXECUTION_COORDINATOR: &[u8] = include_bytes!("governed_execution_coordinator.rs");
 pub const GOVERNED_EXECUTION: &[u8] = include_bytes!("governed_execution.rs");

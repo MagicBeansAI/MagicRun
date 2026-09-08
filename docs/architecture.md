@@ -100,6 +100,51 @@ supervisor, launch an unrelated service, or silently replace a consumer's runtim
 
 ## Detecting architectural drift
 
+### Synthetic process diagnostics
+
+The custom compiler cfg `magicrun_test_diagnostics` enables a test-only observer
+around the synchronous batch child's wait/cleanup/reap path. It is not a Cargo
+feature, runtime flag, production log, callback or agent surface. Normal builds
+omit its module and hooks; the standard release profile rejects the cfg.
+
+A non-Send, non-cloneable capture must be opened and dropped on the invocation's
+blocking thread. Nested capture is refused, at most 16 captures exist globally,
+and unrelated threads/uncaptured work retain no observations. It keeps fixed
+enums, booleans and saturating counts: owned-group check, wait event class,
+closed signal category, cleanup attempts and final status. No PID, raw exit
+code, command, path, environment, stream bytes or credential is retained or
+printed. Signal diagnostics never select a process to terminate or alter the
+existing cleanup decision. Observing a signal does not identify its sender.
+
+This diagnostic does change the literal batch source bytes. Consumer-owned
+source attestations must therefore change on a reviewed dependency upgrade;
+they must never be frozen to preserve old approval. Magician's existing locked
+dependency is not changed by this work. Default runtime behavior, production
+API, credential contracts and schema remain unchanged. The optional diagnostic
+source bytes are exposed only when the same cfg is enabled.
+
+For a local synthetic investigation, use a separate target directory on the
+build volume. Never package its output or point it at live credentials:
+
+```bash
+CARGO_TARGET_DIR=/Volumes/SSD1/magicrun/termination-diagnostic-builds \
+RUSTFLAGS='--cfg magicrun_test_diagnostics' \
+cargo test -p tool-runtime-core --lib process_test_diagnostics::
+
+CARGO_TARGET_DIR=/Volumes/SSD1/magicrun/termination-diagnostic-builds \
+RUSTFLAGS='--cfg magicrun_test_diagnostics' \
+cargo test -p tool-runtime-core --lib \
+  diagnostic_wait_and_reap_distinguish_normal_exit_from_recipient_signals
+```
+
+The second test uses actual owned normal/nonzero/SIGTERM/SIGKILL recipients.
+Its observations distinguish pre-cleanup wait evidence from the reaped result.
+They do not by themselves resolve an intermittent consumer failure. A consumer
+must attach the capture to exactly its synthetic invocation and keep its own
+fail-fast qualification evidence.
+
+### Baseline review
+
 [architecture-baseline.json](architecture-baseline.json) binds this document to
 package `tool-runtime-core 0.1.73`, workspace/package manifests and production
 `src/` fingerprints. The local, ignored Cargo lockfile is not a published

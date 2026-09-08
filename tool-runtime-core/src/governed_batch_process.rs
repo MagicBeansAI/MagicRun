@@ -1075,6 +1075,8 @@ struct ProcessTreeGuard {
 impl ProcessTreeGuard {
     fn new(child: Child) -> Self {
         let pid = Some(child.id());
+        #[cfg(magicrun_test_diagnostics)]
+        crate::process_test_diagnostics::spawned(child.id());
         Self {
             child: Some(child),
             pid,
@@ -1092,8 +1094,10 @@ impl ProcessTreeGuard {
                 return Ok(None);
             }
             terminate_exited_process_group_before_reap(self.pid);
-            self.child_mut()?
-                .wait()
+            let result = self.child_mut()?.wait();
+            #[cfg(magicrun_test_diagnostics)]
+            crate::process_test_diagnostics::reaped(&result);
+            result
                 .map(Some)
                 .map_err(|_| process_wait_failed())
         }
@@ -1108,10 +1112,14 @@ impl ProcessTreeGuard {
     }
 
     fn terminate_and_reap(&mut self) {
+        #[cfg(magicrun_test_diagnostics)]
+        crate::process_test_diagnostics::cleanup(false);
         terminate_process_group(self.pid);
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
-            let _ = child.wait();
+            let _result = child.wait();
+            #[cfg(magicrun_test_diagnostics)]
+            crate::process_test_diagnostics::reaped(&_result);
         }
         self.child = None;
     }
@@ -1350,13 +1358,16 @@ pub(crate) fn terminate_process_group(pid: Option<u32>) {
     let group = -pid;
     // SAFETY: the child was placed in a new process group whose leader is owned by the
     // guard. A negative pid addresses that exact group only.
-    let delivered = unsafe { libc::kill(group, libc::SIGTERM) } == 0;
+    let result = unsafe { libc::kill(group, libc::SIGTERM) };
+    #[cfg(magicrun_test_diagnostics)]
+    crate::process_test_diagnostics::group_signal(false, result);
+    let delivered = result == 0;
     if delivered {
         thread::sleep(TERMINATION_GRACE);
         // SAFETY: same exact owned process group; SIGKILL is the bounded backstop.
-        unsafe {
-            libc::kill(group, libc::SIGKILL);
-        }
+        let _result = unsafe { libc::kill(group, libc::SIGKILL) };
+        #[cfg(magicrun_test_diagnostics)]
+        crate::process_test_diagnostics::group_signal(true, _result);
     }
 }
 
@@ -1382,9 +1393,15 @@ pub(crate) fn observe_owned_child_exit(pid: Option<u32>) -> Result<bool, ()> {
         if result == 0 {
             // SAFETY: successful waitid initialized the siginfo record. POSIX specifies
             // si_pid == 0 when WNOHANG finds no waitable state change.
-            return Ok(unsafe { information.assume_init().si_pid() } != 0);
+            let information = unsafe { information.assume_init() };
+            #[cfg(magicrun_test_diagnostics)]
+            crate::process_test_diagnostics::wait_observation(pid, &information);
+            return Ok(unsafe { information.si_pid() } != 0);
         }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+        let interrupted = std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
+        #[cfg(magicrun_test_diagnostics)]
+        crate::process_test_diagnostics::wait_error(interrupted);
+        if !interrupted {
             return Err(());
         }
     }
@@ -1398,10 +1415,12 @@ pub(crate) fn terminate_exited_process_group_before_reap(pid: Option<u32>) {
     let Some(pid) = pid.and_then(|value| i32::try_from(value).ok()) else {
         return;
     };
+    #[cfg(magicrun_test_diagnostics)]
+    crate::process_test_diagnostics::cleanup(true);
     // SAFETY: the waitable owned leader still pins this exact process-group identity.
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
+    let _result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    #[cfg(magicrun_test_diagnostics)]
+    crate::process_test_diagnostics::group_signal(true, _result);
 }
 
 #[cfg(not(unix))]
@@ -1952,6 +1971,58 @@ mod tests {
             environment.sort_by(|left, right| left.0.cmp(&right.0));
             GovernedBatchProcess::from_authorized_parts(parts, environment)
         }
+    }
+
+    #[cfg(all(unix, magicrun_test_diagnostics))]
+    #[test]
+    fn diagnostic_wait_and_reap_distinguish_normal_exit_from_recipient_signals() {
+        use crate::process_test_diagnostics::{Capture, Signal, WaitCode};
+        let _budget = TEST_PROCESS_BUDGET.lock().unwrap();
+        for (script, terminal, signal, success) in [
+            ("#!/bin/sh\nexit 0\n", GovernedExecutionTerminal::Success, None, Some(true)),
+            ("#!/bin/sh\nexit 17\n", GovernedExecutionTerminal::NonZeroExit, None, Some(false)),
+            ("#!/bin/sh\nkill -TERM $$\n", GovernedExecutionTerminal::RuntimeFailure, Some(Signal::Terminate), None),
+            ("#!/bin/sh\nkill -KILL $$\n", GovernedExecutionTerminal::RuntimeFailure, Some(Signal::Kill), None),
+        ] {
+            let fixture = Fixture::new(script.as_bytes());
+            let process = fixture.process(vec![], None, 2, 4096, 4096);
+            let observation = Capture::start().unwrap();
+            let result = GovernedBatchExecutor::execute(process, &GovernedBatchCancellation::new()).unwrap();
+            assert_eq!(result.terminal().terminal(), terminal);
+            let snapshot = observation.snapshot();
+            let before = snapshot.last_wait.expect("before-reap observation");
+            assert_eq!(snapshot.spawned_children, 1);
+            assert_eq!(snapshot.spawn_group_owned, Some(true));
+            assert!(before.owned_child && before.child_notification);
+            assert_eq!(before.code, if signal.is_some() { WaitCode::Killed } else { WaitCode::Exited });
+            assert_eq!(before.signal, signal);
+            assert_eq!(before.normal_success, success);
+            assert_eq!(snapshot.reaped_signal, signal);
+            assert_eq!(snapshot.reaped_normal_success, success);
+            assert!(snapshot.cleanup_before_reap && !snapshot.termination_cleanup);
+            assert_eq!(snapshot.group_term_attempts, 0);
+            assert_eq!(snapshot.group_kill_attempts, 1);
+            assert_eq!(snapshot.wait_errors, 0);
+            assert!(!snapshot.child_wait_error);
+        }
+    }
+
+    #[cfg(all(unix, magicrun_test_diagnostics))]
+    #[test]
+    fn diagnostic_deadline_cleanup_is_distinct_from_pre_reap_cleanup() {
+        use crate::process_test_diagnostics::{Capture, Signal};
+        let _budget = TEST_PROCESS_BUDGET.lock().unwrap();
+        let fixture = Fixture::new(b"#!/bin/sh\nexec /bin/sleep 5\n");
+        let process = fixture.process(vec![], None, 1, 4096, 4096);
+        let observation = Capture::start().unwrap();
+        let result = GovernedBatchExecutor::execute(process, &GovernedBatchCancellation::new()).unwrap();
+        assert_eq!(result.terminal().terminal(), GovernedExecutionTerminal::TimedOut);
+        let snapshot = observation.snapshot();
+        assert!(snapshot.termination_cleanup && !snapshot.cleanup_before_reap);
+        assert_eq!(snapshot.group_term_attempts, 1);
+        assert_eq!(snapshot.group_kill_attempts, 1);
+        assert!(matches!(snapshot.reaped_signal, Some(Signal::Terminate | Signal::Kill)));
+        assert!(!snapshot.child_wait_error);
     }
 
     #[test]

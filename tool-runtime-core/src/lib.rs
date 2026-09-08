@@ -1,3 +1,9 @@
+#[cfg(all(magicrun_test_diagnostics, not(debug_assertions)))]
+compile_error!("magicrun_test_diagnostics is forbidden in release builds");
+#[cfg(magicrun_test_diagnostics)]
+#[doc(hidden)]
+pub mod process_test_diagnostics;
+
 pub mod action_overrides;
 pub mod browser_profile_adapter;
 pub mod canary;
