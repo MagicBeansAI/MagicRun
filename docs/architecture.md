@@ -139,6 +139,31 @@ Every namespace defined in that reviewed header has a named category (including
 `INVALID`); unknown namespace values remain `OtherNamespace`. A catch-all result
 from an older decoder cannot be retrospectively assigned one of the new names.
 
+On macOS, an active capture additionally prepares one anonymous `MAP_SHARED`
+mapping containing a lock-free atomic byte before spawn. Only the parent
+allocates/clones its owning Arc. The child's existing pre-exec callback performs
+two atomic stores: at entry and immediately before successful return. It never
+uses TLS, locks, allocation, logging or extra descriptors. The parent reads a
+closed stage after spawn returns, including an error return; allocation failure
+is `Unavailable`, never an execution decision. Uncaptured work allocates nothing.
+The mapping is retained through the Command's callback lifetime and unmapped by
+its final parent owner; exec/exit discards the child mapping. Capture capacity
+also bounds simultaneous observed invocations. Other platforms leave this stage
+absent. No event history, address or arbitrary byte is exposed.
+
+`CallbackNotEntered`, `CallbackEntered` and `CallbackCompleted` localize the
+callback boundary, **not** the exception site or recipient entry. Completed does
+not prove exec succeeded, and a returned child handle alone is not proof of exec:
+Rust 1.92's [Unix spawn implementation](https://github.com/rust-lang/rust/blob/1.92.0/library/std/src/sys/process/unix/unix.rs)
+treats EOF on the child error pipe as a successful spawn, including child death
+before exec. Its registered callback forces the fork path; no new callback is
+added solely to select a different launch mechanism. The probe follows
+[`pre_exec`'s safety boundary](https://doc.rust-lang.org/std/os/unix/process/trait.CommandExt.html#tymethod.pre_exec)
+and [shared mmap inheritance](https://pubs.opengroup.org/onlinepubs/9799919799/functions/mmap.html).
+Synthetic children cover death before/inside/after the callback, callback error,
+successful exec and failed exec after callback completion. The original process
+and HTTP concurrency, deadlines, cleanup and uncertainty rules are unchanged.
+
 This diagnostic does change the literal batch source bytes. Consumer-owned
 source attestations must therefore change on a reviewed dependency upgrade;
 they must never be frozen to preserve old approval. Magician's existing locked

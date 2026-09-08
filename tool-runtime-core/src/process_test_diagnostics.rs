@@ -14,6 +14,20 @@ thread_local! {
     static CURRENT: RefCell<Option<Snapshot>> = const { RefCell::new(None) };
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) mod launch;
+
+/// Callback progress only. Even `CallbackCompleted` does not prove exec or
+/// recipient entry; a successful spawn can also follow child death before exec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreExecStage {
+    Unavailable,
+    CallbackNotEntered,
+    CallbackEntered,
+    CallbackCompleted,
+    Invalid,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Signal {
     Kill,
@@ -152,6 +166,7 @@ pub enum ExecReason {
 /// environment, credentials or arbitrary strings. Deliberately not Serialize.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Snapshot {
+    pub pre_exec_stage: Option<PreExecStage>,
     pub spawned_children: u32,
     pub spawn_group_owned: Option<bool>,
     pub wait_polls: u32,

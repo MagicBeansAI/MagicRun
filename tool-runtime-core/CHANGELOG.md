@@ -12,6 +12,12 @@ _Current development version: `0.1.73`._
 
 ### Test-only process investigation
 
+- Add a macOS-only shared atomic pre-exec stage probe for active synthetic
+  captures. Child writes require no allocation, locks, logging or descriptors;
+  parent observations distinguish callback entry/completion without claiming
+  exec or recipient entry. Allocation failure remains diagnostic-only. Add
+  real child-death, callback-error and exec-failure boundary coverage. Normal
+  builds omit the probe; process behavior and consumer dependencies are unchanged.
 - Name every namespace in the reviewed Apple header, including its invalid
   category, with complete mapping coverage and unknown-value refusal. The first
   consumer CI recurrence reached the prior decoder's catch-all; that failure is

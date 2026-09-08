@@ -486,6 +486,8 @@ fn execute_spawned(
     if let Some(jail) = process.jail.as_ref() {
         jail.harden_environment(&mut command);
     }
+    #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
+    let launch_probe = crate::process_test_diagnostics::launch::prepare();
     #[cfg(unix)]
     {
         // Only the kernel mechanism is applied here. Under
@@ -499,11 +501,17 @@ fn execute_spawned(
         command.process_group(0);
         let directory_fd = cwd.as_ref().map(|cwd| cwd.raw_fd());
         let jail_limits = process.jail.as_ref().map(GovernedProcessJail::limits);
+        #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
+        let child_launch_probe = launch_probe.clone(); // parent-only Arc clone
         // SAFETY: `setrlimit` and `fchdir` are async-signal-safe. The optional
         // descriptor belongs to the identity-checked handle retained across
         // `spawn` and is used only in the post-fork, pre-exec child.
         unsafe {
             command.pre_exec(move || {
+                #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
+                if let Some(probe) = child_launch_probe.as_ref() {
+                    probe.entered();
+                }
                 // This branch is reached with `Some` only under
                 // `KernelAddressSpace`, where the target is known to accept a
                 // finite `RLIMIT_AS`. It therefore stays exactly as written: a
@@ -524,10 +532,18 @@ fn execute_spawned(
                 }
                 if let Some(directory_fd) = directory_fd {
                     if libc::fchdir(directory_fd) == 0 {
+                        #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
+                        if let Some(probe) = child_launch_probe.as_ref() {
+                            probe.completed();
+                        }
                         return Ok(());
                     } else {
                         return Err(std::io::Error::last_os_error());
                     }
+                }
+                #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
+                if let Some(probe) = child_launch_probe.as_ref() {
+                    probe.completed();
                 }
                 Ok(())
             });
@@ -550,7 +566,10 @@ fn execute_spawned(
     }
 
     process.authority.revalidate().map_err(authority_changed)?;
-    let child = command.spawn().map_err(|_| spawn_failed())?;
+    let child = command.spawn();
+    #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
+    crate::process_test_diagnostics::launch::record(launch_probe.as_deref());
+    let child = child.map_err(|_| spawn_failed())?;
     let mut tree = ProcessTreeGuard::new(child);
     let stdout = tree
         .child_mut()?
@@ -1992,6 +2011,8 @@ mod tests {
             assert_eq!(result.terminal().terminal(), terminal, "expected signal {signal:?}; closed observation {snapshot:?}");
             let before = snapshot.last_wait.expect("before-reap observation");
             assert_eq!(snapshot.spawned_children, 1);
+            #[cfg(target_os = "macos")]
+            assert_eq!(snapshot.pre_exec_stage, Some(crate::process_test_diagnostics::PreExecStage::CallbackCompleted));
             assert_eq!(snapshot.spawn_group_owned, Some(true));
             assert!(before.owned_child && before.child_notification);
             assert_eq!(before.code, if signal.is_some() { WaitCode::Killed } else { WaitCode::Exited });
@@ -2025,6 +2046,8 @@ mod tests {
         assert_eq!(result.terminal().terminal(), GovernedExecutionTerminal::TimedOut);
         let snapshot = observation.snapshot();
         assert!(snapshot.termination_cleanup && !snapshot.cleanup_before_reap);
+        #[cfg(target_os = "macos")]
+        assert_eq!(snapshot.pre_exec_stage, Some(crate::process_test_diagnostics::PreExecStage::CallbackCompleted));
         assert_eq!(snapshot.group_term_attempts, 1);
         assert_eq!(snapshot.group_kill_attempts, 1);
         assert!(matches!(snapshot.reaped_signal, Some(Signal::Terminate | Signal::Kill)));
