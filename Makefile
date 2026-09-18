@@ -30,7 +30,11 @@ architecture-snapshot:
 test-architecture:
 	python3 scripts/tests/test_architecture.py
 
+test-store-durability:
+	python3 scripts/tests/test_store_durability.py
+
 check: check-architecture
+	python3 scripts/tests/test_store_durability.py
 	python3 scripts/check_store_durability_adoption.py
 	cargo check --workspace --all-targets
 
@@ -46,4 +50,4 @@ test-lifecycle:
 inventory classification replay:
 	cargo run -p tool-runtime-core --bin tool-runtime-$@ -- $(ARGS)
 
-.PHONY: help print-target-dir test-build-paths check-architecture architecture-snapshot test-architecture check build test test-lifecycle inventory classification replay
+.PHONY: help print-target-dir test-build-paths check-architecture architecture-snapshot test-architecture test-store-durability check build test test-lifecycle inventory classification replay

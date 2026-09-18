@@ -45,24 +45,64 @@ EXEMPT_DEFINITION_MARKERS = (
 )
 
 
-def rust_sources() -> list[Path]:
+# `#[cfg(test)] mod name;` — a module whose whole file is compiled only under
+# test. Attributes may stack between the cfg and the item.
+CFG_TEST_MODULE = re.compile(
+    r"#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;"
+)
+
+
+def rust_sources(root: Path = ROOT) -> list[Path]:
     files: list[Path] = []
-    for root in SCAN_ROOTS:
-        base = ROOT / root
+    for scan_root in SCAN_ROOTS:
+        base = root / scan_root
         if base.is_dir():
             files.extend(sorted(base.rglob("*.rs")))
     return files
 
 
-def scan() -> dict[str, dict[str, int]]:
-    """`{relative path: {rule: count}}` for every file with at least one hit."""
-    found: dict[str, dict[str, int]] = defaultdict(dict)
-    for path in rust_sources():
+def test_only_sources(sources: list[Path]) -> set[Path]:
+    """Files that exist only under `cfg(test)`: not store surfaces.
+
+    The ratchet counts hand-rolled writers on production write paths. A test
+    that renames a directory to prove a retained descriptor survives the swap
+    is exercising a store, not implementing one, and its count would be review
+    debt that no store fix can ever pay down. Only the file-per-module form is
+    resolved here (`foo.rs` or `foo/mod.rs` declaring `mod tests;` →
+    `foo/tests.rs` or `foo/tests/mod.rs`); an inline `mod tests { … }` block
+    stays inside its production file's count as it always has.
+    """
+    declared: set[Path] = set()
+    for path in sources:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError as error:  # unreadable file is a real failure, not a skip
             raise SystemExit(f"store-durability guard: cannot read {path}: {error}")
-        rel = path.relative_to(ROOT).as_posix()
+        if "#[cfg(test)]" not in text:
+            continue
+        # `mod x;` resolves beside a `mod.rs`/`lib.rs`/`main.rs`, else under a
+        # directory named after the declaring file.
+        base = path.parent if path.name in {"mod.rs", "lib.rs", "main.rs"} else path.with_suffix("")
+        for match in CFG_TEST_MODULE.finditer(text):
+            name = match.group(1)
+            declared.add(base / f"{name}.rs")
+            declared.add(base / name / "mod.rs")
+    return {path for path in sources if path in declared}
+
+
+def scan(root: Path = ROOT) -> dict[str, dict[str, int]]:
+    """`{relative path: {rule: count}}` for every file with at least one hit."""
+    found: dict[str, dict[str, int]] = defaultdict(dict)
+    sources = rust_sources(root)
+    test_only = test_only_sources(sources)
+    for path in sources:
+        if path in test_only:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:  # unreadable file is a real failure, not a skip
+            raise SystemExit(f"store-durability guard: cannot read {path}: {error}")
+        rel = path.relative_to(root).as_posix()
         for line in text.splitlines():
             stripped = line.lstrip()
             # Comments describe these helpers; they do not call them. Without
