@@ -1,6 +1,6 @@
 # MagicRun architecture
 
-Architecture version: `0.1.74`
+Architecture version: `0.1.75`
 
 Original immutable baseline tag: `architecture/v0.1.73`. The current reviewed
 source/document fingerprints are in [architecture-baseline.json](architecture-baseline.json).
@@ -101,6 +101,23 @@ supervisor, launch an unrelated service, or silently replace a consumer's runtim
 - **Consumer attestations track source:** `source_bytes` lets a consumer review
   actual compiled code. Documentation fingerprints below are not a replacement
   for that consumer-owned trust decision.
+
+## Declared login prompts
+
+`0.1.75` lets a skill's `auth.lifecycle.login_prompts` name the prompts its
+login hook may print on the PTY — each a `kind` (`username`, `password`,
+`otp`, `device_code`, `operator`) and the literal `marker` the prompt line
+ends with. `manifest::declared_login_prompt` matches only the line the cursor
+is on, after dropping ANSI escapes, and only when it ends with a declared
+marker: arbitrary terminal text is never a prompt, and a marker mentioned
+elsewhere in the output is not one either. The host's interaction bridge
+decides what a match means — answer it through the host's own secure channel
+(`CredentialLifecycleInteractionAction::ProvideInput`, the value never enters
+coordinator state) or settle the operation as an `authentication_required`
+challenge typed by the kind. `CredentialLifecyclePendingKind::Password` names
+that class beside the existing `Otp`. Empty `login_prompts` keeps today's
+behaviour. No runtime source outside the manifest and the pending-kind enum
+changes; no process, credential or wire contract moves.
 
 ## macOS non-jailed batch launch
 

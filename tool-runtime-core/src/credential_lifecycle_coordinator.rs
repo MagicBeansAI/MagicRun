@@ -147,6 +147,8 @@ pub enum CredentialLifecyclePendingKind {
     BrowserCallback,
     DeviceCode,
     Otp,
+    /// The program asked for a password (a declared login prompt matched).
+    Password,
     Qr,
     OperatorRequired,
 }

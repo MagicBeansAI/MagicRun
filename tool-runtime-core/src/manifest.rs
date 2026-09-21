@@ -448,6 +448,95 @@ pub struct AuthLifecycle {
     pub login: Option<LifecycleHook>,
     pub logout: Option<LifecycleHook>,
     pub refresh: Option<LifecycleHook>,
+    /// Prompts the login hook's PTY may show, declared by the skill. A host
+    /// matches only these markers — never arbitrary terminal text — and
+    /// answers a matched prompt through its own secure channel or reports an
+    /// `authentication_required` challenge typed by the prompt's kind. Empty
+    /// keeps today's behavior: the host cannot recognise a prompt.
+    pub login_prompts: Vec<LifecyclePrompt>,
+}
+
+/// One prompt a login hook may print, and what it asks for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LifecyclePrompt {
+    pub kind: LifecyclePromptKind,
+    /// The literal text the prompt line ends with (after trailing whitespace),
+    /// compared exactly. One to 128 bytes, no control characters.
+    pub marker: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecyclePromptKind {
+    Username,
+    Password,
+    Otp,
+    DeviceCode,
+    Operator,
+}
+
+pub const MAX_LIFECYCLE_PROMPT_MARKER_BYTES: usize = 128;
+
+impl LifecyclePrompt {
+    pub fn is_valid(&self) -> bool {
+        let marker = self.marker.as_str();
+        !marker.trim().is_empty()
+            && marker.len() <= MAX_LIFECYCLE_PROMPT_MARKER_BYTES
+            && !marker.chars().any(char::is_control)
+    }
+}
+
+/// The declared prompt the latest PTY output line ends with, if any. Only the
+/// last line is read (what a prompt leaves the cursor on), ANSI escape
+/// sequences are dropped first, and the marker must end the line exactly —
+/// text that merely mentions a marker somewhere does not match. Invalid
+/// prompts never match.
+pub fn declared_login_prompt<'a>(
+    prompts: &'a [LifecyclePrompt],
+    recent_output: &[u8],
+) -> Option<&'a LifecyclePrompt> {
+    if prompts.is_empty() || recent_output.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(recent_output);
+    let tail = strip_ansi_escapes(&text);
+    let tail = tail.trim_end_matches(['\r', '\n']);
+    let line = tail.rsplit(['\r', '\n']).next().unwrap_or("").trim_end();
+    if line.is_empty() {
+        return None;
+    }
+    prompts
+        .iter()
+        .filter(|prompt| prompt.is_valid())
+        .find(|prompt| line.ends_with(prompt.marker.trim_end()))
+}
+
+/// Drop `ESC [ … <final byte>` and `ESC <single byte>` sequences.
+fn strip_ansi_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            },
+            Some(_) => {
+                chars.next();
+            },
+            None => {},
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -593,6 +682,50 @@ pub enum AuthState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prompts() -> Vec<LifecyclePrompt> {
+        vec![
+            LifecyclePrompt { kind: LifecyclePromptKind::Password, marker: "Password:".into() },
+            LifecyclePrompt { kind: LifecyclePromptKind::Otp, marker: "Enter the 6-digit code:".into() },
+            LifecyclePrompt { kind: LifecyclePromptKind::Username, marker: "".into() },
+        ]
+    }
+
+    #[test]
+    fn a_declared_prompt_matches_only_the_line_the_cursor_is_on() {
+        let prompts = prompts();
+        assert_eq!(
+            declared_login_prompt(&prompts, b"Logging in...\nPassword: ").map(|p| p.kind),
+            Some(LifecyclePromptKind::Password)
+        );
+        // ANSI colour around the prompt does not hide it.
+        assert_eq!(
+            declared_login_prompt(&prompts, b"\x1b[1mEnter the 6-digit code:\x1b[0m ").map(|p| p.kind),
+            Some(LifecyclePromptKind::Otp)
+        );
+        // A marker mentioned earlier in the output, or mid-line, is not a prompt.
+        assert!(declared_login_prompt(&prompts, b"Password: is required\nDone.\n").is_none());
+        assert!(declared_login_prompt(&prompts, b"Password: hunter2 was rejected").is_none());
+        // Nothing declared, nothing matches — arbitrary terminal text is never a prompt.
+        assert!(declared_login_prompt(&[], b"Password: ").is_none());
+        assert!(declared_login_prompt(&prompts, b"").is_none());
+        // An invalid prompt (empty marker) never matches anything.
+        assert!(declared_login_prompt(&prompts, b"anything\n").is_none());
+    }
+
+    #[test]
+    fn prompt_markers_are_bounded_literals() {
+        assert!(LifecyclePrompt { kind: LifecyclePromptKind::Password, marker: "Password:".into() }.is_valid());
+        assert!(!LifecyclePrompt { kind: LifecyclePromptKind::Password, marker: "   ".into() }.is_valid());
+        assert!(!LifecyclePrompt { kind: LifecyclePromptKind::Password, marker: "x".repeat(129) }.is_valid());
+        assert!(!LifecyclePrompt { kind: LifecyclePromptKind::Password, marker: "Pass\u{7}word:".into() }.is_valid());
+        let contract: AuthLifecycle = serde_yaml::from_str(
+            "login_prompts:\n  - kind: otp\n    marker: 'Enter code:'\n",
+        )
+        .unwrap();
+        assert_eq!(contract.login_prompts[0].kind, LifecyclePromptKind::Otp);
+        assert!(serde_yaml::from_str::<AuthLifecycle>("login_prompts:\n  - kind: otp\n    marker: x\n    pattern: y\n").is_err());
+    }
 
     fn parse_contract(yaml: &str) -> SkillRuntimeContract {
         serde_yaml::from_str(yaml).expect("fixture must match the Phase 1A vocabulary")

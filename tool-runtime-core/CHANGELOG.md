@@ -8,7 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.74`._
+_Current development version: `0.1.75`._
+
+### Declared login prompts (`0.1.75`)
+
+- Add `auth.lifecycle.login_prompts`: the prompts a login hook may print on
+  the PTY, each a `kind` (`username`, `password`, `otp`, `device_code`,
+  `operator`) and the literal `marker` the prompt line ends with (1–128
+  bytes, no control characters). `manifest::declared_login_prompt` matches
+  only the current line, ANSI escapes dropped, ending exactly with a declared
+  marker — never arbitrary terminal text. Written for Magician's secure-HITL
+  authenticated dispatch (P4): the host answers a matched prompt through its
+  own secure channel or reports a typed `authentication_required` challenge.
+- Add `CredentialLifecyclePendingKind::Password` beside `Otp`.
+- Contracts without `login_prompts` are unchanged; no process, credential or
+  wire contract moves.
 
 ### macOS non-jailed batch launch
 

@@ -904,6 +904,7 @@ mod tests {
                         interaction: CliInteraction::Batch,
                         timeout_secs: Some(30),
                     }),
+                    login_prompts: Vec::new(),
                 },
                 identity,
                 ..AuthContract::default()

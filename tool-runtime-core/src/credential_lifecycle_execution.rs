@@ -1090,6 +1090,7 @@ mod tests {
                         timeout_secs: Some(30),
                     }),
                     refresh: None,
+                    login_prompts: Vec::new(),
                 },
                 identity: IdentityContract::ProfileExpected {
                     selector: IdentitySelector::JsonPointer {
