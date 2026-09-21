@@ -3,7 +3,7 @@
   "project": "MagicRun",
   "architecture_version": "0.1.74",
   "document": "docs/architecture.md",
-  "document_sha256": "9eb721a14e678eaded1bb5ec51a97082a246fb95743b94321e2d92bc3e9d70d1",
+  "document_sha256": "b7fd95d77e17374e7331e44422d05c9acf07e5ae3da8408d44c8ed33445e429c",
   "component_versions": {
     "tool-runtime-core": "0.1.74"
   },
@@ -36,7 +36,7 @@
     "tool-runtime-core/src/governed_execution.rs": "fc40d78097f3f1f4329c72190008b9a1e1e9c6cb724536075de680914f07ed69",
     "tool-runtime-core/src/governed_execution_authority.rs": "e1aae9ccc6ec43be09b97a3e869ce2a1a69615b23dd40447b59d2fd02d85b307",
     "tool-runtime-core/src/governed_execution_coordinator.rs": "bf9b7445f55f4e524a8f7cd5b265fb3cdcc5c05eda1d67b0259412072da9c368",
-    "tool-runtime-core/src/governed_execution_result.rs": "50f1b8115fcbca691d0164f2112e208cdb27ba7eea97ba7708faf927ae7b70a5",
+    "tool-runtime-core/src/governed_execution_result.rs": "6119c0825f7d897bf911de1b3b419e40c9b285310a60c01cdca6d744aef508bf",
     "tool-runtime-core/src/governed_process_jail.rs": "3969f410f83706b8ec493baaf1ef156215d24ffba2828ec100616bb108a5e022",
     "tool-runtime-core/src/governed_pty_process.rs": "5be0567c50cb74e15c4dcc84df4e1a5d9a619bd1bef358b59a608be875a38fff",
     "tool-runtime-core/src/inventory.rs": "6de35bebad840060369faebe7046c7b19db10d86d0ba432ce3fe2186d1b1b054",

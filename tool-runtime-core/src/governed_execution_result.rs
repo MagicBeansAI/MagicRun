@@ -9,11 +9,12 @@ use std::{
     ffi::CString,
     fmt, fs,
     fs::File,
-    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::{
     fs::MetadataExt,
@@ -342,6 +343,7 @@ impl GovernedArtifactAuthority {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn collect_raw(self) -> Result<RawArtifactCollection, GovernedArtifactError> {
         self.revalidate()?;
         let mut retention = GovernedArtifactRetention::acquire(self.policy.max_total_bytes)?;
@@ -399,6 +401,12 @@ impl GovernedArtifactAuthority {
             files,
             retention,
         })
+    }
+
+    #[cfg(not(unix))]
+    fn collect_raw(self) -> Result<RawArtifactCollection, GovernedArtifactError> {
+        let _ = self;
+        Err(unsafe_output_root())
     }
 }
 

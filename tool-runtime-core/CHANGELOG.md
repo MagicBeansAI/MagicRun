@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Current development version: `0.1.74`._
 
+### Windows compilation
+
+- Keep declared-artifact collection fail-closed on non-Unix targets without
+  compiling the Unix-only file-identity path. This restores Windows builds;
+  artifact authority remains unavailable there until an equivalent safe handle
+  walk is implemented.
+
 ### macOS non-jailed batch launch
 
 - Use `posix_spawn` with an open-directory file action, explicit argv/env and

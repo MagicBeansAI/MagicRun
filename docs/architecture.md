@@ -101,6 +101,10 @@ supervisor, launch an unrelated service, or silently replace a consumer's runtim
 - **Consumer attestations track source:** `source_bytes` lets a consumer review
   actual compiled code. Documentation fingerprints below are not a replacement
   for that consumer-owned trust decision.
+- **Declared artifacts fail closed off Unix:** the descriptor-relative artifact
+  collector is compiled only where its Unix identity and `openat` checks exist.
+  Windows builds retain the public contract but reject artifact authority until
+  an equivalent handle-relative implementation is reviewed.
 
 ## macOS non-jailed batch launch
 
