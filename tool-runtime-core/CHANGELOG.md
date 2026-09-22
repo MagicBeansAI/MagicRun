@@ -24,6 +24,13 @@ _Current development version: `0.1.75`._
 - Contracts without `login_prompts` are unchanged; no process, credential or
   wire contract moves.
 
+### Windows compilation
+
+- Keep declared-artifact collection fail-closed on non-Unix targets without
+  compiling the Unix-only file-identity path. This restores Windows builds;
+  artifact authority remains unavailable there until an equivalent safe handle
+  walk is implemented.
+
 ### macOS non-jailed batch launch
 
 - Use `posix_spawn` with an open-directory file action, explicit argv/env and

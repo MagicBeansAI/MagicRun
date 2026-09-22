@@ -6,6 +6,13 @@ on:
 permissions:
   contents: read
 jobs:
+  windows-compile:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The portable production library must compile on Windows. Its Unix-only
+      # execution fixtures are intentionally exercised by the runtime matrix.
+      - run: cargo check --workspace --lib --bins
   runtime:
     strategy:
       fail-fast: false
