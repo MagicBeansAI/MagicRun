@@ -1,6 +1,6 @@
 # MagicRun architecture
 
-Architecture version: `0.1.75`
+Architecture version: `0.1.76`
 
 Original immutable baseline tag: `architecture/v0.1.73`. The current reviewed
 source/document fingerprints are in [architecture-baseline.json](architecture-baseline.json).
@@ -72,7 +72,7 @@ supervisor, launch an unrelated service, or silently replace a consumer's runtim
 | --- | --- |
 | Manifest admission and tool discovery | `manifest*`, `registry`, `inventory`, `tool_discovery`, MCP catalog policy/projection |
 | Exact authorization and execution ownership | `governed_execution_coordinator`, `governed_execution_authority`, `governed_execution` |
-| Batch, PTY, optional jail | `governed_batch_process` and its macOS spawn backend, `governed_pty_process`, `governed_process_jail` |
+| Batch, PTY, optional jail | `governed_batch_process` and its macOS spawn backend, `governed_pty_process`, `governed_process_jail` and its in-jail egress forwarder (`magicrun-jail-egress-forwarder`) |
 | Credential preparation and placement | `credential_preparation`, `credential_injection`, `credential_materialization`, `credential_filesystem` |
 | Credential lifecycle and profiles | `credential_lifecycle*`, `credential_profiles`, `credential_profile_store`, `profile_selection` |
 | Results and settlement | `governed_execution_result`, coordinator audit/terminal types |
@@ -105,6 +105,53 @@ supervisor, launch an unrelated service, or silently replace a consumer's runtim
   collector is compiled only where its Unix identity and `openat` checks exist.
   Windows builds retain the public contract but reject artifact authority until
   an equivalent handle-relative implementation is reviewed.
+
+## Brokered-egress process jail
+
+`0.1.76` adds `GovernedProcessJail::strict_app_with_brokered_egress`, an
+explicitly opted-in variant of the strict jail whose only reachable network is
+one host-owned HTTP CONNECT broker. `strict_app` and its profile, argv and
+audit are unchanged (pinned by golden tests). The host owns the broker and all
+egress policy — destination allowlist, name resolution, private-address
+refusal, byte metering; the jail only guarantees there is no other way out.
+
+```mermaid
+flowchart LR
+    child["Jailed child (proxy env)"] -->|"macOS: TCP localhost:port only"| broker["Host CONNECT broker"]
+    child -->|"Linux: 127.0.0.1:3128 in isolated netns"| fwd["In-jail forwarder"]
+    fwd -->|"read-only bind of the broker's unix socket"| broker
+    broker -->|"allowlisted, host-resolved"| internet["Destination"]
+```
+
+- **macOS** (`LoopbackTcp { port }`): the strict SBPL profile plus
+  `network-outbound` IPv4 TCP to `localhost:<port>` (`remote tcp4`) and read-only `/private/etc/ssl`.
+  No `mach-lookup` (so no mDNSResponder DNS and no trustd), no bind/inbound.
+  TLS stacks that need trustd (Security.framework, Go on macOS) cannot verify
+  certificates here; file-based stores (`SSL_CERT_FILE`, OpenSSL/LibreSSL,
+  rustls with bundled roots, certifi) work.
+- **Linux** (`UnixSocket { path }`): `--unshare-all` stays, so the jail has
+  its own netns with only `lo` and no resolver files. A host TCP proxy is
+  unreachable from there, so `magicrun-jail-egress-forwarder` — installed
+  root-owned at a fixed path, validated like `bwrap`, digested into the audit —
+  runs first inside the jail, listens on `127.0.0.1:3128`, starts the exact
+  executable as its only child and relays each connection to the broker
+  socket (bind-mounted read-only; `connect(2)` does not need a writable
+  mount). It is single-threaded, never writes to stdio, never resolves names,
+  and exits with the child's exact status. It adds no authority: the child
+  could connect to the same socket directly.
+- The child environment is overlaid last with the proxy variables (upper and
+  lower case), empty `NO_PROXY`, and `SSL_CERT_FILE` for an exposed host trust
+  bundle. A child that ignores them has nothing to connect to.
+- Identity: a brokered jail reports schema
+  `tool-runtime.governed-process-jail.brokered-egress.v1`;
+  `governed_process_jail_profile_identity(platform, network)` digests the
+  rendered profile/argv template and overlay without needing a jail, for lock
+  digests; `GovernedProcessJailAudit::egress` carries the concrete binding
+  (broker kind and port, forwarder digest, binding identity). The strict audit
+  omits the field and serializes byte-for-byte as before.
+- Secrets need no new surface: a reviewed `auth.injections` secret with an
+  environment target already reaches a jailed child through
+  `CredentialPreparationPlan` and the host's `CredentialMaterialResolver`.
 
 ## Declared login prompts
 
