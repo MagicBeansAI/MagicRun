@@ -8,7 +8,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.75`._
+_Current development version: `0.1.76`._
+
+### Brokered-egress process jail (`0.1.76`)
+
+- Add `GovernedProcessJail::strict_app_with_brokered_egress(limits, broker)`,
+  an explicitly opted-in jail whose only reachable network is one host-owned
+  HTTP CONNECT broker (`GovernedEgressBrokerEndpoint`). The broker, not the
+  jail, enforces the destination allowlist, resolves names, refuses private
+  addresses and meters bytes; the jail guarantees it is the sole endpoint.
+  - macOS takes `LoopbackTcp { port }`: the strict SBPL profile plus exactly
+    `(allow network-outbound (remote ip "localhost:<port>"))` and read-only
+    access to `/private/etc/ssl` (and `/etc` symlink metadata). No
+    `mach-lookup` is granted, so DNS (mDNSResponder) and trustd remain
+    unreachable; no bind/inbound rule is granted.
+  - Linux takes `UnixSocket { path }` (an existing socket owned by the caller
+    in a directory nobody else can write). Bubblewrap keeps `--unshare-all`
+    (isolated netns, only `lo`, no resolver files); the socket, a host trust
+    bundle and the trusted forwarder are bind-mounted read-only, and the new
+    `magicrun-jail-egress-forwarder` binary (installed root-owned at one of
+    `GOVERNED_JAIL_EGRESS_FORWARDER_PATHS`) listens on `127.0.0.1:3128` (at most 16 concurrent relays) in the
+    jail's netns, runs the exact executable as its only child, relays each
+    connection to the socket, and exits with the child's exact status.
+  - The child environment gets `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (and
+    lowercase) set to `http://127.0.0.1:<port>`, empty `NO_PROXY`/`no_proxy`,
+    and `SSL_CERT_FILE` when a host trust bundle is exposed. The overlay is
+    applied after every contract value, so a package cannot re-point it. A
+    child that ignores the proxy variables cannot connect anywhere.
+- Add identity: `GovernedProcessJail::{network, platform, profile_identity}`,
+  `governed_process_jail_profile_identity(platform, network)` (an
+  endpoint-independent BLAKE3 over the rendered profile/argv template and
+  environment overlay, computable without a jail), and
+  `GovernedProcessJailAudit::egress` (`GovernedProcessJailEgressAudit`: broker
+  kind/port, proxy port, forwarder digest, profile and binding identities).
+  A brokered jail reports schema `tool-runtime.governed-process-jail.brokered-egress.v1`.
+- `source_bytes::GOVERNED_PROCESS_JAIL` now also carries the forwarder source
+  (`source_bytes::GOVERNED_JAIL_EGRESS_FORWARDER` alone).
+- The strict profile is unchanged: golden tests pin its macOS SBPL bytes, its
+  bubblewrap argv (now built by a pure builder) and its audit JSON (`egress` is
+  omitted when absent). New error codes: `UnsupportedEgressBroker`,
+  `EgressBrokerUnavailable`, `EgressForwarderUnavailable`.
+- No new API for secrets: caller-authorized environment already reaches a
+  jailed child through the existing `auth.injections` secret → environment
+  path (`CredentialPreparationPlan::new` + `CredentialMaterialResolver`).
 
 ### Declared login prompts (`0.1.75`)
 

@@ -5,7 +5,15 @@
 //! consumer to reach into a sibling checkout. Consumers own labels, hashing,
 //! review policy, and the handling of identity changes on an upgrade.
 
-pub const GOVERNED_PROCESS_JAIL: &[u8] = include_bytes!("governed_process_jail.rs");
+// The jail attestation covers the in-jail egress forwarder it launches in the
+// brokered-egress mode; consumers need not discover that security input.
+pub const GOVERNED_PROCESS_JAIL: &[u8] = concat!(
+    include_str!("governed_process_jail.rs"),
+    "\n// in-jail egress forwarder\n",
+    include_str!("governed_process_jail/egress_forwarder.rs"),
+).as_bytes();
+pub const GOVERNED_JAIL_EGRESS_FORWARDER: &[u8] =
+    include_bytes!("governed_process_jail/egress_forwarder.rs");
 #[cfg(not(target_os = "macos"))]
 pub const GOVERNED_BATCH_PROCESS: &[u8] = include_bytes!("governed_batch_process.rs");
 // Existing host attestations of batch execution must cover its new delegated
@@ -34,6 +42,15 @@ pub const CREDENTIAL_MATERIALIZATION: &[u8] = include_bytes!("credential_materia
 pub const MANIFEST_PARSER: &[u8] = include_bytes!("manifest_parser.rs");
 pub const MANIFEST_VALIDATION: &[u8] = include_bytes!("manifest_validation.rs");
 pub const MCP_CATALOG_PROJECTION: &[u8] = include_bytes!("mcp_catalog_projection.rs");
+
+#[cfg(test)]
+mod jail_tests {
+    #[test]
+    fn jail_attestation_includes_the_in_jail_egress_forwarder() {
+        assert!(super::GOVERNED_PROCESS_JAIL.starts_with(include_bytes!("governed_process_jail.rs")));
+        assert!(super::GOVERNED_PROCESS_JAIL.ends_with(super::GOVERNED_JAIL_EGRESS_FORWARDER));
+    }
+}
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
