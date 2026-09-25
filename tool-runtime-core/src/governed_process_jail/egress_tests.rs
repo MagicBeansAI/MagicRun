@@ -345,6 +345,38 @@ mod macos {
         assert!(broker.requests().is_empty());
     }
 
+    /// The broker port admits IPv4 TCP only: a listener another process
+    /// binds on the same port over IPv6 loopback stays unreachable.
+    #[test]
+    fn the_broker_port_over_ipv6_loopback_is_refused() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let broker = TestBroker::start();
+        let Ok(listener) = TcpListener::bind(("::1", broker.port)) else {
+            return;
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                if let Ok(stream) = stream {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            }
+        });
+        let Some(jail) = brokered(broker.port) else {
+            return;
+        };
+        let target = format!("http://[::1]:{}/", broker.port);
+        let run = run_in_jail(jail, "curl", &["-sS", "--noproxy", "*", &target]);
+        assert_eq!(run.exit_code, Some(7), "stderr={}", run.stderr);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert!(broker.requests().is_empty());
+    }
+
     /// (c) Name resolution is impossible inside the jail.
     #[test]
     fn dns_resolution_fails_inside_the_jail() {

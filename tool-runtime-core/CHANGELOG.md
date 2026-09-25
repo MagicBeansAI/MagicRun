@@ -18,7 +18,7 @@ _Current development version: `0.1.76`._
   jail, enforces the destination allowlist, resolves names, refuses private
   addresses and meters bytes; the jail guarantees it is the sole endpoint.
   - macOS takes `LoopbackTcp { port }`: the strict SBPL profile plus exactly
-    `(allow network-outbound (remote ip "localhost:<port>"))` and read-only
+    `(allow network-outbound (remote tcp4 "localhost:<port>"))` (IPv4 TCP only) and read-only
     access to `/private/etc/ssl` (and `/etc` symlink metadata). No
     `mach-lookup` is granted, so DNS (mDNSResponder) and trustd remain
     unreachable; no bind/inbound rule is granted.

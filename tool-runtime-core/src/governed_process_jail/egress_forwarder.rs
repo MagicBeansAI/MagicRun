@@ -132,7 +132,8 @@ mod unix {
         let mut connections: Vec<Connection> = Vec::new();
         loop {
             let mut descriptors = Vec::with_capacity(1 + connections.len() * 2);
-            if connections.len() < MAX_FORWARDER_CONNECTIONS {
+            let listening = connections.len() < MAX_FORWARDER_CONNECTIONS;
+            if listening {
                 descriptors.push(libc::pollfd {
                     fd: listener.as_raw_fd(),
                     events: libc::POLLIN,
@@ -168,6 +169,18 @@ mod unix {
             }
             if let Some(status) = child.try_wait().map_err(|_| FORWARDER_EXIT_USAGE)? {
                 return Ok(status);
+            }
+            // `poll` reports hang-up and error even on a descriptor with no
+            // registered interest; without looking, a dead peer would make
+            // every poll return at once and spin the relay.
+            if ready > 0 {
+                let offset = usize::from(listening);
+                for (connection, pair) in connections
+                    .iter_mut()
+                    .zip(descriptors[offset..].chunks_exact(2))
+                {
+                    connection.observe(pair[0].revents, pair[1].revents);
+                }
             }
             accept_pending(&listener, &invocation.socket, &mut connections);
             for connection in &mut connections {
@@ -301,6 +314,22 @@ mod unix {
                 upstream |= libc::POLLOUT;
             }
             (client, upstream)
+        }
+
+        /// Fail a connection whose descriptors can no longer make progress:
+        /// a client that hung up or errored cannot receive the rest of a
+        /// reply, and a broker that hung up after everything it sent was
+        /// delivered cannot take more of the request.
+        fn observe(&mut self, client: libc::c_short, upstream: libc::c_short) {
+            let dead = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+            if client & dead != 0
+                || upstream & (libc::POLLERR | libc::POLLNVAL) != 0
+                || (upstream & libc::POLLHUP != 0
+                    && self.inbound.source_closed
+                    && !self.inbound.has_data())
+            {
+                self.failed = true;
+            }
         }
 
         fn pump(&mut self) {

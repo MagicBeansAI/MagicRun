@@ -3,7 +3,7 @@
   "project": "MagicRun",
   "architecture_version": "0.1.76",
   "document": "docs/architecture.md",
-  "document_sha256": "3a82ad76cad9b0c201a665c7a37a340517eee34d60dc0d6f3d43b69543ed9cf9",
+  "document_sha256": "0bd3a8e2d2f7c1e975d447c02dc5332517a425e73efdb63b30da39792ae6a400",
   "component_versions": {
     "tool-runtime-core": "0.1.76"
   },
@@ -38,9 +38,9 @@
     "tool-runtime-core/src/governed_execution_authority.rs": "e1aae9ccc6ec43be09b97a3e869ce2a1a69615b23dd40447b59d2fd02d85b307",
     "tool-runtime-core/src/governed_execution_coordinator.rs": "bf9b7445f55f4e524a8f7cd5b265fb3cdcc5c05eda1d67b0259412072da9c368",
     "tool-runtime-core/src/governed_execution_result.rs": "6119c0825f7d897bf911de1b3b419e40c9b285310a60c01cdca6d744aef508bf",
-    "tool-runtime-core/src/governed_process_jail.rs": "e06b8bfa7c4d10ab5ea07156f1a4720f60f2c1130a1aff590f57936164342dd8",
-    "tool-runtime-core/src/governed_process_jail/egress_forwarder.rs": "886d8dc7a843ab48aedb2b5c6021276021d96b3bb4dc758c90bb141f632e756f",
-    "tool-runtime-core/src/governed_process_jail/egress_tests.rs": "bfca2eec8065fb47b6319cac717802059edb55bb73b22376d15b2a4a6811961a",
+    "tool-runtime-core/src/governed_process_jail.rs": "003afeb4e38a022a7002b729fd4368e402d6bfcd7140f73e9013fd018f3ce510",
+    "tool-runtime-core/src/governed_process_jail/egress_forwarder.rs": "534fa25cd2e466bdf964e177c54691e4d12a62e5b8d4997a50f459095a0c7c4a",
+    "tool-runtime-core/src/governed_process_jail/egress_tests.rs": "f755a4160027586401111f57fb78e10c4d34adf6f9e166f5691e3cbba951f082",
     "tool-runtime-core/src/governed_pty_process.rs": "5be0567c50cb74e15c4dcc84df4e1a5d9a619bd1bef358b59a608be875a38fff",
     "tool-runtime-core/src/inventory.rs": "6de35bebad840060369faebe7046c7b19db10d86d0ba432ce3fe2186d1b1b054",
     "tool-runtime-core/src/lib.rs": "bd8fa12a9813ababd0aa7d2baada4ea680478d83fc5ab982439039e48b61245e",

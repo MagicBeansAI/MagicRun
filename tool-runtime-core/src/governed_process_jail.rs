@@ -159,7 +159,7 @@ pub enum GovernedProcessJailNetwork {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GovernedEgressBrokerEndpoint {
     /// macOS: a TCP listener on the host loopback interface. The sandbox
-    /// profile admits outbound connections to `localhost:<port>` only.
+    /// profile admits outbound IPv4 TCP to `localhost:<port>` only.
     LoopbackTcp { port: NonZeroU16 },
     /// Linux: a unix stream socket owned by the calling user. It is
     /// bind-mounted read-only into the jail and relayed from
@@ -1078,7 +1078,7 @@ fn macos_egress_profile(
         ));
     }
     profile.push_str(&format!(
-        "(allow network-outbound (remote ip \"localhost:{broker_port}\"))\n"
+        "(allow network-outbound (remote tcp4 \"localhost:{broker_port}\"))\n"
     ));
     if profile.len() > MAX_GOVERNED_JAIL_PROFILE_BYTES {
         return Err(profile_too_large());
@@ -1626,7 +1626,7 @@ mod tests {
             added,
             "(allow file-read-metadata (literal \"/etc\"))\n\
              (allow file-read* (subpath \"/private/etc/ssl\"))\n\
-             (allow network-outbound (remote ip \"localhost:49152\"))\n"
+             (allow network-outbound (remote tcp4 \"localhost:49152\"))\n"
         );
         for absent in ["mach-lookup", "network-bind", "network-inbound", "(remote ip \"*", "system-socket", "(allow default)"] {
             assert!(!brokered.contains(absent), "{absent}");
@@ -1634,7 +1634,7 @@ mod tests {
         let without_trust = macos_egress_profile(executable, None, workdir, "49152", false).unwrap();
         assert_eq!(
             without_trust.strip_prefix(&strict).unwrap(),
-            "(allow network-outbound (remote ip \"localhost:49152\"))\n"
+            "(allow network-outbound (remote tcp4 \"localhost:49152\"))\n"
         );
         for hostile in ["", "1) (allow default", "80\"", "*"] {
             assert!(macos_egress_profile(executable, None, workdir, hostile, true).is_err());

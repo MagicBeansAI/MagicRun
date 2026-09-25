@@ -124,7 +124,7 @@ flowchart LR
 ```
 
 - **macOS** (`LoopbackTcp { port }`): the strict SBPL profile plus
-  `network-outbound` to `localhost:<port>` and read-only `/private/etc/ssl`.
+  `network-outbound` IPv4 TCP to `localhost:<port>` (`remote tcp4`) and read-only `/private/etc/ssl`.
   No `mach-lookup` (so no mDNSResponder DNS and no trustd), no bind/inbound.
   TLS stacks that need trustd (Security.framework, Go on macOS) cannot verify
   certificates here; file-based stores (`SSL_CERT_FILE`, OpenSSL/LibreSSL,
