@@ -775,6 +775,73 @@ mod tests {
         assert_eq!(profile.matches("(allow process-exec").count(), 1);
     }
 
+    /// Golden: the strict profile existing locks were reviewed against. The
+    /// brokered-egress mode must not move a single byte of it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_strict_profile_is_byte_identical_to_the_reviewed_golden() {
+        let profile = macos_profile(
+            Path::new("/private/tmp/governed-bundle/bin/tool"),
+            Some(Path::new("/private/tmp/governed-bundle")),
+            Path::new("/private/tmp/private-work"),
+        )
+        .unwrap();
+        assert_eq!(
+            profile,
+            "(version 1)\n\
+             (deny default)\n\
+             (deny process-fork)\n\
+             (allow process-exec (literal \"/private/tmp/governed-bundle/bin/tool\"))\n\
+             (allow file-read* (literal \"/private/tmp/governed-bundle/bin/tool\"))\n\
+             (allow file-read-data (literal \"/\"))\n\
+             (allow sysctl-read)\n\
+             (allow file-read* (subpath \"/System\"))\n\
+             (allow file-read* (subpath \"/usr/lib\"))\n\
+             (allow file-read* (subpath \"/Library/Apple/System\"))\n\
+             (allow file-read* (subpath \"/private/var/db/dyld\"))\n\
+             (allow file-read* (literal \"/dev/null\"))\n\
+             (allow file-read* (literal \"/dev/random\"))\n\
+             (allow file-read* (literal \"/dev/urandom\"))\n\
+             (allow file-read* (subpath \"/private/tmp/governed-bundle\"))\n\
+             (allow file-read* (subpath \"/private/tmp/private-work\"))\n\
+             (allow file-write* (subpath \"/private/tmp/private-work\"))\n"
+        );
+    }
+
+    /// Golden: the strict audit projection is embedded in governed receipts
+    /// and consumer digests. It must serialize exactly as before.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn strict_audit_serialization_is_unchanged() {
+        let jail = match GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) {
+            Ok(jail) => jail,
+            Err(error) if error.code == GovernedProcessJailErrorCode::LauncherUnavailable => return,
+            Err(error) => panic!("unexpected strict jail setup failure: {error}"),
+        };
+        assert_eq!(jail.schema_version(), GOVERNED_PROCESS_JAIL_V1);
+        let platform = if cfg!(target_os = "macos") {
+            ("macos_sandbox_exec", false)
+        } else {
+            ("linux_bubblewrap", true)
+        };
+        assert_eq!(
+            serde_json::to_string(&jail.audit()).unwrap(),
+            format!(
+                "{{\"guarantees\":{{\"schema_version\":\"tool-runtime.governed-process-jail.v1\",\
+                 \"platform\":\"{}\",\"direct_network_denied\":true,\
+                 \"ambient_environment_denied\":true,\"host_writes_denied\":true,\
+                 \"private_workdir\":true,\"exact_executable_snapshot\":true,\
+                 \"wall_ceiling\":true,\"cpu_ceiling\":true,\"memory_ceiling\":true,\
+                 \"process_ceiling\":{},\"file_ceiling\":true,\"output_ceiling\":true}},\
+                 \"limits\":{{\"wall_seconds\":30,\"cpu_seconds\":30,\
+                 \"max_memory_bytes\":536870912,\"max_processes\":16,\
+                 \"max_open_files\":64,\"max_files\":256,\"max_file_bytes\":16777216,\
+                 \"max_total_file_bytes\":67108864}}}}",
+                platform.0, platform.1
+            )
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_reused_system_executable_does_not_grant_its_parent() {
