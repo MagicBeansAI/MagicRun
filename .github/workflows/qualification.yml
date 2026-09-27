@@ -25,3 +25,26 @@ jobs:
       - run: make test-architecture
       - run: make check
       - run: make test
+  # The Linux jail paths (bubblewrap, the in-jail egress forwarder, interpreter
+  # mode, staged inputs) run for real here: skipped Linux jail tests fail
+  # (MAGICRUN_REQUIRE_LINUX_JAIL=1). Both launch modes are covered:
+  # unprivileged user namespaces, and setuid bubblewrap as used in containers.
+  linux-jail:
+    strategy:
+      fail-fast: false
+      matrix:
+        bwrap: [userns, setuid]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap python3 jq curl perl
+      # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor.
+      - if: matrix.bwrap == 'userns'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - if: matrix.bwrap == 'setuid'
+        run: sudo chmod u+s /usr/bin/bwrap && ls -l /usr/bin/bwrap
+      - run: cargo build -p tool-runtime-core --bin magicrun-jail-egress-forwarder
+      - run: sudo install -D -o root -g root -m 0755 target/debug/magicrun-jail-egress-forwarder /usr/libexec/magicrun/magicrun-jail-egress-forwarder
+      - run: ls -ld /usr/libexec /usr/libexec/magicrun && python3 --version && bwrap --version
+      - run: MAGICRUN_REQUIRE_LINUX_JAIL=1 cargo test -p tool-runtime-core --lib governed_process_jail -- --nocapture
+      - run: MAGICRUN_REQUIRE_LINUX_JAIL=1 cargo test -p tool-runtime-core --test jail_egress_forwarder -- --nocapture
