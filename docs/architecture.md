@@ -1,6 +1,6 @@
 # MagicRun architecture
 
-Architecture version: `0.1.77`
+Architecture version: `0.1.78`
 
 Original immutable baseline tag: `architecture/v0.1.73`. The current reviewed
 source/document fingerprints are in [architecture-baseline.json](architecture-baseline.json).
@@ -269,6 +269,22 @@ flowchart LR
 - **Launch errors.** A pinned interpreter that changed before launch is
   reported as `GovernedBatchProcessErrorCode::InterpreterUnavailable`, not
   `JailUnavailable`.
+
+## Staged input files (`0.1.78`)
+
+`GovernedProcessJail::stage_input_file(name, bytes)` writes one input file
+into the jail's private workdir before launch and returns the plain name the
+child opens relative to its working directory. A consumer can hand a jailed
+tool data it would otherwise read from a host path, without ever learning or
+exposing the workdir's host path.
+
+- **Name.** One plain component: `[A-Za-z0-9._-]`, not hidden, at most 128
+  bytes. `..`, separators and non-ASCII are refused (`InvalidInputFile`).
+- **Creation.** The file is always fresh (`create_new`, `O_NOFOLLOW`): an
+  existing name or a planted link is refused, never overwritten or followed.
+  It is written `0400` and synced.
+- **Limits.** It counts against the jail's `max_file_bytes`,
+  `max_total_file_bytes` and `max_files`, exactly as the child's own files do.
 
 ## Declared login prompts
 

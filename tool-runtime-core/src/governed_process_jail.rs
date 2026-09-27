@@ -137,6 +137,9 @@ pub enum GovernedProcessJailErrorCode {
     /// No trusted interpreter is installed, a pinned interpreter changed, or
     /// the jail cannot take one.
     InterpreterUnavailable,
+    /// A staged input file has an unsafe name, already exists, or would
+    /// exceed the jail's file limits.
+    InvalidInputFile,
 }
 
 /// Stable and value-free. Host paths and launcher diagnostics never cross the
@@ -767,6 +770,46 @@ impl GovernedProcessJail {
     ) -> Result<GovernedWorkingDirectoryRoot, GovernedProcessJailError> {
         GovernedWorkingDirectoryRoot::open(mode, &self.canonical_workdir)
             .map_err(|_| private_workdir_unavailable())
+    }
+
+    /// Write one input file into the jail's private workdir before launch and
+    /// return the plain name the child opens relative to its working
+    /// directory. The host path is never returned. The name is a single
+    /// component (`[A-Za-z0-9._-]`, not hidden, at most 128 bytes); the file
+    /// is created fresh (never overwriting or following a link), read-only to
+    /// its owner, and counts against the jail's file ceilings exactly as the
+    /// child's own files do.
+    pub fn stage_input_file(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<String, GovernedProcessJailError> {
+        if !is_plain_input_file_name(name) {
+            return Err(invalid_input_file());
+        }
+        let length = u64::try_from(bytes.len()).map_err(|_| invalid_input_file())?;
+        if length > self.limits.max_file_bytes {
+            return Err(invalid_input_file());
+        }
+        let (files, total) = staged_workdir_usage(&self.canonical_workdir)?;
+        if files.saturating_add(1) > self.limits.max_files
+            || total.saturating_add(length) > self.limits.max_total_file_bytes
+        {
+            return Err(invalid_input_file());
+        }
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o400).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(self.canonical_workdir.join(name))
+            .map_err(|_| invalid_input_file())?;
+        std::io::Write::write_all(&mut file, bytes).map_err(|_| invalid_input_file())?;
+        file.sync_all().map_err(|_| invalid_input_file())?;
+        Ok(name.to_owned())
     }
 
     pub(crate) fn watch(&self) -> GovernedProcessJailWatch {
@@ -2209,6 +2252,45 @@ const fn launcher_unavailable() -> GovernedProcessJailError {
     )
 }
 
+fn is_plain_input_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Files and bytes already in the private workdir, walked without following
+/// links; anything unexpected refuses staging.
+fn staged_workdir_usage(workdir: &Path) -> Result<(u64, u64), GovernedProcessJailError> {
+    let mut pending = vec![workdir.to_path_buf()];
+    let (mut files, mut total) = (0_u64, 0_u64);
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|_| invalid_input_file())? {
+            let entry = entry.map_err(|_| invalid_input_file())?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|_| invalid_input_file())?;
+            files = files.saturating_add(1);
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            } else {
+                return Err(invalid_input_file());
+            }
+        }
+    }
+    Ok((files, total))
+}
+
+const fn invalid_input_file() -> GovernedProcessJailError {
+    GovernedProcessJailError::new(
+        GovernedProcessJailErrorCode::InvalidInputFile,
+        "jail.input_file",
+        "a staged input file is unsafe or exceeds the jail's file limits",
+    )
+}
+
 const fn private_workdir_unavailable() -> GovernedProcessJailError {
     GovernedProcessJailError::new(
         GovernedProcessJailErrorCode::PrivateWorkdirUnavailable,
@@ -2278,6 +2360,71 @@ const fn unsafe_host_path() -> GovernedProcessJailError {
 mod tests {
     use super::*;
     use static_assertions::assert_not_impl_any;
+
+    fn strict_jail_or_skip() -> Option<GovernedProcessJail> {
+        GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()).ok()
+    }
+
+    #[test]
+    fn staged_input_names_are_single_plain_components() {
+        for good in ["input.json", "doc-1.pdf", "a_b.C9"] {
+            assert!(is_plain_input_file_name(good), "{good}");
+        }
+        let long = "x".repeat(129);
+        for bad in ["", ".hidden", "..", "a/b", "../x", "a b", "a\\b", "é.txt", long.as_str()] {
+            assert!(!is_plain_input_file_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn staging_writes_a_fresh_read_only_file_and_never_overwrites_or_follows_links() {
+        let Some(jail) = strict_jail_or_skip() else {
+            return;
+        };
+        assert_eq!(jail.stage_input_file("input.json", b"{}").unwrap(), "input.json");
+        let staged = jail.canonical_workdir.join("input.json");
+        assert_eq!(fs::read(&staged).unwrap(), b"{}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&staged).unwrap().permissions().mode() & 0o777, 0o400);
+        }
+        assert_eq!(
+            jail.stage_input_file("input.json", b"again").unwrap_err().code,
+            GovernedProcessJailErrorCode::InvalidInputFile
+        );
+        assert_eq!(
+            jail.stage_input_file("../escape", b"x").unwrap_err().code,
+            GovernedProcessJailErrorCode::InvalidInputFile
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/hosts", jail.canonical_workdir.join("link")).unwrap();
+            assert_eq!(
+                jail.stage_input_file("link", b"x").unwrap_err().code,
+                GovernedProcessJailErrorCode::InvalidInputFile
+            );
+        }
+    }
+
+    #[test]
+    fn staging_respects_the_jail_file_ceilings() {
+        let mut limits = GovernedProcessJailLimits::default();
+        limits.max_file_bytes = 8;
+        limits.max_total_file_bytes = 12;
+        limits.max_files = 2;
+        let Ok(jail) = GovernedProcessJail::strict_app(limits) else {
+            return;
+        };
+        let refused = |result: Result<String, GovernedProcessJailError>| {
+            result.unwrap_err().code == GovernedProcessJailErrorCode::InvalidInputFile
+        };
+        assert!(refused(jail.stage_input_file("big", b"123456789")));
+        jail.stage_input_file("one", b"12345678").unwrap();
+        assert!(refused(jail.stage_input_file("two", b"12345")), "total ceiling");
+        jail.stage_input_file("two", b"1234").unwrap();
+        assert!(refused(jail.stage_input_file("three", b"")), "file-count ceiling");
+    }
 
     #[test]
     fn limits_refuse_zero_and_widening() {

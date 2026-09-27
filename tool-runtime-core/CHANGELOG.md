@@ -8,7 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.77`._
+_Current development version: `0.1.78`._
+
+### Staged input files (`0.1.78`)
+
+- Add `GovernedProcessJail::stage_input_file(name, bytes)`: one fresh,
+  owner-read-only file in the private workdir before launch, addressed by a
+  plain single-component name, bounded by the jail's file ceilings; the host
+  path is never returned. New error code `InvalidInputFile`. Profiles,
+  identities and goldens are unchanged.
 
 ### Interpreter mode for the governed process jail (`0.1.77`)
 

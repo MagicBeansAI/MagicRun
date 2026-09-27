@@ -296,6 +296,22 @@ mod macos {
         }
     }
 
+    /// A file staged before launch is readable by the jailed child by its
+    /// plain name, relative to the private workdir.
+    #[test]
+    fn a_staged_input_file_is_readable_by_the_child() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Ok(jail) = GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let name = jail.stage_input_file("input.txt", b"staged-content").unwrap();
+        let run = run_in_jail(jail, "cat", &[&name]);
+        assert_eq!(run.exit_code, Some(0), "stderr={}", run.stderr);
+        assert_eq!(run.stdout, "staged-content");
+    }
+
     /// (a) A standard CLI reaches the broker through the proxy environment
     /// alone, and bytes are tunnelled end to end.
     #[test]
