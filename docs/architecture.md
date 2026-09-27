@@ -314,12 +314,17 @@ flowchart LR
   BLAKE3 in `GovernedProcessJailAudit::linux_helper_digest`) read-only at
   `/run/magicrun/jail-helper` and runs it first:
   `--magicrun-jail-exec-v1 <tasks> <host-userns> -- <program…>`. It checks
-  that `/proc/self/ns/user` differs from the host's namespace, sets
-  `RLIMIT_NPROC` soft and hard to `max_tasks + GOVERNED_JAIL_HELPER_TASKS`
-  (bubblewrap's in-jail init and the brokered forwarder) and execs. In the
+  that `/proc/self/ns/user` differs from the host's namespace and that its
+  UID does not map to host root (`/proc/self/uid_map`), sets `RLIMIT_NPROC`
+  soft and hard to `max_tasks` plus the machinery in the namespace
+  (bubblewrap's init; plus the forwarder when brokered) and execs. In the
   brokered mode it execs the forwarder role, which spawns the command. A
-  Linux jail without the helper fails to build with `JailHelperUnavailable`
-  (brokered: `EgressForwarderUnavailable`).
+  refusal is exit 126 with exactly `JAIL_EXEC_REFUSAL_MARKER` on stderr; the
+  batch runner reports that as `GovernedBatchProcessErrorCode::JailHelperRefused`
+  (not dispatched), not as the command's exit. A Linux jail without the helper
+  fails to build with `JailHelperUnavailable` (brokered:
+  `EgressForwarderUnavailable`); a helper whose device, inode, size or times
+  changed since the jail was built is refused at launch.
 - **What the kernel checks.**
   - *Unprivileged bubblewrap (userns):* the namespace is owned by the user.
     Level 0 counts the jail's tasks in its own namespace against the shim's
@@ -330,27 +335,39 @@ flowchart LR
     exact per-jail bound; the ancestor level counts root's tasks against the
     unlowered limit bubblewrap inherited, which no longer fails.
   - *Setuid bubblewrap without user namespaces* (`user.max_user_namespaces=0`,
-    RHEL 7 module parameter, old kernels): the jail's tasks share the UID's
-    host-wide count, so no `RLIMIT_NPROC` can bound one jail. The shim runs
-    as `- -` (exec only), `guarantees().process_ceiling` is `false`, and the
-    sampled watchdog is the only process/task bound. A delegated cgroup v2
-    `pids.max` would be exact there; none is assumed.
-  - The host predicts the mode the way bubblewrap decides it (setuid bit,
-    `/proc/self/ns/user`, RHEL parameter, `max_user_namespaces`). A wrong
-    prediction fails closed: the shim refuses a requested ceiling outside a
-    new namespace (exit 126).
+    the RHEL 7 module parameter, or no user-namespace support): the jail's
+    tasks share the UID's host-wide count, so no `RLIMIT_NPROC` can bound one
+    jail.
+  - *Kernels before 5.17*: before the 5.14 ucounts rework `RLIMIT_NPROC`
+    counts the UID's tasks host-wide even inside a user namespace (Debian 11,
+    Ubuntu 20.04, RHEL 8), and 5.14-5.16 carry accounting bugs fixed in 5.17.
+  - *A root real UID*: Linux never holds tasks charged to the initial root
+    user to `RLIMIT_NPROC`.
+  - In these three cases the shim runs as `- -` (exec only),
+    `guarantees().process_ceiling` is `false`, and the sampled watchdog is the
+    only process/task bound. A delegated cgroup v2 `pids.max` would be exact
+    there; none is assumed.
+  - The host decides with `MIN_GOVERNED_JAIL_TASK_CEILING_KERNEL` (5.17, from
+    `uname`; an unparsable release fails closed), the real UID, and the way
+    bubblewrap decides on a namespace (setuid bit, `/proc/self/ns/user`, RHEL
+    parameter, `max_user_namespaces`). A wrong prediction fails closed: the
+    shim refuses a requested ceiling outside a new namespace or for a UID
+    mapped to host root.
 - **Tasks and processes.** `GovernedProcessJailLimits::max_tasks` (default
   256, at most 1024, at least `max_processes`) is the thread budget; Node,
   Go and threaded Python run many threads per process. `max_processes` stays
-  the watchdog's process count. Both allow the launcher, init and forwarder
-  on top.
+  the watchdog's process count. On Linux both allow the launcher, init and
+  (brokered) forwarder on top; on macOS nothing, as `sandbox-exec` execs the
+  command in place.
 - **Watchdog.** Linux samples the launcher and all its descendants by parent
   links, not the process group: a jailed process can `setsid`/`setpgid`
   out of the group, never out of the pid namespace, whose orphans the
   in-jail init adopts. It sums processes, threads, CPU and resident memory.
   Killing the launcher's group still tears the jail down (the init dies with
   its parent, and the pid namespace with it). macOS also counts threads
-  (`PROC_PIDTASKINFO`).
+  (`PROC_PIDTASKINFO`). Known limits: each sample re-reads `/proc` whole (a
+  process forked between two reads is seen next sample), and directory
+  identity re-reads `/proc/self/mountinfo` on every check; neither is cached.
 - **Directory identity.** Birth time is part of a working directory's
   identity on Linux only (inode numbers are reused at once), and not on
   overlayfs, where copy-up changes it. macOS leaves it out: `touch -t` to an

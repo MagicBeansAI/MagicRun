@@ -518,6 +518,11 @@ fn the_exec_shim_refuses_a_ceiling_in_the_host_user_namespace() {
     let path = marker.path().join("ran");
     let output = exec_shim(&["64", &host, "--", "/usr/bin/touch", path.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(126));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        tool_runtime_core::governed_process_jail::egress_forwarder::JAIL_EXEC_REFUSAL_MARKER
+    );
+    assert!(output.stdout.is_empty());
     assert!(!path.exists());
     // Malformed: refused before anything runs.
     let output = exec_shim(&["64", "-", "--", "/usr/bin/touch", path.to_str().unwrap()]);

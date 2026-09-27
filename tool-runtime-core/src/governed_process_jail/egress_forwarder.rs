@@ -27,7 +27,9 @@
 //! ```
 //!
 //! With a task ceiling it first proves it runs in a user namespace other than
-//! the host's (`/proc/self/ns/user` differs from `<host-userns>`), then sets
+//! the host's (`/proc/self/ns/user` differs from `<host-userns>`) and that
+//! its UID does not map to host root (whose tasks Linux never holds to
+//! `RLIMIT_NPROC`), then sets
 //! `RLIMIT_NPROC` (soft and hard) to `<tasks>` and execs `<program>`. Linux
 //! charges `RLIMIT_NPROC` to the (user namespace, UID) pair of the forking
 //! task, so inside the jail's own new user namespace it counts only the
@@ -46,6 +48,11 @@ pub const FORWARDER_EXIT_SPAWN: i32 = 127;
 /// Exec shim: a task ceiling was requested but the shim does not run in a
 /// user namespace of its own, so no per-jail bound is possible.
 pub const JAIL_EXEC_EXIT_NO_USER_NAMESPACE: i32 = 126;
+/// The exact stderr of an exec-shim refusal. The batch runner reports a jail
+/// whose ceiling was requested, that exits 126 with exactly this stderr and
+/// no stdout, as a jail failure rather than the command's exit.
+pub const JAIL_EXEC_REFUSAL_MARKER: &str =
+    "magicrun-jail-helper: refused: no per-jail task ceiling is possible here\n";
 /// argv marker of the in-jail exec-shim protocol.
 pub const GOVERNED_JAIL_EXEC_PROTOCOL_V1: &str = "--magicrun-jail-exec-v1";
 /// Concurrent relayed connections; further connections wait in the listen
@@ -174,6 +181,27 @@ pub fn parse_exec_arguments(
     })
 }
 
+/// Whether `uid` maps to host UID 0 in a `/proc/<pid>/uid_map` (lines of
+/// `inside outside count`). Unmapped or malformed counts as root: fail closed.
+pub fn uid_maps_to_host_root(uid_map: &str, uid: u64) -> bool {
+    for line in uid_map.lines() {
+        let fields = line
+            .split_whitespace()
+            .map(str::parse::<u64>)
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(fields) = fields else {
+            return true;
+        };
+        let [inside, outside, count] = fields[..] else {
+            return true;
+        };
+        if uid >= inside && uid - inside < count {
+            return outside + (uid - inside) == 0;
+        }
+    }
+    true
+}
+
 /// The inode of a `user:[N]` namespace link target.
 pub fn parse_user_namespace_link(target: &std::path::Path) -> Option<u64> {
     target
@@ -235,7 +263,17 @@ mod unix {
             let own = std::fs::read_link("/proc/self/ns/user")
                 .ok()
                 .and_then(|target| super::parse_user_namespace_link(&target));
-            if own.is_none() || own == Some(host_namespace) {
+            // SAFETY: `getuid` has no preconditions and cannot fail.
+            let uid = u64::from(unsafe { libc::getuid() });
+            let host_root = std::fs::read_to_string("/proc/self/uid_map")
+                .map_or(true, |map| super::uid_maps_to_host_root(&map, uid));
+            if own.is_none() || own == Some(host_namespace) || host_root {
+                // One fixed line, so the runner can tell the refusal from the
+                // command's own exit; nothing else is ever written.
+                let _ = std::io::Write::write_all(
+                    &mut std::io::stderr(),
+                    super::JAIL_EXEC_REFUSAL_MARKER.as_bytes(),
+                );
                 return super::JAIL_EXEC_EXIT_NO_USER_NAMESPACE;
             }
             // The parser bounds nothing, but a ceiling beyond `rlim_t` is
@@ -787,6 +825,24 @@ mod tests {
         assert_eq!(connection_capacity_for(16, 6), 4);
         // Never fewer reserved than stdio plus the listener.
         assert_eq!(connection_capacity_for(12, 0), 3);
+    }
+
+    #[test]
+    fn a_uid_mapped_to_host_root_is_refused() {
+        // bubblewrap's usual single mapping of the caller's UID.
+        assert!(!uid_maps_to_host_root("      1000       1000          1\n", 1000));
+        // The initial namespace's identity map: UID 1000 is host 1000.
+        assert!(!uid_maps_to_host_root("         0          0 4294967295\n", 1000));
+        // Root in the initial namespace, or mapped onto host root.
+        assert!(uid_maps_to_host_root("         0          0 4294967295\n", 0));
+        assert!(uid_maps_to_host_root("0 0 1\n", 0));
+        assert!(uid_maps_to_host_root("1000 0 1\n", 1000));
+        assert!(!uid_maps_to_host_root("0 100000 65536\n", 0));
+        // Unmapped or malformed: fail closed.
+        assert!(uid_maps_to_host_root("1000 1000 1\n", 7));
+        assert!(uid_maps_to_host_root("", 1000));
+        assert!(uid_maps_to_host_root("x y z\n", 1000));
+        assert!(uid_maps_to_host_root("1 2\n", 1));
     }
 
     #[test]

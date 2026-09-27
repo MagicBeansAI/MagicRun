@@ -1194,12 +1194,10 @@ mod linux {
         .unwrap();
         if exact {
             let output = json(&run);
-            // The namespace holds bubblewrap's init and the interpreter's main
-            // thread beside the new threads.
-            // The namespace holds bubblewrap's init and the interpreter's main
-            // thread beside the new threads: max_tasks + 2 in all.
+            // Strict mode: the ceiling is max_tasks + 1 (bubblewrap's init),
+            // and the interpreter's main thread is one of them.
             let threads = output["threads"].as_u64().unwrap();
-            assert!((28..=32).contains(&threads), "{output}");
+            assert!((26..=31).contains(&threads), "{output}");
             assert!(output["error"].as_str().is_some(), "{output}");
             assert_eq!(output["fork"], "EAGAIN", "the task ceiling, not memory: {output}");
         } else {
@@ -1250,6 +1248,36 @@ mod linux {
             assert_eq!(output["error"], "BlockingIOError", "{output}");
         } else {
             assert_eq!(run.terminal, GovernedExecutionTerminal::ProcessLimitExceeded, "stdout={}", run.stdout);
+        }
+    }
+
+    /// With a ceiling requested, exit 126 with exactly the helper's refusal
+    /// line is reported as the jail's failure, not as the command's exit.
+    #[test]
+    fn a_helper_refusal_is_a_jail_error() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(jail) = strict_jail_with(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let exact = jail.guarantees().process_ceiling;
+        let script = Script::new(&format!(
+            "import sys\nsys.stderr.write({:?})\nsys.stderr.flush()\nsys.exit(126)\n",
+            egress_forwarder::JAIL_EXEC_REFUSAL_MARKER
+        ));
+        let result = try_run_in_jail(jail, &script.search_path(), SCRIPT_NAME, &[], &[], Some(script.digest));
+        if exact {
+            assert_eq!(
+                result.err(),
+                Some(super::super::egress_tests::JailRunError::Batch(
+                    crate::governed_batch_process::GovernedBatchProcessErrorCode::JailHelperRefused
+                ))
+            );
+        } else {
+            // No ceiling requested: the helper cannot refuse, so this is the
+            // command's own exit.
+            assert_eq!(result.unwrap().exit_code, Some(126));
         }
     }
 

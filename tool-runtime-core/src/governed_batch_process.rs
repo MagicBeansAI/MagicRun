@@ -46,7 +46,7 @@ use crate::{
     },
     governed_process_jail::{
         GovernedProcessJail, GovernedProcessJailErrorCode, GovernedProcessJailLimits,
-        GovernedProcessJailWatch, GOVERNED_JAIL_HELPER_TASKS,
+        GovernedProcessJailWatch,
     },
     manifest::CliInteraction,
 };
@@ -149,6 +149,10 @@ pub enum GovernedBatchProcessErrorCode {
     /// The jail's pinned interpreter is no longer trusted or changed its
     /// bytes; nothing was dispatched.
     InterpreterUnavailable,
+    /// Linux: the in-jail helper refused to apply the task ceiling (no user
+    /// namespace of the jail's own, or a UID mapped to host root); the
+    /// command never ran.
+    JailHelperRefused,
     StreamUnavailable,
     StreamWriteFailed,
     StreamReadFailed,
@@ -443,7 +447,23 @@ impl GovernedBatchExecutor {
                 Zeroizing::new(Vec::new()),
             ));
         }
+        let helper_may_refuse = process
+            .jail
+            .as_ref()
+            .is_some_and(GovernedProcessJail::applies_task_ceiling);
         let mut raw = execute_spawned(process, executable, cwd, cancellation, started, deadline)?;
+        // The in-jail helper refused before the command existed. Report the
+        // jail, not a tool exit. A command that forged this exact output
+        // would only turn its own exit into this error; it gains nothing.
+        if helper_may_refuse
+            && raw.exit_code == Some(crate::governed_process_jail::egress_forwarder::JAIL_EXEC_EXIT_NO_USER_NAMESPACE)
+            && raw.stdout.is_empty()
+            && raw.stderr.as_slice()
+                == crate::governed_process_jail::egress_forwarder::JAIL_EXEC_REFUSAL_MARKER.as_bytes()
+        {
+            drop(permit);
+            return Err(jail_helper_refused());
+        }
         if raw.terminal.dispatch() == GovernedExecutionDispatch::NotDispatched {
             drop(permit);
         } else {
@@ -1614,10 +1634,10 @@ fn observe_jail_limits(
     }
     let usage = owned_group_usage(pid).ok_or(())?;
     let limits = watch.limits();
-    // Both counts include the jail's own machinery: the launcher and, on
-    // Linux, bubblewrap's in-jail init and the brokered forwarder. Each is
-    // one single-threaded process.
-    let overhead = GOVERNED_JAIL_HELPER_TASKS.saturating_add(1);
+    // Both counts allow the jail's own machinery: on Linux the launcher,
+    // bubblewrap's in-jail init and the brokered forwarder, each one
+    // single-threaded process; on macOS nothing (`sandbox-exec` execs).
+    let overhead = watch.overhead();
     if usage.processes > limits.max_processes.saturating_add(overhead)
         || usage.tasks > limits.max_tasks.saturating_add(overhead)
     {
@@ -1938,6 +1958,15 @@ const fn jail_unavailable() -> GovernedBatchProcessError {
         GovernedBatchProcessErrorCode::JailUnavailable,
         "jail",
         "the strict process jail could not build a safe host command",
+        GovernedExecutionDispatch::NotDispatched,
+    )
+}
+
+const fn jail_helper_refused() -> GovernedBatchProcessError {
+    GovernedBatchProcessError::new(
+        GovernedBatchProcessErrorCode::JailHelperRefused,
+        "jail.helper",
+        "the in-jail helper refused the task ceiling; the command never ran",
         GovernedExecutionDispatch::NotDispatched,
     )
 }

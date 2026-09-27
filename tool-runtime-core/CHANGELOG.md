@@ -45,6 +45,26 @@ _Current development version: `0.1.78`._
     `blake3:1fc54240…cc61a0` → `blake3:ab90ccc5…d0fe3c`, brokered
     `blake3:3c4fcba8…e142cc` → `blake3:e2822def…4fbe8e`. macOS identities are
     unchanged.
+- **Exact ceiling only where the kernel enforces it.** The in-jail ceiling
+  also needs a kernel at least `MIN_GOVERNED_JAIL_TASK_CEILING_KERNEL` (5.17;
+  older kernels count the UID's tasks host-wide inside a user namespace, and
+  5.14-5.16 carry ucounts bugs) and a non-root real UID (never held to
+  `RLIMIT_NPROC`); otherwise the shim only execs and `process_ceiling` is
+  `false`. The shim also refuses a ceiling when its UID maps to host root.
+  Its refusal (exit 126 with exactly `JAIL_EXEC_REFUSAL_MARKER` on stderr)
+  is reported as the new `GovernedBatchProcessErrorCode::JailHelperRefused`,
+  not dispatched. The ceiling's machinery allowance is per mode (bubblewrap's
+  init, plus the forwarder when brokered); the watchdog allows the same plus
+  the launcher on Linux, and nothing on macOS. A helper whose device, inode,
+  size or times changed since the jail was built is refused at launch.
+- **Compatibility.** `0.1.78` adds public fields
+  (`GovernedProcessJailLimits::max_tasks`,
+  `GovernedProcessJailAudit::linux_helper_digest`) and enum variants
+  (`GovernedProcessJailErrorCode::JailHelperUnavailable`,
+  `GovernedBatchProcessErrorCode::JailHelperRefused`). Struct literals and
+  exhaustive matches in consumers need updating, which a `0.1.x` patch bump
+  does not signal under strict semver; this crate is pre-1.0 and consumers
+  pin exact revisions.
 - **Watchdog escape (Linux).** The watchdog found jail members by process
   group, so a jailed command that called `setsid()` escaped process, CPU and
   memory sampling. It now follows the launcher's descendants by parent link

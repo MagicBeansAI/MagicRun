@@ -45,10 +45,15 @@ pub const DEFAULT_GOVERNED_JAIL_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 /// Python start many threads in one process.
 pub const DEFAULT_GOVERNED_JAIL_TASKS: u64 = 256;
 pub const MAX_GOVERNED_JAIL_TASKS: u64 = 1024;
-/// Tasks of the jail's own machinery inside its Linux user namespace, on top
-/// of `max_tasks`: bubblewrap's in-jail init and, when brokered, the
-/// forwarder.
+/// Most tasks of the jail's own machinery inside its Linux user namespace, on
+/// top of `max_tasks`: bubblewrap's in-jail init and, when brokered, the
+/// forwarder (strict and interpreter mode: the init only).
 pub const GOVERNED_JAIL_HELPER_TASKS: u64 = 2;
+/// Oldest kernel (`major.minor`) whose per-user-namespace `RLIMIT_NPROC`
+/// accounting (the 5.14 ucounts rework, with its fixes through 5.17) makes the
+/// in-jail task ceiling a per-jail bound. Older kernels count the UID's tasks
+/// host-wide even inside a user namespace.
+pub const MIN_GOVERNED_JAIL_TASK_CEILING_KERNEL: (u32, u32) = (5, 17);
 
 /// Schema of the opt-in brokered-egress mode. The strict profile keeps
 /// [`GOVERNED_PROCESS_JAIL_V1`]; a jail built with
@@ -542,13 +547,50 @@ pub struct GovernedProcessJail {
     linux_helper: Option<LinuxJailHelper>,
 }
 
-/// Linux: the trusted in-jail helper and whether the jail gets a user
-/// namespace of its own, where the helper can bound its tasks exactly.
+/// Linux: the trusted in-jail helper, its file identity at build time, and
+/// whether the helper can bound the jail's tasks exactly (a user namespace of
+/// the jail's own, a kernel with per-namespace accounting, a non-root UID).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct LinuxJailHelper {
     path: PathBuf,
     digest: GovernedProcessJailDigest,
-    user_namespace: bool,
+    identity: Option<HelperFileIdentity>,
+    exact_task_ceiling: bool,
+}
+
+/// Device, inode, size and times of the helper when the jail was built; a
+/// replaced or rewritten helper no longer matches at launch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct HelperFileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl HelperFileIdentity {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn of(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = fs::symlink_metadata(path).ok()?;
+            Some(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                length: metadata.len(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
+                changed: (metadata.ctime(), metadata.ctime_nsec()),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
 }
 
 /// Host-validated binding of the brokered-egress mode.
@@ -633,9 +675,10 @@ impl GovernedProcessJail {
                     None => trusted_egress_forwarder().map_err(|_| jail_helper_unavailable())?,
                 };
                 Some(LinuxJailHelper {
+                    identity: HelperFileIdentity::of(&path),
                     path,
                     digest,
-                    user_namespace: linux_user_namespace_expected(&launcher),
+                    exact_task_ceiling: linux_exact_task_ceiling_expected(&launcher),
                 })
             },
             GovernedProcessJailPlatform::MacosSandboxExec => None,
@@ -739,7 +782,7 @@ impl GovernedProcessJail {
             process_ceiling: self
                 .linux_helper
                 .as_ref()
-                .is_some_and(|helper| helper.user_namespace),
+                .is_some_and(|helper| helper.exact_task_ceiling),
             file_ceiling: true,
             output_ceiling: true,
         }
@@ -883,7 +926,33 @@ impl GovernedProcessJail {
         GovernedProcessJailWatch {
             workdir: self.canonical_workdir.clone(),
             limits: self.limits,
+            overhead: self.watchdog_overhead(),
         }
+    }
+
+    /// Linux: tasks of the jail's machinery inside its user namespace:
+    /// bubblewrap's in-jail init, plus the forwarder when brokered.
+    fn helper_tasks(&self) -> u64 {
+        1 + u64::from(self.egress.is_some())
+    }
+
+    /// Processes (each single-threaded) the watchdog sees besides the
+    /// admitted command. Linux: the launcher plus the helper tasks. macOS:
+    /// none, since `sandbox-exec` execs the command in place.
+    fn watchdog_overhead(&self) -> u64 {
+        match self.platform {
+            GovernedProcessJailPlatform::LinuxBubblewrap => 1 + self.helper_tasks(),
+            GovernedProcessJailPlatform::MacosSandboxExec => 0,
+        }
+    }
+
+    /// Whether the in-jail helper applies a task ceiling: its refusal (exit
+    /// 126 with [`egress_forwarder::JAIL_EXEC_REFUSAL_MARKER`]) is then a jail
+    /// failure, not the command's exit.
+    pub(crate) fn applies_task_ceiling(&self) -> bool {
+        self.linux_helper
+            .as_ref()
+            .is_some_and(|helper| helper.exact_task_ceiling)
     }
 
     /// Require the governed invocation to be bound to the exact directory
@@ -1065,9 +1134,13 @@ impl GovernedProcessJail {
             .collect::<Vec<_>>();
         let helper = self.linux_helper.as_ref().ok_or_else(jail_helper_unavailable)?;
         validate_trusted_launcher(&helper.path).map_err(|_| jail_helper_unavailable())?;
+        // The helper whose digest the audit reports is the one that runs.
+        if helper.identity.is_none() || HelperFileIdentity::of(&helper.path) != helper.identity {
+            return Err(jail_helper_unavailable());
+        }
         let exec = LinuxJailExec {
             helper: &helper.path,
-            task_ceiling: if helper.user_namespace {
+            task_ceiling: if helper.exact_task_ceiling {
                 // The shim refuses to run unless its user namespace differs
                 // from this one, so a mispredicted namespace fails closed.
                 let host_namespace = fs::read_link("/proc/self/ns/user")
@@ -1078,7 +1151,7 @@ impl GovernedProcessJail {
                     OsString::from(
                         self.limits
                             .max_tasks
-                            .saturating_add(GOVERNED_JAIL_HELPER_TASKS)
+                            .saturating_add(self.helper_tasks())
                             .to_string(),
                     ),
                     OsString::from(host_namespace.to_string()),
@@ -1620,21 +1693,31 @@ fn walk_tree(
     Ok(())
 }
 
-/// Whether bubblewrap will give the jail a user namespace of its own.
+/// Whether the in-jail helper can bound the jail's tasks exactly on this
+/// host: see [`TaskCeilingHost::exact`].
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_user_namespace_expected(launcher: &Path) -> bool {
+fn linux_exact_task_ceiling_expected(launcher: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
-        let setuid = fs::metadata(launcher)
-            .is_ok_and(|metadata| metadata.uid() == 0 && metadata.mode() & 0o4000 != 0);
-        user_namespace_expected(
-            setuid,
-            Path::new("/proc/self/ns/user").exists(),
-            fs::read_to_string("/sys/module/user_namespace/parameters/enable").ok().as_deref(),
-            fs::read_to_string("/proc/sys/user/max_user_namespaces").ok().as_deref(),
-        )
+        // SAFETY: `uname` writes only the provided, live `utsname`.
+        let release = unsafe {
+            let mut name = std::mem::zeroed::<libc::utsname>();
+            (libc::uname(&mut name) == 0)
+                .then(|| std::ffi::CStr::from_ptr(name.release.as_ptr()).to_string_lossy().into_owned())
+        };
+        TaskCeilingHost {
+            setuid_launcher: fs::metadata(launcher)
+                .is_ok_and(|metadata| metadata.uid() == 0 && metadata.mode() & 0o4000 != 0),
+            kernel_has_user_namespaces: Path::new("/proc/self/ns/user").exists(),
+            rhel_enable: fs::read_to_string("/sys/module/user_namespace/parameters/enable").ok(),
+            max_user_namespaces: fs::read_to_string("/proc/sys/user/max_user_namespaces").ok(),
+            // SAFETY: `getuid` has no preconditions and cannot fail.
+            root_uid: unsafe { libc::getuid() } == 0,
+            kernel_release: release,
+        }
+        .exact()
     }
     #[cfg(not(unix))]
     {
@@ -1643,23 +1726,64 @@ fn linux_user_namespace_expected(launcher: &Path) -> bool {
     }
 }
 
-/// Mirrors bubblewrap's own decision. Unprivileged bubblewrap always creates
-/// a user namespace (or fails to start). Setuid bubblewrap's
-/// `--unshare-user-try` (part of `--unshare-all`) creates one unless the
-/// kernel has none, the RHEL 7 module parameter disables them, or
-/// `user.max_user_namespaces` is 0. A misprediction fails closed: the shim
-/// refuses a requested ceiling outside a new namespace.
+/// The host facts that decide whether an in-jail `RLIMIT_NPROC` is an exact
+/// per-jail bound.
 #[cfg_attr(not(unix), allow(dead_code))]
-fn user_namespace_expected(
-    setuid: bool,
+struct TaskCeilingHost {
+    setuid_launcher: bool,
     kernel_has_user_namespaces: bool,
-    rhel_enable: Option<&str>,
-    max_user_namespaces: Option<&str>,
-) -> bool {
-    !setuid
-        || (kernel_has_user_namespaces
-            && rhel_enable.is_none_or(|value| !value.trim_start().starts_with('N'))
-            && max_user_namespaces.is_none_or(|value| value.trim() != "0"))
+    rhel_enable: Option<String>,
+    max_user_namespaces: Option<String>,
+    root_uid: bool,
+    kernel_release: Option<String>,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl TaskCeilingHost {
+    /// All of:
+    /// - a non-root real UID: Linux never enforces `RLIMIT_NPROC` for a task
+    ///   charged to the initial root user;
+    /// - a kernel at least [`MIN_GOVERNED_JAIL_TASK_CEILING_KERNEL`] (fail
+    ///   closed on an unparsable release);
+    /// - a user namespace of the jail's own, predicted as bubblewrap decides:
+    ///   unprivileged bubblewrap always creates one (or fails to start);
+    ///   setuid bubblewrap's `--unshare-user-try` creates one unless the
+    ///   kernel has none, the RHEL 7 module parameter disables them, or
+    ///   `user.max_user_namespaces` is 0.
+    ///
+    /// A misprediction fails closed: the shim refuses a requested ceiling
+    /// outside a new namespace or for a UID that maps to host root.
+    fn exact(&self) -> bool {
+        !self.root_uid
+            && self
+                .kernel_release
+                .as_deref()
+                .and_then(kernel_major_minor)
+                .is_some_and(|release| release >= MIN_GOVERNED_JAIL_TASK_CEILING_KERNEL)
+            && (!self.setuid_launcher
+                || (self.kernel_has_user_namespaces
+                    && self
+                        .rhel_enable
+                        .as_deref()
+                        .is_none_or(|value| !value.trim_start().starts_with('N'))
+                    && self
+                        .max_user_namespaces
+                        .as_deref()
+                        .is_none_or(|value| value.trim() != "0")))
+    }
+}
+
+/// `major.minor` of a kernel release such as `5.15.0-1034-azure` or `6.8.0`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn kernel_major_minor(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?;
+    let digits = minor.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    Some((major, minor[..digits].parse().ok()?))
 }
 
 fn trusted_egress_forwarder() -> Result<(PathBuf, GovernedProcessJailDigest), GovernedProcessJailError>
@@ -2218,11 +2342,18 @@ fn macos_profile(
 pub(crate) struct GovernedProcessJailWatch {
     workdir: PathBuf,
     limits: GovernedProcessJailLimits,
+    overhead: u64,
 }
 
 impl GovernedProcessJailWatch {
     pub(crate) fn limits(&self) -> GovernedProcessJailLimits {
         self.limits
+    }
+
+    /// Single-threaded processes of the jail's own machinery the watchdog
+    /// allows on top of `max_processes` and `max_tasks`.
+    pub(crate) fn overhead(&self) -> u64 {
+        self.overhead
     }
 
     pub(crate) fn workdir_within_limits(&self) -> Result<bool, ()> {
@@ -2661,6 +2792,7 @@ mod tests {
                 max_total_file_bytes: 2,
                 ..GovernedProcessJailLimits::default()
             },
+            overhead: 0,
         };
         fs::write(directory.path().join("one"), b"12").unwrap();
         assert_eq!(watch.workdir_within_limits(), Ok(true));
@@ -2750,7 +2882,7 @@ mod tests {
             let helper = jail.linux_helper.as_ref().unwrap();
             (
                 "linux_bubblewrap",
-                linux_user_namespace_expected(&jail.launcher),
+                jail.linux_helper.as_ref().unwrap().exact_task_ceiling,
                 format!(",\"linux_helper_digest\":\"{}\"", helper.digest),
             )
         };
@@ -2835,14 +2967,61 @@ mod tests {
 
     #[test]
     fn user_namespace_prediction_mirrors_bubblewrap() {
+        let host = |setuid, has, rhel: Option<&str>, max: Option<&str>| TaskCeilingHost {
+            setuid_launcher: setuid,
+            kernel_has_user_namespaces: has,
+            rhel_enable: rhel.map(str::to_owned),
+            max_user_namespaces: max.map(str::to_owned),
+            root_uid: false,
+            kernel_release: Some("6.8.0-1017-azure".to_owned()),
+        };
         // Unprivileged bubblewrap always creates one (or fails to start).
-        assert!(user_namespace_expected(false, false, None, Some("0")));
+        assert!(host(false, false, None, Some("0")).exact());
         // Setuid bubblewrap tries, unless the kernel disables them.
-        assert!(user_namespace_expected(true, true, None, Some("63412\n")));
-        assert!(user_namespace_expected(true, true, Some("Y\n"), None));
-        assert!(!user_namespace_expected(true, true, None, Some("0\n")));
-        assert!(!user_namespace_expected(true, true, Some("N\n"), Some("100")));
-        assert!(!user_namespace_expected(true, false, None, None));
+        assert!(host(true, true, None, Some("63412\n")).exact());
+        assert!(host(true, true, Some("Y\n"), None).exact());
+        assert!(!host(true, true, None, Some("0\n")).exact());
+        assert!(!host(true, true, Some("N\n"), Some("100")).exact());
+        assert!(!host(true, false, None, None).exact());
+        // A root UID is never held to RLIMIT_NPROC by the kernel.
+        assert!(!TaskCeilingHost { root_uid: true, ..host(false, true, None, None) }.exact());
+        assert!(!TaskCeilingHost { root_uid: true, ..host(true, true, None, None) }.exact());
+    }
+
+    #[test]
+    fn the_task_ceiling_needs_per_namespace_accounting() {
+        for (release, parsed) in [
+            ("5.15.0-1034-azure", Some((5, 15))),
+            ("6.8.0", Some((6, 8))),
+            ("5.17", Some((5, 17))),
+            ("4.19.0-26-amd64", Some((4, 19))),
+            ("6.1.0-rc3", Some((6, 1))),
+            ("5.16rc1", Some((5, 16))),
+            ("5.x", None),
+            ("", None),
+            ("Linux", None),
+            ("6", None),
+        ] {
+            assert_eq!(kernel_major_minor(release), parsed, "{release}");
+        }
+        let host = |release: Option<&str>| TaskCeilingHost {
+            setuid_launcher: false,
+            kernel_has_user_namespaces: true,
+            rhel_enable: None,
+            max_user_namespaces: None,
+            root_uid: false,
+            kernel_release: release.map(str::to_owned),
+        };
+        for exact in ["5.17.0", "6.8.0", "10.0.1"] {
+            assert!(host(Some(exact)).exact(), "{exact}");
+        }
+        // Debian 11, Ubuntu 20.04/22.04 GA, RHEL 8, and the buggy 5.14-5.16.
+        for coarse in ["5.10.0-28-amd64", "5.4.0-182-generic", "4.18.0-513.el8.x86_64", "5.15.0-1034-azure", "5.16.20"] {
+            assert!(!host(Some(coarse)).exact(), "{coarse}");
+        }
+        // Fail closed.
+        assert!(!host(Some("unknown")).exact());
+        assert!(!host(None).exact());
     }
 
     #[test]
@@ -3145,9 +3324,10 @@ mod tests {
             egress: None,
             interpreter: None,
             linux_helper: Some(LinuxJailHelper {
+                identity: HelperFileIdentity::of(&helper),
                 path: helper,
                 digest,
-                user_namespace: true,
+                exact_task_ceiling: true,
             }),
         };
         let snapshot = tempfile::tempdir().unwrap();
