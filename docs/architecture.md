@@ -72,7 +72,7 @@ supervisor, launch an unrelated service, or silently replace a consumer's runtim
 | --- | --- |
 | Manifest admission and tool discovery | `manifest*`, `registry`, `inventory`, `tool_discovery`, MCP catalog policy/projection |
 | Exact authorization and execution ownership | `governed_execution_coordinator`, `governed_execution_authority`, `governed_execution` |
-| Batch, PTY, optional jail | `governed_batch_process` and its macOS spawn backend, `governed_pty_process`, `governed_process_jail` and its in-jail egress forwarder (`magicrun-jail-egress-forwarder`) |
+| Batch, PTY, optional jail | `governed_batch_process` and its macOS spawn backend, `governed_pty_process`, `governed_process_jail` and its in-jail helper (`magicrun-jail-egress-forwarder`: the Linux exec shim and the egress forwarder) |
 | Credential preparation and placement | `credential_preparation`, `credential_injection`, `credential_materialization`, `credential_filesystem` |
 | Credential lifecycle and profiles | `credential_lifecycle*`, `credential_profiles`, `credential_profile_store`, `profile_selection` |
 | Results and settlement | `governed_execution_result`, coordinator audit/terminal types |
@@ -288,6 +288,73 @@ exposing the workdir's host path.
   It is written `0400` and synced.
 - **Limits.** It counts against the jail's `max_file_bytes`,
   `max_total_file_bytes` and `max_files`, exactly as the child's own files do.
+
+## Linux task ceiling and the in-jail helper (`0.1.78`)
+
+Linux charges `RLIMIT_NPROC` to the (user namespace, UID) pair of the
+forking task, and (kernel 5.14+ ucounts) also checks each ancestor
+namespace's owner against a limit snapshotted from the namespace's creator.
+A limit set on bubblewrap itself is therefore never right: in the host
+namespace it counts every task of the UID (shared, starving budget; exits
+loosen it; containers hide other tasks of the UID from `/proc`), and with
+setuid bubblewrap the new namespace is owned by root, so bubblewrap's own
+helper fork is checked against root's host-wide count and fails with
+`EAGAIN`. The launcher gets no `RLIMIT_NPROC`.
+
+```mermaid
+flowchart LR
+    host["Batch runner (no RLIMIT_NPROC)"] --> bwrap["bubblewrap"]
+    bwrap -->|"namespaces exist"| shim["/run/magicrun/jail-helper --magicrun-jail-exec-v1"]
+    shim -->|"new userns: RLIMIT_NPROC = max_tasks + 2"| cmd["admitted command (or the forwarder, then the command)"]
+```
+
+- **The helper.** Every Linux jail binds the trusted
+  `magicrun-jail-egress-forwarder` (root-owned at one of
+  `GOVERNED_JAIL_EGRESS_FORWARDER_PATHS`, validated like the launcher,
+  BLAKE3 in `GovernedProcessJailAudit::linux_helper_digest`) read-only at
+  `/run/magicrun/jail-helper` and runs it first:
+  `--magicrun-jail-exec-v1 <tasks> <host-userns> -- <program…>`. It checks
+  that `/proc/self/ns/user` differs from the host's namespace, sets
+  `RLIMIT_NPROC` soft and hard to `max_tasks + GOVERNED_JAIL_HELPER_TASKS`
+  (bubblewrap's in-jail init and the brokered forwarder) and execs. In the
+  brokered mode it execs the forwarder role, which spawns the command. A
+  Linux jail without the helper fails to build with `JailHelperUnavailable`
+  (brokered: `EgressForwarderUnavailable`).
+- **What the kernel checks.**
+  - *Unprivileged bubblewrap (userns):* the namespace is owned by the user.
+    Level 0 counts the jail's tasks in its own namespace against the shim's
+    limit (exact, threads included); the ancestor level counts the user's
+    host tasks against the user's own limit, snapshotted unchanged.
+  - *Setuid bubblewrap with user namespaces:* bubblewrap's
+    `--unshare-user-try` creates the namespace as root. Level 0 is the same
+    exact per-jail bound; the ancestor level counts root's tasks against the
+    unlowered limit bubblewrap inherited, which no longer fails.
+  - *Setuid bubblewrap without user namespaces* (`user.max_user_namespaces=0`,
+    RHEL 7 module parameter, old kernels): the jail's tasks share the UID's
+    host-wide count, so no `RLIMIT_NPROC` can bound one jail. The shim runs
+    as `- -` (exec only), `guarantees().process_ceiling` is `false`, and the
+    sampled watchdog is the only process/task bound. A delegated cgroup v2
+    `pids.max` would be exact there; none is assumed.
+  - The host predicts the mode the way bubblewrap decides it (setuid bit,
+    `/proc/self/ns/user`, RHEL parameter, `max_user_namespaces`). A wrong
+    prediction fails closed: the shim refuses a requested ceiling outside a
+    new namespace (exit 126).
+- **Tasks and processes.** `GovernedProcessJailLimits::max_tasks` (default
+  256, at most 1024, at least `max_processes`) is the thread budget; Node,
+  Go and threaded Python run many threads per process. `max_processes` stays
+  the watchdog's process count. Both allow the launcher, init and forwarder
+  on top.
+- **Watchdog.** Linux samples the launcher and all its descendants by parent
+  links, not the process group: a jailed process can `setsid`/`setpgid`
+  out of the group, never out of the pid namespace, whose orphans the
+  in-jail init adopts. It sums processes, threads, CPU and resident memory.
+  Killing the launcher's group still tears the jail down (the init dies with
+  its parent, and the pid namespace with it). macOS also counts threads
+  (`PROC_PIDTASKINFO`).
+- **Directory identity.** Birth time is part of a working directory's
+  identity on Linux only (inode numbers are reused at once), and not on
+  overlayfs, where copy-up changes it. macOS leaves it out: `touch -t` to an
+  earlier time moves APFS birth time.
 
 ## Declared login prompts
 

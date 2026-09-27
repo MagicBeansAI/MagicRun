@@ -125,12 +125,15 @@ struct DirectoryIdentity {
     inode: u64,
     #[cfg(unix)]
     owner: u32,
-    /// Birth time where the filesystem records it (`statx` on Linux, APFS on
-    /// macOS). Linux filesystems reuse a freed inode number at once, so a
-    /// directory removed and recreated under the same name can match on
-    /// device and inode alone; its birth time still differs. Change time
-    /// cannot serve here: it moves whenever an entry is created inside.
-    #[cfg(unix)]
+    /// Linux only: birth time (`statx`) where the filesystem records it.
+    /// Linux filesystems reuse a freed inode number at once, so a directory
+    /// removed and recreated under the same name can match on device and
+    /// inode alone; its birth time still differs. Change time cannot serve:
+    /// it moves whenever an entry is created inside. Not on macOS, where APFS
+    /// birth time is writable (`touch -t` to an earlier time moves it) and
+    /// inode numbers are not reused promptly; and not on overlayfs, where a
+    /// copy-up gives the directory a new birth time.
+    #[cfg(target_os = "linux")]
     created: Option<std::time::SystemTime>,
 }
 
@@ -1054,7 +1057,37 @@ fn directory_identity(
         device: metadata.dev(),
         inode: metadata.ino(),
         owner: metadata.uid(),
-        created: metadata.created().ok(),
+        #[cfg(target_os = "linux")]
+        created: if on_overlayfs(metadata.dev()) {
+            None
+        } else {
+            metadata.created().ok()
+        },
+    })
+}
+
+/// Linux: whether `device` is an overlayfs mount (`/proc/self/mountinfo`
+/// field 3 is the mount's `major:minor`, and a directory on overlayfs reports
+/// the overlay's device). Unknown counts as overlay: birth time is then only
+/// left out, never a false "changed".
+#[cfg(target_os = "linux")]
+fn on_overlayfs(device: u64) -> bool {
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return true;
+    };
+    mountinfo_has_overlay_device(&mountinfo, libc::major(device), libc::minor(device))
+}
+
+/// The mount lines whose filesystem type (first field after ` - `) is
+/// `overlay`, matched on `major:minor`.
+#[cfg(any(target_os = "linux", test))]
+fn mountinfo_has_overlay_device(mountinfo: &str, major: u32, minor: u32) -> bool {
+    let device = format!("{major}:{minor}");
+    mountinfo.lines().any(|line| {
+        let mut halves = line.splitn(2, " - ");
+        let head = halves.next().unwrap_or_default();
+        let fstype = halves.next().and_then(|tail| tail.split_whitespace().next());
+        fstype == Some("overlay") && head.split_whitespace().nth(2) == Some(device.as_str())
     })
 }
 
@@ -1232,6 +1265,32 @@ const fn unsupported_platform() -> GovernedExecutionAuthorityError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overlay_mounts_are_found_by_device() {
+        let mountinfo = "\
+22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
+301 22 0:52 / /var/lib/docker/overlay2/x/merged rw,relatime - overlay overlay rw,lowerdir=/a:/b
+302 22 0:53 / /tmp rw - tmpfs tmpfs rw
+";
+        assert!(super::mountinfo_has_overlay_device(mountinfo, 0, 52));
+        assert!(!super::mountinfo_has_overlay_device(mountinfo, 0, 53));
+        assert!(!super::mountinfo_has_overlay_device(mountinfo, 259, 2));
+        assert!(!super::mountinfo_has_overlay_device("", 0, 52));
+    }
+
+    /// macOS moves a directory's APFS birth time when its modification time
+    /// is set earlier (`touch -t <past>`). That is not a replaced directory.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_modification_time_is_not_a_changed_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let before = super::directory_identity(&std::fs::metadata(directory.path()).unwrap()).unwrap();
+        let past = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800);
+        std::fs::File::open(directory.path()).unwrap().set_modified(past).unwrap();
+        let after = super::directory_identity(&std::fs::metadata(directory.path()).unwrap()).unwrap();
+        assert!(before == after);
+    }
+
     use std::{collections::BTreeSet, fmt, fs};
 
     #[cfg(unix)]

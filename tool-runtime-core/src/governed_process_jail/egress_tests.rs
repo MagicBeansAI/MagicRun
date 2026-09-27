@@ -142,7 +142,7 @@ pub(super) struct JailedRun {
 /// A skipped real-jail test says so on stderr. On a Linux host that sets
 /// `MAGICRUN_REQUIRE_LINUX_JAIL=1` (CI with `bwrap`, the forwarder and a
 /// trusted python3 installed) a skip is a failure instead.
-pub(super) fn skip(reason: &str) {
+pub(crate) fn skip(reason: &str) {
     if cfg!(target_os = "linux") && std::env::var_os("MAGICRUN_REQUIRE_LINUX_JAIL").is_some_and(|value| value == "1") {
         panic!("MAGICRUN_REQUIRE_LINUX_JAIL=1 but the real-jail test would skip: {reason}");
     }

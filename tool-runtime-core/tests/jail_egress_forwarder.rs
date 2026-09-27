@@ -480,3 +480,57 @@ fn the_minimum_descriptor_budget_serves_concurrent_clients_in_turn() {
     assert_eq!(stdout.trim(), "3");
     assert!(cpu < Duration::from_millis(800), "used {cpu:?} of CPU");
 }
+
+fn exec_shim(arguments: &[&str]) -> Output {
+    Command::new(FORWARDER)
+        .env_clear()
+        .arg("--magicrun-jail-exec-v1")
+        .args(arguments)
+        .output()
+        .unwrap()
+}
+
+/// The exec shim without a ceiling only execs: same exit status, no output
+/// of its own.
+#[test]
+fn the_exec_shim_without_a_ceiling_only_execs() {
+    let output = exec_shim(&["-", "-", "--", "/bin/sh", "-c", "echo ran; exit 7"]);
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "ran\n");
+    assert!(output.stderr.is_empty());
+}
+
+/// A requested ceiling outside a user namespace of the jail's own would
+/// count every task of the UID on the host: the shim refuses (126) and runs
+/// nothing.
+#[test]
+fn the_exec_shim_refuses_a_ceiling_in_the_host_user_namespace() {
+    let host = std::fs::read_link("/proc/self/ns/user")
+        .ok()
+        .and_then(|target| {
+            tool_runtime_core::governed_process_jail::egress_forwarder::parse_user_namespace_link(
+                &target,
+            )
+        })
+        .unwrap_or(1)
+        .to_string();
+    let marker = tempfile::tempdir().unwrap();
+    let path = marker.path().join("ran");
+    let output = exec_shim(&["64", &host, "--", "/usr/bin/touch", path.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(126));
+    assert!(!path.exists());
+    // Malformed: refused before anything runs.
+    let output = exec_shim(&["64", "-", "--", "/usr/bin/touch", path.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(125));
+    assert!(!path.exists());
+}
+
+/// Linux: in a (here: claimed) different user namespace the shim sets
+/// `RLIMIT_NPROC` soft and hard to the ceiling before exec.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_exec_shim_sets_the_task_ceiling_before_exec() {
+    let output = exec_shim(&["4242", "1", "--", "/bin/sh", "-c", "ulimit -u; ulimit -Hu"]);
+    assert_eq!(output.status.code(), Some(0), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "4242\n4242\n");
+}

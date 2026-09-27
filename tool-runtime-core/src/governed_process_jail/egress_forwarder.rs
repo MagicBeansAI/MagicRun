@@ -18,6 +18,24 @@
 //! ```text
 //! magicrun-jail-egress-forwarder --magicrun-jail-egress-forwarder-v1 <port> <socket> -- <program> [args...]
 //! ```
+//!
+//! The same trusted binary is the Linux jail's exec shim in every mode. It is
+//! the first program bubblewrap runs, after the jail's namespaces exist:
+//!
+//! ```text
+//! magicrun-jail-egress-forwarder --magicrun-jail-exec-v1 <tasks|-> <host-userns|-> -- <program> [args...]
+//! ```
+//!
+//! With a task ceiling it first proves it runs in a user namespace other than
+//! the host's (`/proc/self/ns/user` differs from `<host-userns>`), then sets
+//! `RLIMIT_NPROC` (soft and hard) to `<tasks>` and execs `<program>`. Linux
+//! charges `RLIMIT_NPROC` to the (user namespace, UID) pair of the forking
+//! task, so inside the jail's own new user namespace it counts only the
+//! jail's tasks, threads included: an exact per-jail bound. Outside a new
+//! user namespace the same limit would count every task of the UID on the
+//! host, so the shim refuses (exit 126) rather than apply a meaningless or
+//! starving bound. With `-` it only execs. It never forks and never writes
+//! to stdio.
 
 use std::{ffi::OsString, path::PathBuf};
 
@@ -25,6 +43,11 @@ use std::{ffi::OsString, path::PathBuf};
 pub const FORWARDER_EXIT_USAGE: i32 = 125;
 /// Exit status when the child cannot be started.
 pub const FORWARDER_EXIT_SPAWN: i32 = 127;
+/// Exec shim: a task ceiling was requested but the shim does not run in a
+/// user namespace of its own, so no per-jail bound is possible.
+pub const JAIL_EXEC_EXIT_NO_USER_NAMESPACE: i32 = 126;
+/// argv marker of the in-jail exec-shim protocol.
+pub const GOVERNED_JAIL_EXEC_PROTOCOL_V1: &str = "--magicrun-jail-exec-v1";
 /// Concurrent relayed connections; further connections wait in the listen
 /// backlog. The forwarder clamps this to what its `RLIMIT_NOFILE` allows (see
 /// [`connection_capacity_for`]).
@@ -107,11 +130,73 @@ pub fn parse_forwarder_arguments(
     })
 }
 
+/// A parsed exec-shim invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JailExecInvocation {
+    /// `RLIMIT_NPROC` to apply, and the host user-namespace inode the shim
+    /// must differ from; `None` for `- -` (exec only).
+    pub task_ceiling: Option<(u64, u64)>,
+    pub program: OsString,
+    pub arguments: Vec<OsString>,
+}
+
+/// Parse the exec-shim argument vector after argv[0]. Anything but the
+/// exact layout is refused: both values numeric (ceiling at least 1) or both
+/// `-`, then `--` and an absolute program.
+pub fn parse_exec_arguments(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Option<JailExecInvocation> {
+    let mut arguments = arguments.into_iter();
+    if arguments.next()? != GOVERNED_JAIL_EXEC_PROTOCOL_V1 {
+        return None;
+    }
+    let tasks = arguments.next()?;
+    let namespace = arguments.next()?;
+    let task_ceiling = match (tasks.to_str()?, namespace.to_str()?) {
+        ("-", "-") => None,
+        (tasks, namespace) => {
+            let tasks = tasks.parse::<u64>().ok().filter(|tasks| *tasks > 0)?;
+            let namespace = namespace.parse::<u64>().ok()?;
+            Some((tasks, namespace))
+        },
+    };
+    if arguments.next()? != "--" {
+        return None;
+    }
+    let program = arguments.next()?;
+    if !std::path::Path::new(&program).is_absolute() {
+        return None;
+    }
+    Some(JailExecInvocation {
+        task_ceiling,
+        program,
+        arguments: arguments.collect(),
+    })
+}
+
+/// The inode of a `user:[N]` namespace link target.
+pub fn parse_user_namespace_link(target: &std::path::Path) -> Option<u64> {
+    target
+        .to_str()?
+        .strip_prefix("user:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
 /// Process entry point of `magicrun-jail-egress-forwarder`. Runs the relay
 /// until the child exits, then exits with the child's status (re-raising a
-/// terminating signal). Never returns.
+/// terminating signal); or, in exec-shim mode, applies the task ceiling and
+/// execs. Never returns.
 #[cfg(unix)]
 pub fn forwarder_main(arguments: impl IntoIterator<Item = OsString>) -> ! {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    if arguments.first().is_some_and(|first| first == GOVERNED_JAIL_EXEC_PROTOCOL_V1) {
+        let Some(invocation) = parse_exec_arguments(arguments) else {
+            std::process::exit(FORWARDER_EXIT_USAGE);
+        };
+        std::process::exit(unix::exec_shim(&invocation));
+    }
     let Some(invocation) = parse_forwarder_arguments(arguments) else {
         std::process::exit(FORWARDER_EXIT_USAGE);
     };
@@ -140,6 +225,38 @@ mod unix {
         EXIT_DRAIN_MS, FORWARDER_EXIT_SPAWN, FORWARDER_EXIT_USAGE, POLL_INTERVAL_MS, PUMP_ROUNDS,
         RELAY_BUFFER_BYTES,
     };
+
+    /// Apply the task ceiling (only inside a user namespace of the jail's
+    /// own) and exec the program. Returns only on failure, with the exit code.
+    pub(super) fn exec_shim(invocation: &super::JailExecInvocation) -> i32 {
+        use std::os::unix::process::CommandExt;
+
+        if let Some((tasks, host_namespace)) = invocation.task_ceiling {
+            let own = std::fs::read_link("/proc/self/ns/user")
+                .ok()
+                .and_then(|target| super::parse_user_namespace_link(&target));
+            if own.is_none() || own == Some(host_namespace) {
+                return super::JAIL_EXEC_EXIT_NO_USER_NAMESPACE;
+            }
+            // The parser bounds nothing, but a ceiling beyond `rlim_t` is
+            // no bound at all; `rlim_t` is 64-bit on every supported target.
+            let value = tasks as libc::rlim_t;
+            let limit = libc::rlimit {
+                rlim_cur: value,
+                rlim_max: value,
+            };
+            // SAFETY: `setrlimit` reads only the live `limit`.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limit) } != 0 {
+                return FORWARDER_EXIT_USAGE;
+            }
+        }
+        // `exec` replaces this process and returns only on failure. No PATH
+        // search: the program is absolute.
+        let _error = Command::new(&invocation.program)
+            .args(&invocation.arguments)
+            .exec();
+        FORWARDER_EXIT_SPAWN
+    }
 
     pub(super) fn run(invocation: &ForwarderInvocation) -> Result<ExitStatus, i32> {
         // Bind before the child exists so its first connection cannot race
@@ -290,10 +407,11 @@ mod unix {
 
     /// The child has exited: deliver what it already sent to the broker, for
     /// at most `EXIT_DRAIN_MS`, so a fire-and-forget upload is not cut short.
-    /// After the child exits, deliver what it already sent. A connection the
-    /// child completed just before exiting may still sit in the listen queue
-    /// (Linux reports a fully closed client only once its peer closes), so
-    /// the queue is accepted too while under capacity.
+    /// A connection the child completed just before exiting may still sit in
+    /// the listen queue (Linux reports a fully closed client only once its
+    /// peer closes), so the queue is accepted once, at exit, while under
+    /// capacity. Never again afterwards: a descendant that outlives the child
+    /// must not open new brokered connections during the drain.
     fn drain_outbound(
         listener: &TcpListener,
         socket: &Path,
@@ -301,8 +419,8 @@ mod unix {
         capacity: usize,
     ) {
         let deadline = Instant::now() + Duration::from_millis(EXIT_DRAIN_MS);
+        let _ = accept_pending(listener, socket, connections, capacity);
         loop {
-            let _ = accept_pending(listener, socket, connections, capacity);
             for connection in connections.iter_mut() {
                 connection.pump_outbound();
             }
@@ -669,6 +787,43 @@ mod tests {
         assert_eq!(connection_capacity_for(16, 6), 4);
         // Never fewer reserved than stdio plus the listener.
         assert_eq!(connection_capacity_for(12, 0), 3);
+    }
+
+    #[test]
+    fn exec_shim_parses_only_the_exact_layout() {
+        let parsed = parse_exec_arguments(args(&[
+            "--magicrun-jail-exec-v1",
+            "258",
+            "4026531837",
+            "--",
+            "/app/tool",
+            "--flag",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.task_ceiling, Some((258, 4026531837)));
+        assert_eq!(parsed.program, OsString::from("/app/tool"));
+        assert_eq!(parsed.arguments, args(&["--flag"]));
+        let exec_only =
+            parse_exec_arguments(args(&["--magicrun-jail-exec-v1", "-", "-", "--", "/app/tool"])).unwrap();
+        assert_eq!(exec_only.task_ceiling, None);
+        for refused in [
+            &["--magicrun-jail-exec-v1", "0", "1", "--", "/app/tool"][..],
+            &["--magicrun-jail-exec-v1", "8", "-", "--", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "-", "1", "--", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "8", "1", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "8", "1", "--", "relative"],
+            &["--magicrun-jail-exec-v1", "8", "1", "--"],
+            &["--magicrun-jail-egress-forwarder-v1", "8", "1", "--", "/app/tool"],
+        ] {
+            assert_eq!(parse_exec_arguments(args(refused)), None, "{refused:?}");
+        }
+        assert_eq!(
+            parse_user_namespace_link(std::path::Path::new("user:[4026531837]")),
+            Some(4026531837)
+        );
+        for refused in ["pid:[1]", "user:[x]", "user:4026531837"] {
+            assert_eq!(parse_user_namespace_link(std::path::Path::new(refused)), None);
+        }
     }
 
     #[test]

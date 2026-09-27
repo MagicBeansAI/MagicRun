@@ -20,24 +20,52 @@ _Current development version: `0.1.78`._
 
 ### Linux fixes found by the first real Linux run (`0.1.78`)
 
-- **The jail could not start for a busy user.** `RLIMIT_NPROC` is counted
-  across every process of the real UID on Linux, and was set to the jail's
-  ceiling (16). Any user already running that many processes (a CI runner, a
-  service container) saw bubblewrap fail its namespace clone with `EAGAIN`.
-  The parent now counts the UID's tasks (threads, which is what Linux
-  counts) just before spawn and allows the jail `max_processes` more on top.
+- **Linux task ceiling moved into the jail.** `RLIMIT_NPROC` is no longer
+  set on bubblewrap (first set to the ceiling, which failed for any busy
+  user; then to the UID's task count plus the ceiling, which still failed
+  with setuid bubblewrap and was a shared, host-wide budget). Linux charges
+  it per (user namespace, UID) and checks ancestor namespace owners against
+  a limit snapshotted at namespace creation. Every Linux jail now binds the
+  trusted `magicrun-jail-egress-forwarder` at `/run/magicrun/jail-helper` and
+  runs it first as an exec shim (`--magicrun-jail-exec-v1`), which sets
+  `RLIMIT_NPROC = max_tasks + GOVERNED_JAIL_HELPER_TASKS` inside the jail's
+  own user namespace and execs; in the brokered mode it then execs the
+  forwarder role. It refuses (exit 126) to apply a ceiling outside a new user
+  namespace. Setuid bubblewrap without user namespaces gets no ceiling and
+  reports `guarantees().process_ceiling == false` (watchdog only).
+  - **Install:** the helper is now required for every Linux jail mode, not
+    only brokered egress. Without it a Linux jail fails to build with the new
+    `JailHelperUnavailable`.
+  - New `GovernedProcessJailLimits::max_tasks` (threads; default 256, max
+    1024, at least `max_processes`), `DEFAULT_GOVERNED_JAIL_TASKS`,
+    `MAX_GOVERNED_JAIL_TASKS`, `GOVERNED_JAIL_HELPER_TASKS`, and
+    `GovernedProcessJailAudit::linux_helper_digest`. The audit JSON gains
+    `max_tasks` (all platforms) and, on Linux, `linux_helper_digest`; the
+    Linux strict argv golden and the Linux profile identities rotate: strict
+    `blake3:1fc54240…cc61a0` → `blake3:ab90ccc5…d0fe3c`, brokered
+    `blake3:3c4fcba8…e142cc` → `blake3:e2822def…4fbe8e`. macOS identities are
+    unchanged.
+- **Watchdog escape (Linux).** The watchdog found jail members by process
+  group, so a jailed command that called `setsid()` escaped process, CPU and
+  memory sampling. It now follows the launcher's descendants by parent link
+  (nothing leaves the pid namespace) and sums threads as well as processes;
+  both counts allow the launcher, the in-jail init and the forwarder on top
+  of `max_processes`/`max_tasks`. macOS also counts threads.
 - **Egress forwarder: sends lost at child exit on Linux.** A connection the
   child completed just before exiting could still be in the listen queue, and
   the post-exit drain never accepted it, so a fire-and-forget upload
-  delivered nothing. The drain now accepts the queue too.
+  delivered nothing. The drain accepts the queue once, at exit; never again,
+  so a surviving descendant cannot open new brokered connections.
 - **A recreated working directory could pass revalidation on Linux.** Linux
   filesystems reuse a freed inode number immediately, so a directory removed
   and recreated under the same name matched on device and inode alone.
-  Directory identity now includes birth time where the filesystem records it
-  (`statx` on Linux, APFS on macOS).
-- **CI.** The manual workflow gains a `linux-jail` job (Ubuntu 24.04,
-  unprivileged user namespaces and setuid bubblewrap) with the forwarder
-  installed and `MAGICRUN_REQUIRE_LINUX_JAIL=1`.
+  Directory identity now includes birth time on Linux (`statx`), except on
+  overlayfs, where copy-up changes it. Not on macOS: APFS birth time moves
+  with `touch -t <past>`, which gave false "changed" errors.
+- **CI.** The manual workflow gains a `linux-jail` job (Ubuntu 24.04) with
+  the helper installed and `MAGICRUN_REQUIRE_LINUX_JAIL=1`, over three legs:
+  unprivileged user namespaces, setuid bubblewrap, and setuid bubblewrap with
+  `user.max_user_namespaces=0`. Checkouts do not persist credentials.
 
 ### Interpreter mode for the governed process jail (`0.1.77`)
 

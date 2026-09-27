@@ -46,7 +46,7 @@ use crate::{
     },
     governed_process_jail::{
         GovernedProcessJail, GovernedProcessJailErrorCode, GovernedProcessJailLimits,
-        GovernedProcessJailWatch, MAX_GOVERNED_JAIL_PROCESSES,
+        GovernedProcessJailWatch, GOVERNED_JAIL_HELPER_TASKS,
     },
     manifest::CliInteraction,
 };
@@ -550,22 +550,6 @@ fn execute_spawned(
         command.process_group(0);
         let directory_fd = cwd.as_ref().map(|cwd| cwd.raw_fd());
         let jail_limits = process.jail.as_ref().map(GovernedProcessJail::limits);
-        // Linux counts RLIMIT_NPROC across every process of the real UID, not
-        // just the jail's. Setting it to the ceiling alone made bubblewrap's
-        // own namespace clone fail with EAGAIN for any user already running
-        // that many processes (a CI runner, a service container). Count the
-        // UID's processes here in the parent (the pre-exec child must not
-        // allocate) and allow the jail `max_processes` more on top.
-        #[cfg(target_os = "linux")]
-        let process_ceiling = jail_limits
-            .map(|limits| {
-                current_uid_process_count()
-                    .map(|existing| existing.saturating_add(limits.max_processes))
-                    .ok_or_else(jail_unavailable)
-            })
-            .transpose()?;
-        #[cfg(not(target_os = "linux"))]
-        let process_ceiling: Option<u64> = None;
         #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
         let child_launch_probe = launch_probe.clone(); // parent-only Arc clone
                                                        // SAFETY: `setrlimit` and `fchdir` are async-signal-safe. The optional
@@ -593,7 +577,7 @@ fn execute_spawned(
                     }
                 }
                 if let Some(limits) = jail_limits {
-                    apply_jail_rlimits(limits, process_ceiling)?;
+                    apply_jail_rlimits(limits)?;
                 }
                 if let Some(directory_fd) = directory_fd {
                     if libc::fchdir(directory_fd) == 0 {
@@ -1590,10 +1574,7 @@ fn validate_environment(
 }
 
 #[cfg(unix)]
-fn apply_jail_rlimits(
-    limits: GovernedProcessJailLimits,
-    process_ceiling: Option<u64>,
-) -> std::io::Result<()> {
+fn apply_jail_rlimits(limits: GovernedProcessJailLimits) -> std::io::Result<()> {
     macro_rules! apply {
         ($resource:expr, $value:expr) => {{
             let value = libc::rlim_t::try_from($value)
@@ -1613,59 +1594,15 @@ fn apply_jail_rlimits(
     apply!(libc::RLIMIT_CPU, limits.cpu_seconds);
     apply!(libc::RLIMIT_NOFILE, limits.max_open_files);
     apply!(libc::RLIMIT_FSIZE, limits.max_file_bytes);
-    // Linux enforces this against the real UID across all its processes, so
-    // the value is the UID's existing process count (taken by the parent just
-    // before spawn) plus the jail's ceiling: the jail may create at most
-    // `max_processes` more. Other same-UID processes forking meanwhile only
-    // make it stricter; the sampled watchdog still counts the jail's own group.
-    // macOS denies process-fork in SBPL instead; its RLIMIT_NPROC is also
-    // user-wide and adds no useful precision there.
-    #[cfg(target_os = "linux")]
-    if let Some(ceiling) = process_ceiling {
-        apply!(libc::RLIMIT_NPROC, ceiling);
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = process_ceiling;
+    // RLIMIT_NPROC is deliberately NOT applied to the launcher. Linux charges
+    // it per (user namespace, UID) and also checks every ancestor namespace's
+    // owner against a limit snapshotted when that namespace is created, so a
+    // small limit here bounds the UID's tasks host-wide, starves concurrent
+    // jails and, with setuid bubblewrap (namespace owned by root), fails the
+    // namespace helper's own fork. The trusted in-jail helper sets it instead,
+    // once the jail's user namespace exists, where it counts only the jail's
+    // tasks. macOS denies process-fork in SBPL.
     Ok(())
-}
-
-/// Tasks owned by this real UID: what Linux's `RLIMIT_NPROC` counts, which
-/// is threads, not processes. Sums `Threads:` over `/proc/<pid>/status`
-/// entries whose real `Uid:` matches. Bounded; `None` if `/proc` cannot be
-/// read.
-#[cfg(target_os = "linux")]
-fn current_uid_process_count() -> Option<u64> {
-    const MAX_PROC_ENTRIES: usize = 1 << 20;
-    // SAFETY: getuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() }.to_string();
-    let mut count = 0_u64;
-    for (index, entry) in std::fs::read_dir("/proc").ok()?.enumerate() {
-        if index >= MAX_PROC_ENTRIES {
-            return None;
-        }
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name();
-        if !name.to_string_lossy().bytes().all(|byte| byte.is_ascii_digit()) {
-            continue;
-        }
-        // A process can exit between listing and reading; that is not an error.
-        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
-            continue;
-        };
-        let real = status
-            .lines()
-            .find_map(|line| line.strip_prefix("Uid:"))
-            .and_then(|fields| fields.split_whitespace().next());
-        if real == Some(uid.as_str()) {
-            let threads = status
-                .lines()
-                .find_map(|line| line.strip_prefix("Threads:"))
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .unwrap_or(1);
-            count = count.saturating_add(threads);
-        }
-    }
-    Some(count)
 }
 
 fn observe_jail_limits(
@@ -1677,7 +1614,13 @@ fn observe_jail_limits(
     }
     let usage = owned_group_usage(pid).ok_or(())?;
     let limits = watch.limits();
-    if usage.processes > limits.max_processes {
+    // Both counts include the jail's own machinery: the launcher and, on
+    // Linux, bubblewrap's in-jail init and the brokered forwarder. Each is
+    // one single-threaded process.
+    let overhead = GOVERNED_JAIL_HELPER_TASKS.saturating_add(1);
+    if usage.processes > limits.max_processes.saturating_add(overhead)
+        || usage.tasks > limits.max_tasks.saturating_add(overhead)
+    {
         return Ok(Some(GovernedExecutionTerminal::ProcessLimitExceeded));
     }
     if usage.cpu_micros > limits.cpu_seconds.saturating_mul(1_000_000) {
@@ -1691,16 +1634,23 @@ fn observe_jail_limits(
 
 struct OwnedGroupUsage {
     processes: u64,
+    /// Threads of every member process.
+    tasks: u64,
     cpu_micros: u64,
     memory_bytes: u64,
 }
+
+/// Bound on `/proc` entries one Linux sample visits.
+#[cfg(target_os = "linux")]
+const MAX_PROC_ENTRIES: usize = 1 << 20;
 
 #[cfg(target_os = "macos")]
 fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
     const PROC_PGRP_ONLY: u32 = 2;
     const PID_BYTES: usize = std::mem::size_of::<libc::pid_t>();
     const GROWTH_HEADROOM: usize = 8;
-    const MAX_OBSERVED_GROUP_MEMBERS: usize = MAX_GOVERNED_JAIL_PROCESSES as usize + 1;
+    const MAX_OBSERVED_GROUP_MEMBERS: usize =
+        crate::governed_process_jail::MAX_GOVERNED_JAIL_PROCESSES as usize + 1;
 
     let leader = pid.and_then(|value| i32::try_from(value).ok())?;
     let group = u32::try_from(leader).ok()?;
@@ -1727,11 +1677,13 @@ fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
     if live >= members.len() {
         return Some(OwnedGroupUsage {
             processes: live as u64,
+            tasks: live as u64,
             cpu_micros: 0,
             memory_bytes: 0,
         });
     }
     let mut processes = 0_u64;
+    let mut tasks = 0_u64;
     let mut cpu_nanos = 0_u64;
     let mut memory_bytes = 0_u64;
     for member in members[..live].iter().copied().filter(|value| *value > 0) {
@@ -1754,18 +1706,43 @@ fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
             .saturating_add(info.ri_user_time)
             .saturating_add(info.ri_system_time);
         memory_bytes = memory_bytes.saturating_add(info.ri_phys_footprint);
+        let mut task = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+        let task_bytes = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        // SAFETY: PROC_PIDTASKINFO writes at most `task_bytes` into `task`.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                member,
+                libc::PROC_PIDTASKINFO,
+                0,
+                task.as_mut_ptr().cast::<libc::c_void>(),
+                task_bytes,
+            )
+        };
+        let threads = if written == task_bytes {
+            // SAFETY: the kernel filled the whole structure.
+            u64::try_from(unsafe { task.assume_init() }.pti_threadnum).unwrap_or(1)
+        } else {
+            1
+        };
+        tasks = tasks.saturating_add(threads.max(1));
     }
     (processes > 0).then_some(OwnedGroupUsage {
         processes,
+        tasks,
         cpu_micros: cpu_nanos / 1_000,
         memory_bytes,
     })
 }
 
+/// Linux: the launcher and every descendant, found by parent links. Every
+/// task of the jail descends from the launcher: bubblewrap's pid-namespace
+/// init is its child, and a jailed process can leave its process group or
+/// session (`setsid`, `setpgid`) but never the pid namespace, whose orphans
+/// are reparented to that init. Sums processes, threads, CPU and resident
+/// memory.
 #[cfg(target_os = "linux")]
 fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
-    const MAX_PROC_ENTRIES: usize = 65_536;
-    let group = i64::from(pid?);
+    let root = pid?;
     // SAFETY: sysconf is read-only and `_SC_CLK_TCK` has no pointer argument.
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     // SAFETY: sysconf is read-only and `_SC_PAGESIZE` has no pointer argument.
@@ -1773,48 +1750,67 @@ fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
     if ticks_per_second <= 0 || page_size <= 0 {
         return None;
     }
-    let mut processes = 0_u64;
-    let mut cpu_ticks = 0_u64;
-    let mut resident_pages = 0_u64;
-    let mut visited = 0_usize;
-    for entry in std::fs::read_dir("/proc").ok()? {
-        let entry = entry.ok()?;
-        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
-            continue;
-        }
-        visited = visited.checked_add(1)?;
-        if visited > MAX_PROC_ENTRIES {
+    let mut samples = std::collections::HashMap::<u32, (u32, u64, u64)>::new();
+    let mut children = std::collections::HashMap::<u32, Vec<u32>>::new();
+    for (visited, entry) in std::fs::read_dir("/proc").ok()?.enumerate() {
+        if visited >= MAX_PROC_ENTRIES {
             return None;
         }
-        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(_) => continue,
+        let entry = entry.ok()?;
+        let Ok(member) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
         };
-        let tail = match stat.rsplit_once(')') {
-            Some((_, tail)) => tail.trim(),
-            None => continue,
+        // A process can exit between listing and reading; that is not an error.
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, tail)) = stat.rsplit_once(')') else {
+            continue;
         };
         let fields = tail.split_whitespace().collect::<Vec<_>>();
-        if fields.len() <= 12 || fields[2].parse::<i64>().ok() != Some(group) {
+        if fields.len() <= 17 {
             continue;
         }
-        let user = fields[11].parse::<u64>().ok()?;
-        let system = fields[12].parse::<u64>().ok()?;
-        processes = processes.saturating_add(1);
-        cpu_ticks = cpu_ticks.saturating_add(user).saturating_add(system);
-        // A process that exits after its stat sample holds no resident pages;
-        // otherwise a malformed statm loses the required observation.
-        match std::fs::read_to_string(entry.path().join("statm")) {
-            Ok(statm) => {
-                let resident = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
-                resident_pages = resident_pages.saturating_add(resident);
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(_) => return None,
+        let parent = fields[1].parse::<u32>().ok()?;
+        let cpu = fields[11]
+            .parse::<u64>()
+            .ok()?
+            .saturating_add(fields[12].parse::<u64>().ok()?);
+        let threads = fields[17].parse::<u64>().ok()?.max(1);
+        samples.insert(member, (parent, cpu, threads));
+        children.entry(parent).or_default().push(member);
+    }
+    let mut processes = 0_u64;
+    let mut tasks = 0_u64;
+    let mut cpu_ticks = 0_u64;
+    let mut resident_pages = 0_u64;
+    let mut pending = vec![root];
+    let mut seen = std::collections::HashSet::from([root]);
+    while let Some(member) = pending.pop() {
+        if let Some(&(_, cpu, threads)) = samples.get(&member) {
+            processes = processes.saturating_add(1);
+            tasks = tasks.saturating_add(threads);
+            cpu_ticks = cpu_ticks.saturating_add(cpu);
+            // A process that exits after its stat sample holds no resident
+            // pages; otherwise a malformed statm loses the observation.
+            match std::fs::read_to_string(format!("/proc/{member}/statm")) {
+                Ok(statm) => {
+                    let resident = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+                    resident_pages = resident_pages.saturating_add(resident);
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(_) => return None,
+            }
+        }
+        for child in children.get(&member).into_iter().flatten() {
+            if seen.insert(*child) {
+                pending.push(*child);
+            }
         }
     }
     (processes > 0).then_some(OwnedGroupUsage {
         processes,
+        tasks,
         cpu_micros: cpu_ticks.saturating_mul(1_000_000) / ticks_per_second as u64,
         memory_bytes: resident_pages.saturating_mul(page_size as u64),
     })
@@ -2265,9 +2261,13 @@ mod tests {
                 if matches!(
                     error.code,
                     crate::governed_process_jail::GovernedProcessJailErrorCode::LauncherUnavailable
+                        | crate::governed_process_jail::GovernedProcessJailErrorCode::JailHelperUnavailable
                         | crate::governed_process_jail::GovernedProcessJailErrorCode::UnsupportedPlatform
                 ) =>
             {
+                crate::governed_process_jail::egress_tests::skip(&format!(
+                    "no strict jail on this host: {error}"
+                ));
                 return;
             },
             Err(error) => panic!("unexpected strict jail setup failure: {error}"),
