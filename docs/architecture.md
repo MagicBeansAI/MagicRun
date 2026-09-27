@@ -278,8 +278,11 @@ child opens relative to its working directory. A consumer can hand a jailed
 tool data it would otherwise read from a host path, without ever learning or
 exposing the workdir's host path.
 
-- **Name.** One plain component: `[A-Za-z0-9._-]`, not hidden, at most 128
-  bytes. `..`, separators and non-ASCII are refused (`InvalidInputFile`).
+- **Name.** One plain component: `[A-Za-z0-9._-]`, not hidden, not starting
+  with `-` (the name is passed as an argument, so never a flag or `-`), at most
+  128 bytes. `..`, separators and non-ASCII are refused (`InvalidInputFile`).
+- **Failures.** A failed write removes the partial file; I/O failures report
+  `PrivateWorkdirUnavailable`.
 - **Creation.** The file is always fresh (`create_new`, `O_NOFOLLOW`): an
   existing name or a planted link is refused, never overwritten or followed.
   It is written `0400` and synced.
