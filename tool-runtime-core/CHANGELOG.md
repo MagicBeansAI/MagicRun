@@ -8,7 +8,105 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.76`._
+_Current development version: `0.1.77`._
+
+### Interpreter mode for the governed process jail (`0.1.77`)
+
+- Add `GovernedJailInterpreter`, a validated, pinned interpreter produced
+  only by fixed host discovery: `GovernedJailInterpreter::python3_for_host()`.
+  There is no constructor taking a caller path. It carries the canonical real
+  executable, a BLAKE3 digest of the executable and its pinned images, the
+  `major.minor` version and read-only library roots. The executable, every
+  image and every library root pass the trusted-launcher checks (root-owned,
+  not group/other-writable, canonical, no symlink components); library trees
+  are walked entry by entry (root-owned; non-symlinks not group/other-writable).
+  No interpreter is run during discovery.
+  - macOS tries `GOVERNED_JAIL_MACOS_PYTHON3_CANDIDATES` in order: python.org
+    `/Library/Frameworks/Python.framework`, then the CommandLineTools
+    `Python3.framework` (`Versions/Current/bin/python3`). The
+    candidate spelling must be root-owned end to end. It resolves to
+    `Versions/X.Y/bin/pythonX.Y`; the jail execs
+    `Versions/X.Y/Resources/Python.app/Contents/MacOS/Python` directly (the
+    `bin` binary is a stub that would re-exec it), pins the framework library
+    `Versions/X.Y/<Name>`, reads `Versions/X.Y/lib` and denies
+    `lib/pythonX.Y/site-packages`. `/usr/bin/python3` (an `xcrun` shim needing
+    fork/exec) is never used. A python.org framework left `root:admin` 0775
+    (as on the development host) is refused as admin-writable unless
+    tightened; CommandLineTools (`root:wheel` 0755) passes.
+  - Linux takes canonical `/usr/bin/python3` (`python3.N`) with library roots
+    `/usr/lib/python3.N` and, where present, `/usr/lib64/python3.N`.
+  - Windows and other hosts refuse (`UnsupportedPlatform`).
+- Add `GovernedProcessJail::with_interpreter(self, interpreter)`, composing
+  with `strict_app` and `strict_app_with_brokered_egress`. The governed
+  executable snapshot becomes the script; argv is
+  `<interpreter> -I -S -B <script-snapshot> <args...>`
+  (`GOVERNED_JAIL_PYTHON3_FLAGS`). The script is still resolved, hashed and
+  privately snapshotted by the governed executor, so
+  `with_expected_executable_digest` binds the script bytes. The interpreter
+  digest and trust checks are rerun when the jail takes it and again
+  immediately before every launch. A jail takes one interpreter, for its own
+  platform.
+  - macOS profile: the strict profile rendered with the interpreter as the
+    only `process-exec` literal, plus a read-only literal of the script
+    snapshot, read-only literals of the pinned images, read-only library
+    subpaths and a trailing `(deny file-read* (subpath ".../site-packages"))`.
+    `process-fork` stays denied; the script is never exec-allowed. The
+    brokered rules are appended unchanged.
+  - Linux argv: the interpreter and its library roots are `--ro-bind`ed at
+    their own paths before the read-only remount, and the command becomes
+    `<interpreter> -I -S -B /app/<script>` (under the forwarder when brokered).
+    Compile-checked only; not run on a Linux host.
+- Identity and audit: `profile_identity()` differs in interpreter mode and
+  equals the new `governed_process_jail_interpreter_profile_identity(platform,
+  network, kind, version)`, which binds interpreter kind, `major.minor` and
+  flags but no host path. `GovernedProcessJailAudit::interpreter`
+  (`GovernedJailInterpreterAudit`: kind, version, digest, flags, profile
+  identity) records which interpreter ran and is omitted otherwise. The jail
+  schema stays that of its network mode. New error code
+  `InterpreterUnavailable`.
+- The bubblewrap argv and the audit JSON of existing jails are unchanged; the
+  Linux profile identities are unchanged and now pinned by golden tests.
+
+#### Review fixes (`0.1.77`)
+
+- **Strict profile change (macOS), identities rotate.** The strict SBPL
+  profile ends with `(deny file-map-executable (subpath "<workdir>"))`, so
+  files written to the workdir cannot be `dlopen`ed (`ctypes.CDLL` included),
+  mapped `PROT_EXEC`, or injected via `DYLD_INSERT_LIBRARIES` on a re-exec.
+  It is defense in depth, not a code-execution barrier: in-memory code via
+  `mprotect`/`ctypes` still runs, inside the same profile. Tools that unpack
+  a library into `TMPDIR` and load it (some JNA, sqlite-jdbc, .NET
+  single-file, packaged Node addons) stop working in the jail. The jail's
+  environment backstop now also strips `LD_*` and `GLIBC_TUNABLES`. This
+  applies to every mode. The
+  macOS profile identities rotate: strict
+  `blake3:e783cb6b…020d31` → `blake3:8a06b6cf…32dcd2`, brokered
+  `blake3:89b6c07b…2f09f6` → `blake3:97a0d14f…60aacb`. Linux identities are
+  unchanged. `harden_environment` strips `DYLD_*` and `__PYVENV_LAUNCHER__`.
+- **Audit wording.** `GovernedJailInterpreterAudit::flags` is now
+  `launch_flags` and `user_site_denied` is `launch_user_site_disabled`; both
+  are launch hygiene, since a script can re-exec the interpreter without them
+  (still inside the same profile). `script_exec_denied` is `false` on Linux,
+  where bubblewrap has no exec control and `/work` is not `noexec`.
+- **Linux discovery.** Shared-libpython builds pin `libpython3.N.so.*` from
+  the executable's ELF `DT_NEEDED` as an image (found as a regular file in the
+  canonical `/usr/lib64`, `/usr/lib/<multiarch>` or `/usr/lib`; otherwise
+  refused), and stdlib roots are canonicalized and deduplicated (`lib64 ->
+  lib`). Compile-checked only.
+- **macOS discovery.** The Xcode.app candidate is dropped (`/Applications`
+  is `root:admin` 0775 on stock macOS). The interpreter digest is streamed.
+- **macOS process watchdog.** The process-group sample no longer uses a
+  null-buffer sizing call that XNU answers with a system-wide estimate; any
+  jailed child sampled at least once was ending as `ProcessLimitExceeded`.
+- **Egress forwarder (Linux).** No poll spin after a peer hang-up, a paused
+  listener after `EMFILE`/`ENFILE`, non-blocking broker connects (a full
+  backlog closes the client; 2 s bound), up to 1 s of outbound delivery after
+  the child exits, relays clamped to what `RLIMIT_NOFILE` leaves after the
+  descriptors open at start, and a brokered Linux
+  jail refuses `max_open_files` below `MIN_GOVERNED_JAIL_BROKERED_OPEN_FILES`
+  (8). An unreadable forwarder candidate falls through to the next one.
+- **Errors.** `GovernedBatchProcessErrorCode::InterpreterUnavailable` reports
+  a pinned interpreter that changed before launch.
 
 ### Brokered-egress process jail (`0.1.76`)
 

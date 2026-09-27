@@ -83,9 +83,40 @@ const LINUX_HOST_TRUST_BUNDLES: [&str; 3] = [
 const MACOS_TRUST_DIRECTORY: &str = "/private/etc/ssl";
 const MACOS_TRUST_BUNDLE: &str = "/private/etc/ssl/cert.pem";
 
+/// Schema of the interpreter evidence in [`GovernedProcessJailAudit`]. The
+/// jail's own schema stays that of its network mode.
+pub const GOVERNED_JAIL_INTERPRETER_V1: &str = "tool-runtime.governed-process-jail.interpreter.v1";
+/// Fixed interpreter flags placed before the script snapshot: `-I` isolated
+/// mode (no `PYTHON*` environment, no user site, no script directory or cwd
+/// on `sys.path`), `-S` no `site` import, `-B` no bytecode writes.
+pub const GOVERNED_JAIL_PYTHON3_FLAGS: [&str; 3] = ["-I", "-S", "-B"];
+/// Fixed macOS discovery candidates, in order. `/usr/bin/python3` is
+/// deliberately absent: it is an `xcrun` shim that needs fork and exec. The
+/// Xcode.app framework is absent too: `/Applications` is `root:admin` 0775 on
+/// stock macOS, so it can never pass the trust checks. A python.org framework
+/// passes only once it is root-owned and not group/other-writable
+/// (`chown -R root:wheel` and `chmod -R go-w` its `Python.framework`); the
+/// installer leaves it admin-writable.
+pub const GOVERNED_JAIL_MACOS_PYTHON3_CANDIDATES: [&str; 2] = [
+    "/Library/Frameworks/Python.framework/Versions/Current/bin/python3",
+    "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/Current/bin/python3",
+];
+/// Fixed Linux discovery candidate.
+pub const GOVERNED_JAIL_LINUX_PYTHON3_CANDIDATES: [&str; 1] = ["/usr/bin/python3"];
+const MAX_GOVERNED_JAIL_INTERPRETER_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+/// Linux: the smallest `max_open_files` a brokered jail accepts, so the
+/// in-jail forwarder can hold stdio, its listener, one relay and the spawn
+/// pipe. The forwarder clamps its concurrent relays to what the limit allows.
+pub const MIN_GOVERNED_JAIL_BROKERED_OPEN_FILES: u64 =
+    egress_forwarder::FORWARDER_MIN_OPEN_FILES;
+#[cfg_attr(not(unix), allow(dead_code))]
+const MAX_GOVERNED_JAIL_INTERPRETER_TREE_ENTRIES: usize = 200_000;
+
 pub mod egress_forwarder;
 #[cfg(test)]
 mod egress_tests;
+#[cfg(all(test, unix))]
+mod interpreter_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +134,9 @@ pub enum GovernedProcessJailErrorCode {
     EgressBrokerUnavailable,
     /// Linux only: no trusted in-jail egress forwarder is installed.
     EgressForwarderUnavailable,
+    /// No trusted interpreter is installed, a pinned interpreter changed, or
+    /// the jail cannot take one.
+    InterpreterUnavailable,
 }
 
 /// Stable and value-free. Host paths and launcher diagnostics never cross the
@@ -237,6 +271,146 @@ pub struct GovernedProcessJailEgressAudit {
     pub binding_identity: GovernedProcessJailDigest,
 }
 
+/// Interpreter family a jail can pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedJailInterpreterKind {
+    Python3,
+}
+
+/// `major.minor` of a pinned interpreter, serialized as `"3.9"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GovernedJailInterpreterVersion {
+    pub major: u16,
+    pub minor: u16,
+}
+
+impl fmt::Display for GovernedJailInterpreterVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}.{}", self.major, self.minor)
+    }
+}
+
+impl Serialize for GovernedJailInterpreterVersion {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Value-free evidence of the interpreter mode. Present in
+/// [`GovernedProcessJailAudit`] only for a jail built
+/// [`GovernedProcessJail::with_interpreter`], so other audits serialize
+/// exactly as before. Host paths are never included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct GovernedJailInterpreterAudit {
+    pub schema_version: &'static str,
+    pub kind: GovernedJailInterpreterKind,
+    pub version: GovernedJailInterpreterVersion,
+    /// BLAKE3 over the interpreter executable and its pinned images (macOS:
+    /// the framework library; Linux: a shared `libpython3.N.so`); rechecked
+    /// immediately before every launch.
+    pub digest: GovernedProcessJailDigest,
+    /// Launch hygiene, not containment: the fixed flags placed between the
+    /// interpreter and the script snapshot. A script can re-exec the
+    /// interpreter without them; it stays inside the same profile.
+    pub launch_flags: [&'static str; 3],
+    /// Launch hygiene, not containment: `-I` disables the user site at
+    /// launch. The host user site is never readable (the jail's `HOME` is its
+    /// private workdir), but a re-exec without `-I` can import from a user
+    /// site the script itself writes into that workdir.
+    pub launch_user_site_disabled: bool,
+    /// Enforced by the profile. macOS: only the interpreter literal may be
+    /// exec'd, and workdir files cannot be `dlopen`ed or mapped `PROT_EXEC`
+    /// (in-process code via `mprotect`/`ctypes` is not prevented). Linux:
+    /// `false`; bubblewrap has no exec control and `/work` is not `noexec`.
+    pub script_exec_denied: bool,
+    /// Enforced by the profile. macOS: the stdlib `site-packages` subtree is
+    /// denied. Linux: `false`; it is off `sys.path` (`-S`) but readable.
+    pub site_packages_read_denied: bool,
+    /// Identity of this platform, network and interpreter kind/version;
+    /// equal to [`governed_process_jail_interpreter_profile_identity`].
+    pub profile_identity: GovernedProcessJailDigest,
+}
+
+/// A validated, pinned interpreter. It can only be produced by fixed host
+/// discovery ([`Self::python3_for_host`]); there is no constructor taking a
+/// caller path. The executable, its pinned images and every library root are
+/// root-owned, not group/other-writable, canonical and free of symlink swaps,
+/// like a trusted launcher; library trees are walked entry by entry. Paths
+/// stay private to tool-runtime-core.
+pub struct GovernedJailInterpreter {
+    platform: GovernedProcessJailPlatform,
+    kind: GovernedJailInterpreterKind,
+    version: GovernedJailInterpreterVersion,
+    /// Canonical real executable the jail execs (macOS: the framework's
+    /// `Resources/Python.app/Contents/MacOS/Python`, not the `bin` stub that
+    /// would re-exec it).
+    executable: PathBuf,
+    /// Further pinned binaries covered by the digest, read-only literals.
+    images: Vec<PathBuf>,
+    /// Read-only subtrees (stdlib, extension modules, bundled libraries).
+    library_roots: Vec<PathBuf>,
+    /// Subtrees of the library roots denied again (macOS `site-packages`).
+    denied_roots: Vec<PathBuf>,
+    digest: GovernedProcessJailDigest,
+}
+
+impl GovernedJailInterpreter {
+    /// Discover the host's trusted Python 3 at fixed locations.
+    ///
+    /// macOS tries [`GOVERNED_JAIL_MACOS_PYTHON3_CANDIDATES`] in order and
+    /// takes the first that passes every trust check; Linux takes
+    /// [`GOVERNED_JAIL_LINUX_PYTHON3_CANDIDATES`]. Other hosts are refused.
+    pub fn python3_for_host() -> Result<Self, GovernedProcessJailError> {
+        #[cfg(target_os = "macos")]
+        {
+            python3_from_candidates(
+                GovernedProcessJailPlatform::MacosSandboxExec,
+                &GOVERNED_JAIL_MACOS_PYTHON3_CANDIDATES.map(Path::new),
+            )
+        }
+        #[cfg(target_os = "linux")]
+        {
+            python3_from_candidates(
+                GovernedProcessJailPlatform::LinuxBubblewrap,
+                &GOVERNED_JAIL_LINUX_PYTHON3_CANDIDATES.map(Path::new),
+            )
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Err(unsupported_platform())
+        }
+    }
+
+    pub fn kind(&self) -> GovernedJailInterpreterKind {
+        self.kind
+    }
+
+    pub fn version(&self) -> GovernedJailInterpreterVersion {
+        self.version
+    }
+
+    pub fn digest(&self) -> GovernedProcessJailDigest {
+        self.digest
+    }
+
+    /// Re-run every trust check and recompute the digest. Called when a jail
+    /// takes the interpreter and again immediately before each launch.
+    fn revalidate(&self) -> Result<(), GovernedProcessJailError> {
+        validate_trusted_launcher(&self.executable).map_err(|_| interpreter_unavailable())?;
+        for image in &self.images {
+            validate_trusted_launcher(image).map_err(|_| interpreter_unavailable())?;
+        }
+        for root in &self.library_roots {
+            validate_trusted_tree(root, &self.denied_roots)?;
+        }
+        if interpreter_digest(&self.executable, &self.images)? != self.digest {
+            return Err(interpreter_unavailable());
+        }
+        Ok(())
+    }
+}
+
 /// Resource ceilings which are additional to the governed runtime's existing
 /// wall, stdout, stderr and RSS/address-space ceilings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -320,11 +494,14 @@ pub struct GovernedProcessJailAudit {
     pub limits: GovernedProcessJailLimits,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress: Option<GovernedProcessJailEgressAudit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interpreter: Option<GovernedJailInterpreterAudit>,
 }
 
 /// Move-only strict app profile. There is no constructor accepting a caller
 /// executable, environment map, launcher argv, or sandbox profile. The only
-/// caller-supplied host resource is the explicitly opted-in egress broker.
+/// caller-supplied host resources are the explicitly opted-in egress broker
+/// and a discovered, pinned interpreter.
 pub struct GovernedProcessJail {
     platform: GovernedProcessJailPlatform,
     launcher: PathBuf,
@@ -332,6 +509,7 @@ pub struct GovernedProcessJail {
     canonical_workdir: PathBuf,
     limits: GovernedProcessJailLimits,
     egress: Option<BrokeredEgress>,
+    interpreter: Option<GovernedJailInterpreter>,
 }
 
 /// Host-validated binding of the brokered-egress mode.
@@ -401,6 +579,11 @@ impl GovernedProcessJail {
         let egress = broker
             .map(|endpoint| brokered_egress_for(platform, endpoint))
             .transpose()?;
+        if egress.as_ref().is_some_and(|egress| egress.forwarder.is_some())
+            && limits.max_open_files < MIN_GOVERNED_JAIL_BROKERED_OPEN_FILES
+        {
+            return Err(invalid_limits());
+        }
         let workdir = Builder::new()
             .prefix("magician-app-jail-")
             .tempdir()
@@ -416,7 +599,33 @@ impl GovernedProcessJail {
             canonical_workdir,
             limits,
             egress,
+            interpreter: None,
         })
+    }
+
+    /// Opt in to interpreter mode, on top of [`Self::strict_app`] or
+    /// [`Self::strict_app_with_brokered_egress`]. The launched program becomes
+    /// the pinned interpreter and the governed executable snapshot becomes its
+    /// script: argv is `<interpreter> -I -S -B <script-snapshot> <args...>`.
+    /// The profile allows exec of the interpreter literal only (never the
+    /// script), reads the script snapshot, and reads the interpreter's library
+    /// roots read-only; fork stays denied and nothing else changes. The
+    /// governed executor still hashes and snapshots the script, so an expected
+    /// executable digest binds the script bytes; the interpreter's own digest
+    /// is rechecked before every launch. A jail takes one interpreter.
+    pub fn with_interpreter(
+        mut self,
+        interpreter: GovernedJailInterpreter,
+    ) -> Result<Self, GovernedProcessJailError> {
+        if cfg!(not(any(target_os = "macos", target_os = "linux"))) {
+            return Err(unsupported_platform());
+        }
+        if self.interpreter.is_some() || interpreter.platform != self.platform {
+            return Err(interpreter_unavailable());
+        }
+        interpreter.revalidate()?;
+        self.interpreter = Some(interpreter);
+        Ok(self)
     }
 
     pub fn schema_version(&self) -> &'static str {
@@ -441,7 +650,15 @@ impl GovernedProcessJail {
     /// Consumers fold it into lock digests so a profile change invalidates
     /// them. Equal to [`governed_process_jail_profile_identity`].
     pub fn profile_identity(&self) -> GovernedProcessJailDigest {
-        governed_process_jail_profile_identity(self.platform, self.network())
+        match self.interpreter.as_ref() {
+            None => governed_process_jail_profile_identity(self.platform, self.network()),
+            Some(interpreter) => governed_process_jail_interpreter_profile_identity(
+                self.platform,
+                self.network(),
+                interpreter.kind,
+                interpreter.version,
+            ),
+        }
     }
 
     pub fn guarantees(&self) -> GovernedProcessJailGuarantees {
@@ -476,7 +693,23 @@ impl GovernedProcessJail {
             guarantees: self.guarantees(),
             limits: self.limits,
             egress: self.egress_audit(),
+            interpreter: self.interpreter_audit(),
         }
+    }
+
+    fn interpreter_audit(&self) -> Option<GovernedJailInterpreterAudit> {
+        let interpreter = self.interpreter.as_ref()?;
+        Some(GovernedJailInterpreterAudit {
+            schema_version: GOVERNED_JAIL_INTERPRETER_V1,
+            kind: interpreter.kind,
+            version: interpreter.version,
+            digest: interpreter.digest,
+            launch_flags: GOVERNED_JAIL_PYTHON3_FLAGS,
+            launch_user_site_disabled: true,
+            script_exec_denied: self.platform == GovernedProcessJailPlatform::MacosSandboxExec,
+            site_packages_read_denied: !interpreter.denied_roots.is_empty(),
+            profile_identity: self.profile_identity(),
+        })
     }
 
     fn egress_audit(&self) -> Option<GovernedProcessJailEgressAudit> {
@@ -572,6 +805,10 @@ impl GovernedProcessJail {
         validate_trusted_launcher(&self.launcher)?;
         validate_real_absolute_file(executable.as_path())?;
         validate_real_absolute_directory(&self.canonical_workdir)?;
+        if let Some(interpreter) = self.interpreter.as_ref() {
+            // Bind the interpreter bytes at launch, not only at discovery.
+            interpreter.revalidate()?;
+        }
         match self.platform {
             GovernedProcessJailPlatform::MacosSandboxExec => self.macos_command(executable),
             GovernedProcessJailPlatform::LinuxBubblewrap => self.linux_command(executable),
@@ -590,6 +827,26 @@ impl GovernedProcessJail {
             .env("TMPDIR", &self.canonical_workdir)
             .env("TMP", &self.canonical_workdir)
             .env("TEMP", &self.canonical_workdir);
+        // Loader injection (dyld `DYLD_*`, glibc ld.so `LD_*` and
+        // `GLIBC_TUNABLES`) and the macOS framework launcher's executable
+        // override are never part of a jailed launch. On Linux the launcher
+        // (bwrap) runs on the host before any sandbox exists, so this matters
+        // there too. Manifest validation already refuses most of these; this
+        // is the jail's own backstop.
+        let removed = command
+            .get_envs()
+            .map(|(name, _)| name.to_owned())
+            .filter(|name| {
+                let name = name.as_encoded_bytes();
+                name.len() >= 5 && name[..5].eq_ignore_ascii_case(b"DYLD_")
+                    || name.starts_with(b"LD_")
+                    || name == b"GLIBC_TUNABLES"
+                    || name == b"__PYVENV_LAUNCHER__"
+            })
+            .collect::<Vec<_>>();
+        for name in removed {
+            command.env_remove(name);
+        }
         let Some(egress) = self.egress.as_ref() else {
             // Direct network is unavailable in this profile, so a portable
             // host trust-store path is unnecessary ambient host topology.
@@ -615,6 +872,28 @@ impl GovernedProcessJail {
         let executable = sbpl_path(snapshot.as_path())?;
         let private_bundle_root = snapshot.private_bundle_root().map(sbpl_path).transpose()?;
         let workdir = sbpl_path(&self.canonical_workdir)?;
+        if let Some(interpreter) = self.interpreter.as_ref() {
+            let program = sbpl_path(&interpreter.executable)?;
+            let broker_port = self.egress.as_ref().map(|egress| egress.proxy_port().to_string());
+            let profile = macos_interpreter_profile(
+                &interpreter.grants(),
+                &executable,
+                private_bundle_root.as_deref(),
+                &workdir,
+                self.egress
+                    .as_ref()
+                    .zip(broker_port.as_deref())
+                    .map(|(egress, port)| (port, egress.trust_bundle.is_some())),
+            )?;
+            let mut command = Command::new(&self.launcher);
+            command
+                .arg("-p")
+                .arg(profile)
+                .arg(program)
+                .args(GOVERNED_JAIL_PYTHON3_FLAGS)
+                .arg(executable);
+            return Ok(command);
+        }
         let profile = match self.egress.as_ref() {
             None => macos_profile(&executable, private_bundle_root.as_deref(), &workdir)?,
             Some(egress) => macos_egress_profile(
@@ -700,13 +979,23 @@ impl GovernedProcessJail {
             },
         };
         let mut command = Command::new(&self.launcher);
-        command.args(linux_bwrap_args(
-            &lib_roots,
-            private_bundle_root,
-            &self.canonical_workdir,
-            relative_executable,
-            egress.as_ref(),
-        ));
+        match self.interpreter.as_ref() {
+            None => command.args(linux_bwrap_args(
+                &lib_roots,
+                private_bundle_root,
+                &self.canonical_workdir,
+                relative_executable,
+                egress.as_ref(),
+            )),
+            Some(interpreter) => command.args(linux_bwrap_args_with_interpreter(
+                &lib_roots,
+                private_bundle_root,
+                &self.canonical_workdir,
+                relative_executable,
+                egress.as_ref(),
+                Some(&interpreter.grants()),
+            )),
+        };
         Ok(command)
     }
 
@@ -767,6 +1056,441 @@ fn brokered_egress_for(
     }
 }
 
+/// Host paths an interpreter-mode jail grants, borrowed from a pinned
+/// interpreter or rendered as placeholders for the profile identity.
+struct InterpreterGrants<'a> {
+    executable: &'a Path,
+    images: Vec<&'a Path>,
+    library_roots: Vec<&'a Path>,
+    denied_roots: Vec<&'a Path>,
+}
+
+impl GovernedJailInterpreter {
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    fn grants(&self) -> InterpreterGrants<'_> {
+        InterpreterGrants {
+            executable: &self.executable,
+            images: self.images.iter().map(PathBuf::as_path).collect(),
+            library_roots: self.library_roots.iter().map(PathBuf::as_path).collect(),
+            denied_roots: self.denied_roots.iter().map(PathBuf::as_path).collect(),
+        }
+    }
+}
+
+/// Paths of one interpreter installation, before trust validation.
+struct InterpreterLayout {
+    executable: PathBuf,
+    images: Vec<PathBuf>,
+    library_roots: Vec<PathBuf>,
+    denied_roots: Vec<PathBuf>,
+}
+
+/// First candidate that passes every trust check, in order.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn python3_from_candidates(
+    platform: GovernedProcessJailPlatform,
+    candidates: &[&Path],
+) -> Result<GovernedJailInterpreter, GovernedProcessJailError> {
+    candidates
+        .iter()
+        .find_map(|candidate| python3_candidate(platform, candidate).ok())
+        .ok_or_else(interpreter_unavailable)
+}
+
+/// Validate one fixed candidate. Every component of the candidate spelling
+/// (symlinks included) must be root-owned and every non-symlink component
+/// must not be group/other-writable, so nobody but root can re-point it. It
+/// is then resolved to its real `python3.N` binary and the layout derived
+/// from that canonical location is validated in full. No interpreter is run.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn python3_candidate(
+    platform: GovernedProcessJailPlatform,
+    candidate: &Path,
+) -> Result<GovernedJailInterpreter, GovernedProcessJailError> {
+    validate_root_owned_spelling(candidate)?;
+    let real = fs::canonicalize(candidate).map_err(|_| interpreter_unavailable())?;
+    validate_trusted_launcher(&real).map_err(|_| interpreter_unavailable())?;
+    let version = real
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(python3_version)
+        .ok_or_else(interpreter_unavailable)?;
+    let layout = match platform {
+        GovernedProcessJailPlatform::MacosSandboxExec => macos_python3_layout(&real, version),
+        GovernedProcessJailPlatform::LinuxBubblewrap => linux_python3_layout(&real, version),
+    }
+    .ok_or_else(interpreter_unavailable)?;
+    let digest = interpreter_digest(&layout.executable, &layout.images)?;
+    let interpreter = GovernedJailInterpreter {
+        platform,
+        kind: GovernedJailInterpreterKind::Python3,
+        version,
+        executable: layout.executable,
+        images: layout.images,
+        library_roots: layout.library_roots,
+        denied_roots: layout.denied_roots,
+        digest,
+    };
+    interpreter.revalidate()?;
+    Ok(interpreter)
+}
+
+/// `python3.N` → `3.N`. Anything else (`python3`, `python3.14t`,
+/// `python3.9-intel64`) is refused.
+fn python3_version(name: &str) -> Option<GovernedJailInterpreterVersion> {
+    let minor = name.strip_prefix("python3.")?;
+    if minor.is_empty() || minor.len() > 3 || !minor.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(GovernedJailInterpreterVersion {
+        major: 3,
+        minor: minor.parse().ok()?,
+    })
+}
+
+/// macOS framework layout of `<Name>.framework/Versions/X.Y/bin/pythonX.Y`.
+/// The `bin` binary is a stub that re-execs
+/// `Resources/Python.app/Contents/MacOS/Python`, so that app binary is the
+/// executable (one exec, no second exec grant). It loads the framework
+/// library `Versions/X.Y/<Name>`. `Versions/X.Y/lib` holds the stdlib,
+/// `lib-dynload` and bundled libraries (python.org ships OpenSSL there);
+/// `lib/pythonX.Y/site-packages` is denied again.
+fn macos_python3_layout(
+    real: &Path,
+    version: GovernedJailInterpreterVersion,
+) -> Option<InterpreterLayout> {
+    let bin = real.parent()?;
+    let version_directory = bin.parent()?;
+    let versions = version_directory.parent()?;
+    let framework = versions.parent()?.file_name()?.to_str()?;
+    let framework_name = framework.strip_suffix(".framework")?;
+    if bin.file_name()? != "bin"
+        || version_directory.file_name()?.to_str()? != version.to_string()
+        || versions.file_name()? != "Versions"
+        || framework_name.is_empty()
+    {
+        return None;
+    }
+    let library = version_directory.join("lib");
+    let stdlib = library.join(format!("python{version}"));
+    if !stdlib.join("os.py").is_file() {
+        return None;
+    }
+    Some(InterpreterLayout {
+        executable: version_directory.join("Resources/Python.app/Contents/MacOS/Python"),
+        images: vec![version_directory.join(framework_name)],
+        library_roots: vec![library],
+        denied_roots: vec![stdlib.join("site-packages")],
+    })
+}
+
+/// Linux layout of `<prefix>/bin/python3.N`: the stdlib roots
+/// `<prefix>/lib/python3.N` and, where present, `<prefix>/lib64/python3.N`.
+/// The base loader/library roots are already bound by the strict profile.
+fn linux_python3_layout(
+    real: &Path,
+    version: GovernedJailInterpreterVersion,
+) -> Option<InterpreterLayout> {
+    let bin = real.parent()?;
+    if bin.file_name()? != "bin" {
+        return None;
+    }
+    let prefix = bin.parent()?;
+    let library_roots = canonical_unique_directories(
+        ["lib", "lib64"]
+            .into_iter()
+            .map(|directory| prefix.join(directory).join(format!("python{version}"))),
+    );
+    if !library_roots.iter().any(|root| root.join("os.py").is_file()) {
+        return None;
+    }
+    Some(InterpreterLayout {
+        executable: real.to_path_buf(),
+        images: linux_python3_images(real, prefix, version)?,
+        library_roots,
+        denied_roots: Vec::new(),
+    })
+}
+
+/// Canonicalize candidate directories and keep each real directory once, in
+/// order. Arch links `/usr/lib64` to `lib`, so `lib64/python3.N` resolves to
+/// the same root as `lib/python3.N`; only canonical paths are kept.
+fn canonical_unique_directories(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    for candidate in candidates {
+        let Ok(canonical) = fs::canonicalize(&candidate) else {
+            continue;
+        };
+        if fs::symlink_metadata(&canonical).is_ok_and(|metadata| metadata.is_dir())
+            && !directories.contains(&canonical)
+        {
+            directories.push(canonical);
+        }
+    }
+    directories
+}
+
+/// A shared-libpython build (Fedora, RHEL, Arch) keeps the interpreter in
+/// `libpython3.N.so.*`; the executable is a small launcher. Its `DT_NEEDED`
+/// entries are read from the ELF dynamic section and the library is pinned
+/// as an image. `None` (refuse) when the executable is not a readable
+/// little-endian ELF64, names another `libpython`, or a needed libpython is
+/// not a regular file in a trusted library directory.
+fn linux_python3_images(
+    real: &Path,
+    prefix: &Path,
+    version: GovernedJailInterpreterVersion,
+) -> Option<Vec<PathBuf>> {
+    let length = fs::symlink_metadata(real).ok()?.len();
+    if length > MAX_GOVERNED_JAIL_INTERPRETER_IMAGE_BYTES {
+        return None;
+    }
+    let bytes = fs::read(real).ok()?;
+    let needed = elf64_needed(&bytes)?;
+    let mut directories = vec![prefix.join("lib64")];
+    if let Some(multiarch) = elf64_multiarch(&bytes) {
+        directories.push(prefix.join("lib").join(multiarch));
+    }
+    directories.push(prefix.join("lib"));
+    linux_libpython_images(&needed, version, &canonical_unique_directories(directories))
+}
+
+/// Resolve every needed `libpython*` in the first canonical directory that
+/// holds it as a regular (non-symlink) file. Any other libpython name refuses.
+fn linux_libpython_images(
+    needed: &[String],
+    version: GovernedJailInterpreterVersion,
+    directories: &[PathBuf],
+) -> Option<Vec<PathBuf>> {
+    let expected = format!("libpython{version}.so");
+    let mut images = Vec::new();
+    for name in needed.iter().filter(|name| name.starts_with("libpython")) {
+        if !name.starts_with(&expected) || name.contains('/') {
+            return None;
+        }
+        let found = directories.iter().map(|directory| directory.join(name)).find(|path| {
+            fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+        })?;
+        if !images.contains(&found) {
+            images.push(found);
+        }
+    }
+    Some(images)
+}
+
+/// `DT_NEEDED` names of a little-endian ELF64 image. `None` when the bytes are
+/// not one or are malformed; an image without a dynamic section needs
+/// nothing. Bounded: the headers index the given bytes only, at most 4096
+/// dynamic entries are read and names are at most 4096 bytes.
+fn elf64_needed(bytes: &[u8]) -> Option<Vec<String>> {
+    let u16_at = |offset: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?))
+    };
+    let u32_at = |offset: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?))
+    };
+    let u64_at = |offset: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?))
+    };
+    if bytes.get(..6)? != b"\x7fELF\x02\x01" {
+        return None;
+    }
+    let program_headers = usize::try_from(u64_at(0x20)?).ok()?;
+    let entry_size = usize::from(u16_at(0x36)?);
+    let entries = usize::from(u16_at(0x38)?);
+    if entry_size < 56 {
+        return None;
+    }
+    let mut loads = Vec::new();
+    let mut dynamic = None;
+    for index in 0..entries {
+        let header = program_headers.checked_add(index.checked_mul(entry_size)?)?;
+        let offset = u64_at(header.checked_add(8)?)?;
+        let address = u64_at(header.checked_add(16)?)?;
+        let size = u64_at(header.checked_add(32)?)?;
+        match u32_at(header)? {
+            1 => loads.push((address, offset, size)),
+            2 => dynamic = Some((offset, size)),
+            _ => {},
+        }
+    }
+    let Some((dynamic_offset, dynamic_size)) = dynamic else {
+        return Some(Vec::new());
+    };
+    let dynamic_offset = usize::try_from(dynamic_offset).ok()?;
+    let mut names = Vec::new();
+    let mut string_table = None;
+    for index in 0..usize::try_from(dynamic_size / 16).ok()?.min(4096) {
+        let entry = dynamic_offset.checked_add(index * 16)?;
+        let value = u64_at(entry.checked_add(8)?)?;
+        match u64_at(entry)? {
+            0 => break,
+            1 => names.push(value),
+            5 => string_table = Some(value),
+            _ => {},
+        }
+    }
+    if names.is_empty() {
+        return Some(Vec::new());
+    }
+    let string_table = string_table?;
+    let (address, offset, _) = loads.iter().find(|(address, _, size)| {
+        string_table >= *address && string_table - address < *size
+    })?;
+    let string_table = usize::try_from(string_table - address).ok()?
+        .checked_add(usize::try_from(*offset).ok()?)?;
+    names
+        .into_iter()
+        .map(|name| {
+            let start = string_table.checked_add(usize::try_from(name).ok()?)?;
+            let rest = bytes.get(start..)?;
+            let end = rest.iter().take(4096).position(|byte| *byte == 0)?;
+            String::from_utf8(rest[..end].to_vec()).ok()
+        })
+        .collect()
+}
+
+/// Debian multiarch library directory for the ELF machine, if any.
+fn elf64_multiarch(bytes: &[u8]) -> Option<&'static str> {
+    match u16::from_le_bytes(bytes.get(0x12..0x14)?.try_into().ok()?) {
+        62 => Some("x86_64-linux-gnu"),
+        183 => Some("aarch64-linux-gnu"),
+        _ => None,
+    }
+}
+
+/// BLAKE3 over a domain tag and, for the executable then each image, its
+/// length and bytes. Domain-separated, so it is not a plain file digest.
+fn interpreter_digest(
+    executable: &Path,
+    images: &[PathBuf],
+) -> Result<GovernedProcessJailDigest, GovernedProcessJailError> {
+    use std::io::Read;
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"tool-runtime.governed-process-jail.interpreter-image.v1\0");
+    for path in std::iter::once(executable).chain(images.iter().map(PathBuf::as_path)) {
+        let file = fs::File::open(path).map_err(|_| interpreter_unavailable())?;
+        let length = file.metadata().map_err(|_| interpreter_unavailable())?.len();
+        if length > MAX_GOVERNED_JAIL_INTERPRETER_IMAGE_BYTES {
+            return Err(interpreter_unavailable());
+        }
+        // Length-prefixed and streamed: the bytes are never buffered whole,
+        // and a file that grows or shrinks while hashed is refused.
+        hasher.update(&length.to_be_bytes());
+        let hashed = std::io::copy(&mut file.take(length + 1), &mut hasher)
+            .map_err(|_| interpreter_unavailable())?;
+        if hashed != length {
+            return Err(interpreter_unavailable());
+        }
+    }
+    Ok(GovernedProcessJailDigest(*hasher.finalize().as_bytes()))
+}
+
+/// Every component of `path` as spelled, symlinks included, is root-owned;
+/// every non-symlink component is also not group/other-writable. A symlink's
+/// own mode is not a write permission (Linux reports 0777 for all of them).
+fn validate_root_owned_spelling(path: &Path) -> Result<(), GovernedProcessJailError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if !path.is_absolute() {
+            return Err(interpreter_unavailable());
+        }
+        let mut current = Some(path);
+        while let Some(component) = current {
+            let metadata = fs::symlink_metadata(component).map_err(|_| interpreter_unavailable())?;
+            if metadata.uid() != 0
+                || (!metadata.file_type().is_symlink() && metadata.mode() & 0o022 != 0)
+            {
+                return Err(interpreter_unavailable());
+            }
+            current = component.parent();
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(unsupported_platform())
+    }
+}
+
+/// A library root must be a canonical real directory whose ancestors pass the
+/// trusted-launcher checks, and every entry below it (not following
+/// symlinks, not descending into `denied` subtrees) must be root-owned and,
+/// unless a symlink, not group/other-writable. Bounded by
+/// `MAX_GOVERNED_JAIL_INTERPRETER_TREE_ENTRIES`.
+fn validate_trusted_tree(root: &Path, denied: &[PathBuf]) -> Result<(), GovernedProcessJailError> {
+    validate_real_absolute_directory(root).map_err(|_| interpreter_unavailable())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut current = Some(root);
+        while let Some(component) = current {
+            let metadata = fs::symlink_metadata(component).map_err(|_| interpreter_unavailable())?;
+            if metadata.file_type().is_symlink()
+                || metadata.uid() != 0
+                || metadata.mode() & 0o022 != 0
+            {
+                return Err(interpreter_unavailable());
+            }
+            current = component.parent();
+        }
+        walk_tree(root, denied, MAX_GOVERNED_JAIL_INTERPRETER_TREE_ENTRIES, |_, metadata| {
+            trusted_tree_entry(metadata)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = denied;
+        Err(unsupported_platform())
+    }
+}
+
+/// Per-entry predicate of a trusted library tree: root-owned and, unless a
+/// symlink (whose own mode is not a write permission), not
+/// group/other-writable.
+#[cfg(unix)]
+fn trusted_tree_entry(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.uid() == 0 && (metadata.file_type().is_symlink() || metadata.mode() & 0o022 == 0)
+}
+
+/// Walk `root` without following symlinks, requiring `trusted` of every
+/// entry, not descending into `denied` subtrees (their own entry is still
+/// checked), and refusing more than `max_entries` entries.
+#[cfg(unix)]
+fn walk_tree(
+    root: &Path,
+    denied: &[PathBuf],
+    max_entries: usize,
+    trusted: impl Fn(&Path, &fs::Metadata) -> bool,
+) -> Result<(), GovernedProcessJailError> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut entries = 0_usize;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|_| interpreter_unavailable())? {
+            let path = entry.map_err(|_| interpreter_unavailable())?.path();
+            entries += 1;
+            if entries > max_entries {
+                return Err(interpreter_unavailable());
+            }
+            let metadata = fs::symlink_metadata(&path).map_err(|_| interpreter_unavailable())?;
+            if !trusted(&path, &metadata) {
+                return Err(interpreter_unavailable());
+            }
+            if metadata.is_dir() && !denied.contains(&path) {
+                pending.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn trusted_egress_forwarder() -> Result<(PathBuf, GovernedProcessJailDigest), GovernedProcessJailError>
 {
     for candidate in GOVERNED_JAIL_EGRESS_FORWARDER_PATHS {
@@ -774,11 +1498,17 @@ fn trusted_egress_forwarder() -> Result<(PathBuf, GovernedProcessJailDigest), Go
         if validate_trusted_launcher(&path).is_err() {
             continue;
         }
-        let metadata = fs::metadata(&path).map_err(|_| egress_forwarder_unavailable())?;
+        // A candidate that cannot be sized or read is skipped like an
+        // untrusted one; the next fixed location may still hold a good copy.
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
         if metadata.len() > MAX_GOVERNED_JAIL_FORWARDER_BYTES {
-            return Err(egress_forwarder_unavailable());
+            continue;
         }
-        let bytes = fs::read(&path).map_err(|_| egress_forwarder_unavailable())?;
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
         let digest = GovernedProcessJailDigest(*blake3::hash(&bytes).as_bytes());
         return Ok((path, digest));
     }
@@ -862,18 +1592,66 @@ pub fn governed_process_jail_profile_identity(
     platform: GovernedProcessJailPlatform,
     network: GovernedProcessJailNetwork,
 ) -> GovernedProcessJailDigest {
+    profile_identity(platform, network, None)
+}
+
+/// As [`governed_process_jail_profile_identity`], for a jail in interpreter
+/// mode. It renders the interpreter profile/argv with placeholder paths and
+/// additionally binds the interpreter kind, `major.minor` and fixed flags, so
+/// it is portable across hosts yet changes with the interpreter line. It is
+/// never equal to the identity without an interpreter.
+pub fn governed_process_jail_interpreter_profile_identity(
+    platform: GovernedProcessJailPlatform,
+    network: GovernedProcessJailNetwork,
+    kind: GovernedJailInterpreterKind,
+    version: GovernedJailInterpreterVersion,
+) -> GovernedProcessJailDigest {
+    profile_identity(platform, network, Some((kind, version)))
+}
+
+fn profile_identity(
+    platform: GovernedProcessJailPlatform,
+    network: GovernedProcessJailNetwork,
+    interpreter: Option<(GovernedJailInterpreterKind, GovernedJailInterpreterVersion)>,
+) -> GovernedProcessJailDigest {
     let brokered = network == GovernedProcessJailNetwork::BrokeredEgress;
+    let placeholder_grants = InterpreterGrants {
+        executable: Path::new("/<interpreter>"),
+        images: match platform {
+            GovernedProcessJailPlatform::MacosSandboxExec => vec![Path::new("/<interpreter-image>")],
+            GovernedProcessJailPlatform::LinuxBubblewrap => Vec::new(),
+        },
+        library_roots: vec![Path::new("/<interpreter-library>")],
+        denied_roots: match platform {
+            GovernedProcessJailPlatform::MacosSandboxExec => {
+                vec![Path::new("/<interpreter-library>/<site-packages>")]
+            },
+            GovernedProcessJailPlatform::LinuxBubblewrap => Vec::new(),
+        },
+    };
+    let grants = interpreter.map(|_| &placeholder_grants);
     let (template, environment): (Vec<OsString>, Vec<(&'static str, OsString)>) = match platform {
         GovernedProcessJailPlatform::MacosSandboxExec => {
             let executable = Path::new("/<executable>");
             let bundle = Path::new("/<bundle>");
             let workdir = Path::new("/<workdir>");
-            let profile = if brokered {
-                macos_egress_profile(executable, Some(bundle), workdir, "<broker-port>", true)
-            } else {
-                macos_profile(executable, Some(bundle), workdir)
+            let profile = match grants {
+                Some(grants) => macos_interpreter_profile(
+                    grants,
+                    executable,
+                    Some(bundle),
+                    workdir,
+                    brokered.then_some(("<broker-port>", true)),
+                ),
+                None if brokered => {
+                    macos_egress_profile(executable, Some(bundle), workdir, "<broker-port>", true)
+                },
+                None => macos_profile(executable, Some(bundle), workdir),
             }
-            .unwrap_or_default();
+            // Fixed placeholder paths and port contain no quote, NUL or
+            // newline and stay far below the byte ceiling, so rendering
+            // cannot fail; a failure is a bug in this function.
+            .expect("placeholder profile renders");
             let environment = if brokered {
                 egress_environment_template(
                     "http://127.0.0.1:<broker-port>",
@@ -897,12 +1675,13 @@ pub fn governed_process_jail_profile_identity(
                 trust_bundle: Some(Path::new("/<trust-bundle>")),
                 environment: environment.clone(),
             });
-            let args = linux_bwrap_args(
+            let args = linux_bwrap_args_with_interpreter(
                 &[Path::new("/lib"), Path::new("/lib64")],
                 Path::new("/<bundle>"),
                 Path::new("/<workdir>"),
                 Path::new("<executable>"),
                 egress.as_ref(),
+                grants,
             );
             (args, environment)
         },
@@ -939,6 +1718,20 @@ pub fn governed_process_jail_profile_identity(
         hasher.update(b"forwarder-protocol\0");
         hasher.update(GOVERNED_JAIL_EGRESS_FORWARDER_PROTOCOL_V1.as_bytes());
     }
+    if let Some((kind, version)) = interpreter {
+        hasher.update(b"interpreter\0");
+        hasher.update(GOVERNED_JAIL_INTERPRETER_V1.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(match kind {
+            GovernedJailInterpreterKind::Python3 => b"python3\0",
+        });
+        hasher.update(version.to_string().as_bytes());
+        hasher.update(b"\0");
+        for flag in GOVERNED_JAIL_PYTHON3_FLAGS {
+            hasher.update(flag.as_bytes());
+            hasher.update(b"\0");
+        }
+    }
     GovernedProcessJailDigest(*hasher.finalize().as_bytes())
 }
 
@@ -963,6 +1756,29 @@ fn linux_bwrap_args(
     workdir: &Path,
     relative_executable: &Path,
     egress: Option<&LinuxEgressMounts<'_>>,
+) -> Vec<OsString> {
+    linux_bwrap_args_with_interpreter(
+        lib_roots,
+        private_bundle_root,
+        workdir,
+        relative_executable,
+        egress,
+        None,
+    )
+}
+
+/// [`linux_bwrap_args`] plus interpreter mode: the interpreter executable
+/// and its library roots are bound read-only at their own host paths (so the
+/// interpreter finds its stdlib from its location), and the command becomes
+/// `<interpreter> -I -S -B /app/<script>`. `None` yields exactly the argv of
+/// [`linux_bwrap_args`].
+fn linux_bwrap_args_with_interpreter(
+    lib_roots: &[&Path],
+    private_bundle_root: &Path,
+    workdir: &Path,
+    relative_executable: &Path,
+    egress: Option<&LinuxEgressMounts<'_>>,
+    interpreter: Option<&InterpreterGrants<'_>>,
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "--die-with-parent",
@@ -1017,6 +1833,14 @@ fn linux_bwrap_args(
             ]);
         }
     }
+    if let Some(interpreter) = interpreter {
+        for path in std::iter::once(interpreter.executable)
+            .chain(interpreter.images.iter().copied())
+            .chain(interpreter.library_roots.iter().copied())
+        {
+            args.extend([OsString::from("--ro-bind"), path.into(), path.into()]);
+        }
+    }
     // The tmpfs root exists only to assemble the mount namespace. Make it
     // read-only after all mounts are installed so `/work` is the sole
     // writable host-visible or in-memory subtree.
@@ -1044,6 +1868,10 @@ fn linux_bwrap_args(
             OsString::from("--"),
         ]);
     }
+    if let Some(interpreter) = interpreter {
+        args.push(interpreter.executable.into());
+        args.extend(GOVERNED_JAIL_PYTHON3_FLAGS.map(OsString::from));
+    }
     let mut jailed_executable = PathBuf::from("/app");
     jailed_executable.push(relative_executable);
     args.push(jailed_executable.into_os_string());
@@ -1061,6 +1889,16 @@ fn macos_egress_profile(
     broker_port: &str,
     trust_bundle: bool,
 ) -> Result<String, GovernedProcessJailError> {
+    let mut profile = macos_profile(executable, private_bundle_root, workdir)?;
+    profile.push_str(&macos_egress_rules(broker_port, trust_bundle)?);
+    if profile.len() > MAX_GOVERNED_JAIL_PROFILE_BYTES {
+        return Err(profile_too_large());
+    }
+    Ok(profile)
+}
+
+/// The brokered-egress allowances appended to a base profile.
+fn macos_egress_rules(broker_port: &str, trust_bundle: bool) -> Result<String, GovernedProcessJailError> {
     if broker_port.is_empty()
         || !broker_port
             .bytes()
@@ -1068,18 +1906,51 @@ fn macos_egress_profile(
     {
         return Err(unsafe_host_path());
     }
-    let mut profile = macos_profile(executable, private_bundle_root, workdir)?;
+    let mut rules = String::new();
     if trust_bundle {
         // `/etc` is a symlink to `/private/etc`; clients that open
         // `/etc/ssl/cert.pem` need its metadata to resolve it.
-        profile.push_str(&format!(
+        rules.push_str(&format!(
             "(allow file-read-metadata (literal \"/etc\"))\n\
              (allow file-read* (subpath \"{MACOS_TRUST_DIRECTORY}\"))\n"
         ));
     }
-    profile.push_str(&format!(
+    rules.push_str(&format!(
         "(allow network-outbound (remote tcp4 \"localhost:{broker_port}\"))\n"
     ));
+    Ok(rules)
+}
+
+/// Interpreter mode: the strict profile rendered for the interpreter as the
+/// only exec'able program, plus a read-only literal of the script snapshot,
+/// read-only literals of the pinned images, read-only library subtrees and,
+/// last so they win, denials of the `site-packages` subtrees. The optional
+/// brokered-egress allowances follow unchanged. `process-fork` stays denied
+/// and the script is never exec-allowed.
+fn macos_interpreter_profile(
+    interpreter: &InterpreterGrants<'_>,
+    script: &Path,
+    private_bundle_root: Option<&Path>,
+    workdir: &Path,
+    egress: Option<(&str, bool)>,
+) -> Result<String, GovernedProcessJailError> {
+    if interpreter.executable == script {
+        return Err(unsafe_host_path());
+    }
+    let mut profile = macos_profile(interpreter.executable, private_bundle_root, workdir)?;
+    profile.push_str(&format!("(allow file-read* (literal \"{}\"))\n", sbpl_escape(script)?));
+    for image in &interpreter.images {
+        profile.push_str(&format!("(allow file-read* (literal \"{}\"))\n", sbpl_escape(image)?));
+    }
+    for root in &interpreter.library_roots {
+        profile.push_str(&format!("(allow file-read* (subpath \"{}\"))\n", sbpl_escape(root)?));
+    }
+    for denied in &interpreter.denied_roots {
+        profile.push_str(&format!("(deny file-read* (subpath \"{}\"))\n", sbpl_escape(denied)?));
+    }
+    if let Some((broker_port, trust_bundle)) = egress {
+        profile.push_str(&macos_egress_rules(broker_port, trust_bundle)?);
+    }
     if profile.len() > MAX_GOVERNED_JAIL_PROFILE_BYTES {
         return Err(profile_too_large());
     }
@@ -1119,9 +1990,16 @@ fn macos_profile(
             sbpl_escape(root)?,
         ));
     }
+    // The workdir is the only writable subtree. Files written there cannot be
+    // `dlopen`ed or mapped `PROT_EXEC` (nor injected by
+    // `DYLD_INSERT_LIBRARIES` on a re-exec). This is defense in depth: a
+    // process can still create native code in memory (`mprotect`, `ctypes`),
+    // and that code stays inside this same profile.
     profile.push_str(&format!(
         "(allow file-read* (subpath \"{}\"))\n\
-         (allow file-write* (subpath \"{}\"))\n",
+         (allow file-write* (subpath \"{}\"))\n\
+         (deny file-map-executable (subpath \"{}\"))\n",
+        sbpl_escape(workdir)?,
         sbpl_escape(workdir)?,
         sbpl_escape(workdir)?,
     ));
@@ -1380,6 +2258,14 @@ const fn egress_forwarder_unavailable() -> GovernedProcessJailError {
     )
 }
 
+const fn interpreter_unavailable() -> GovernedProcessJailError {
+    GovernedProcessJailError::new(
+        GovernedProcessJailErrorCode::InterpreterUnavailable,
+        "jail.interpreter",
+        "no trusted interpreter is available, or the pinned interpreter changed",
+    )
+}
+
 const fn unsafe_host_path() -> GovernedProcessJailError {
     GovernedProcessJailError::new(
         GovernedProcessJailErrorCode::UnsafeHostPath,
@@ -1456,8 +2342,10 @@ mod tests {
         assert_eq!(profile.matches("(allow process-exec").count(), 1);
     }
 
-    /// Golden: the strict profile existing locks were reviewed against. The
-    /// brokered-egress mode must not move a single byte of it.
+    /// Golden: the reviewed strict profile. The brokered-egress and
+    /// interpreter modes must not move a single byte of it. `0.1.77` added the
+    /// final `file-map-executable` denial of the workdir deliberately, which
+    /// rotates the strict profile identity.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_strict_profile_is_byte_identical_to_the_reviewed_golden() {
@@ -1485,7 +2373,8 @@ mod tests {
              (allow file-read* (literal \"/dev/urandom\"))\n\
              (allow file-read* (subpath \"/private/tmp/governed-bundle\"))\n\
              (allow file-read* (subpath \"/private/tmp/private-work\"))\n\
-             (allow file-write* (subpath \"/private/tmp/private-work\"))\n"
+             (allow file-write* (subpath \"/private/tmp/private-work\"))\n\
+             (deny file-map-executable (subpath \"/private/tmp/private-work\"))\n"
         );
     }
 
@@ -1804,6 +2693,7 @@ mod tests {
             _workdir: directory,
             limits: GovernedProcessJailLimits::default(),
             egress: None,
+            interpreter: None,
         };
         let snapshot = tempfile::tempdir().unwrap();
         let snapshot_root = fs::canonicalize(snapshot.path()).unwrap();
