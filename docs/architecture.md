@@ -1,6 +1,6 @@
 # MagicRun architecture
 
-Architecture version: `0.1.77`
+Architecture version: `0.1.78`
 
 Original immutable baseline tag: `architecture/v0.1.73`. The current reviewed
 source/document fingerprints are in [architecture-baseline.json](architecture-baseline.json).
@@ -72,7 +72,7 @@ supervisor, launch an unrelated service, or silently replace a consumer's runtim
 | --- | --- |
 | Manifest admission and tool discovery | `manifest*`, `registry`, `inventory`, `tool_discovery`, MCP catalog policy/projection |
 | Exact authorization and execution ownership | `governed_execution_coordinator`, `governed_execution_authority`, `governed_execution` |
-| Batch, PTY, optional jail | `governed_batch_process` and its macOS spawn backend, `governed_pty_process`, `governed_process_jail` and its in-jail egress forwarder (`magicrun-jail-egress-forwarder`) |
+| Batch, PTY, optional jail | `governed_batch_process` and its macOS spawn backend, `governed_pty_process`, `governed_process_jail` and its in-jail helper (`magicrun-jail-egress-forwarder`: the Linux exec shim and the egress forwarder) |
 | Credential preparation and placement | `credential_preparation`, `credential_injection`, `credential_materialization`, `credential_filesystem` |
 | Credential lifecycle and profiles | `credential_lifecycle*`, `credential_profiles`, `credential_profile_store`, `profile_selection` |
 | Results and settlement | `governed_execution_result`, coordinator audit/terminal types |
@@ -269,6 +269,142 @@ flowchart LR
 - **Launch errors.** A pinned interpreter that changed before launch is
   reported as `GovernedBatchProcessErrorCode::InterpreterUnavailable`, not
   `JailUnavailable`.
+
+## Staged input files (`0.1.78`)
+
+`GovernedProcessJail::stage_input_file(name, bytes)` writes one input file
+into the jail's private workdir before launch and returns the plain name the
+child opens relative to its working directory. A consumer can hand a jailed
+tool data it would otherwise read from a host path, without ever learning or
+exposing the workdir's host path.
+
+- **Name.** One plain component: `[A-Za-z0-9._-]`, not hidden, not starting
+  with `-` (the name is passed as an argument, so never a flag or `-`), at most
+  128 bytes. `..`, separators and non-ASCII are refused (`InvalidInputFile`).
+- **Failures.** A failed write removes the partial file. An existing name or
+  a planted link is `InvalidInputFile`; every other I/O failure reports
+  `PrivateWorkdirUnavailable`.
+- **Concurrency.** Staging is serialized per jail, so concurrent calls cannot
+  all pass the quota check before any of them writes.
+- **Creation.** The file is always fresh (`create_new`, `O_NOFOLLOW`): an
+  existing name or a planted link is refused, never overwritten or followed.
+  It is written `0400` and synced.
+- **Limits.** It counts against the jail's `max_file_bytes`,
+  `max_total_file_bytes` and `max_files`, exactly as the child's own files do.
+
+## Linux task ceiling and the in-jail helper (`0.1.78`)
+
+Linux charges `RLIMIT_NPROC` to the (user namespace, UID) pair of the
+forking task, and (kernel 5.14+ ucounts) also checks each ancestor
+namespace's owner against a limit snapshotted from the namespace's creator.
+A limit set on bubblewrap itself is therefore never right: in the host
+namespace it counts every task of the UID (shared, starving budget; exits
+loosen it; containers hide other tasks of the UID from `/proc`), and with
+setuid bubblewrap the new namespace is owned by root, so bubblewrap's own
+helper fork is checked against root's host-wide count and fails with
+`EAGAIN`. The launcher gets no `RLIMIT_NPROC`.
+
+```mermaid
+flowchart LR
+    host["Batch runner (no RLIMIT_NPROC)"] --> bwrap["bubblewrap"]
+    bwrap -->|"namespaces exist"| shim["/run/magicrun/jail-helper --magicrun-jail-exec-v1"]
+    shim -->|"new userns: RLIMIT_NPROC = max_tasks + 2"| cmd["admitted command (or the forwarder, then the command)"]
+```
+
+- **The helper.** Every Linux jail binds the trusted
+  `magicrun-jail-egress-forwarder` (root-owned at one of
+  `GOVERNED_JAIL_EGRESS_FORWARDER_PATHS`, validated like the launcher,
+  BLAKE3 in `GovernedProcessJailAudit::linux_helper_digest`) read-only at
+  `/run/magicrun/jail-helper` and runs it first:
+  `--magicrun-jail-exec-v1 <tasks> <host-userns> -- <program…>`. It checks
+  that `/proc/self/ns/user` differs from the host's namespace and that it
+  does not run as UID 0 (bubblewrap keeps the caller's UID; `uid_map` cannot
+  serve, as unprivileged bubblewrap nests a namespace mapping the caller to 0
+  for devpts), sets `RLIMIT_NPROC`
+  soft and hard to `max_tasks` plus the machinery in the namespace
+  (bubblewrap's init; plus the forwarder when brokered) and execs. In the
+  brokered mode it execs the forwarder role, which spawns the command.
+- **Out-of-band exec status.** The shim's third argument is one end of a
+  Unix socket pair the batch runner creates (both ends close-on-exec and
+  non-blocking; only the forked bubblewrap clears close-on-exec on its copy;
+  the runner closes that end after spawn and shuts down sending on its own).
+  Besides the shim and the outer monitor, bubblewrap's in-jail init (pid 1,
+  without `--as-pid-1`) still holds it briefly after forking the shim, and in
+  an unprivileged user namespace it is the jail's UID and dumpable, so a
+  racing jailed command could reach it through pid 1. The first byte
+  therefore decides. The shim writes `JAIL_EXEC_REFUSED` first only if the
+  command never ran (a refused ceiling, a failed `setrlimit`); otherwise it
+  marks the descriptor close-on-exec, so the command never holds it, and
+  writes `JAIL_EXEC_DISPATCHING` immediately before exec. Nothing in the jail
+  runs before that first byte, so any forged byte comes second. A socket
+  rather than a pipe, because `/proc/1/fd/N` can reopen a pipe's read end
+  and consume the first byte, but cannot open a socket. After the launcher
+  exits the runner reads what is available, without blocking: a first
+  `JAIL_EXEC_REFUSED` means `GovernedBatchProcessErrorCode::JailHelperRefused`,
+  not dispatched; the dispatching byte first, any later bytes, or no byte
+  mean dispatched, whatever the command printed or exited with. A failed
+  exec writes the refusal byte after the dispatching byte and so counts,
+  conservatively, as dispatched (exit 126). (An earlier stderr-marker design
+  could be forged after real side effects and was never released.)
+- **Build and launch checks.** A Linux jail without the helper fails to build
+  with `JailHelperUnavailable` (brokered: `EgressForwarderUnavailable`). An
+  exact ceiling is claimed only if the inherited hard `RLIMIT_NPROC` admits
+  it (the shim cannot raise it); if it fell by launch, the launch fails with
+  `JailHelperUnavailable`. A helper whose device, inode, size or times
+  changed since the jail was built is refused at launch. Known limit: the
+  helper is re-checked by path metadata, not bound by an open descriptor
+  (`bwrap --ro-bind-fd`), so a root-owned file replaced between the check and
+  bubblewrap's bind, keeping all of those, is not caught.
+- **What the kernel checks.**
+  - *Unprivileged bubblewrap (userns):* the namespace is owned by the user.
+    Level 0 counts the jail's tasks in its own namespace against the shim's
+    limit (exact, threads included); the ancestor level counts the user's
+    host tasks against the user's own limit, snapshotted unchanged.
+  - *Setuid bubblewrap with user namespaces:* bubblewrap's
+    `--unshare-user-try` creates the namespace as root. Level 0 is the same
+    exact per-jail bound; the ancestor level counts root's tasks against the
+    unlowered limit bubblewrap inherited, which no longer fails.
+  - *Setuid bubblewrap without user namespaces* (`user.max_user_namespaces=0`,
+    the RHEL 7 module parameter, or no user-namespace support): the jail's
+    tasks share the UID's host-wide count, so no `RLIMIT_NPROC` can bound one
+    jail.
+  - *Kernels before 5.17*: before the 5.14 ucounts rework `RLIMIT_NPROC`
+    counts the UID's tasks host-wide even inside a user namespace (Debian 11,
+    Ubuntu 20.04, RHEL 8), and 5.14-5.16 carry accounting bugs fixed in 5.17.
+  - *A root real UID*: Linux never holds tasks charged to the initial root
+    user to `RLIMIT_NPROC`.
+  - In these three cases the shim runs as `- -` (exec only),
+    `guarantees().process_ceiling` is `false`, and the sampled watchdog is the
+    only process/task bound. A delegated cgroup v2 `pids.max` would be exact
+    there; none is assumed.
+  - The host decides with `MIN_GOVERNED_JAIL_TASK_CEILING_KERNEL` (5.17, from
+    `uname`; an unparsable release fails closed), the real UID, and the way
+    bubblewrap decides on a namespace (setuid bit, `/proc/self/ns/user`, RHEL
+    parameter, `max_user_namespaces`). A wrong prediction fails closed: the
+    shim refuses a requested ceiling outside a new namespace or as UID 0.
+- **Tasks and processes.** `GovernedProcessJailLimits::max_tasks` (default
+  256, at most 1024, at least `max_processes`) is the thread budget; Node,
+  Go and threaded Python run many threads per process. `max_processes` stays
+  the watchdog's process count. On Linux both allow the launcher, init and
+  (brokered) forwarder on top; on macOS nothing, as `sandbox-exec` execs the
+  command in place.
+- **Watchdog.** Linux samples the launcher and all its descendants by parent
+  links, not the process group: a jailed process can `setsid`/`setpgid`
+  out of the group, never out of the pid namespace, whose orphans the
+  in-jail init adopts. It sums processes, threads, CPU and resident memory.
+  Killing the launcher's group still tears the jail down (the init dies with
+  its parent, and the pid namespace with it). macOS also counts threads
+  (`PROC_PIDTASKINFO`). Known limits: each sample re-reads `/proc` whole (a
+  process forked between two reads is seen next sample), and taking a
+  directory identity reads `/proc/self/mountinfo`; it is not cached.
+- **Directory identity.** Birth time is part of a working directory's
+  identity on Linux only (inode numbers are reused at once), and not on
+  overlayfs (or `fuse-overlayfs`, or when mountinfo is unreadable), where
+  copy-up changes it. Whether it applies is decided once, when the identity
+  is taken. Where it was recorded, every revalidation reads the current
+  birth time directly (no new overlay probe: the device already matched) and
+  a missing or different one is a changed directory (fail closed). macOS
+  leaves it out: `touch -t` to an earlier time moves APFS birth time.
 
 ## Declared login prompts
 

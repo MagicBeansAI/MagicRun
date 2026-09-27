@@ -18,6 +18,45 @@
 //! ```text
 //! magicrun-jail-egress-forwarder --magicrun-jail-egress-forwarder-v1 <port> <socket> -- <program> [args...]
 //! ```
+//!
+//! The same trusted binary is the Linux jail's exec shim in every mode. It is
+//! the first program bubblewrap runs, after the jail's namespaces exist:
+//!
+//! ```text
+//! magicrun-jail-egress-forwarder --magicrun-jail-exec-v1 <tasks|-> <host-userns|-> <status-fd> -- <program> [args...]
+//! ```
+//!
+//! With a task ceiling it first proves it runs in a user namespace other than
+//! the host's (`/proc/self/ns/user` differs from `<host-userns>`) and that
+//! it does not run as root (whose tasks Linux never holds to `RLIMIT_NPROC`),
+//! then sets `RLIMIT_NPROC` (soft and hard) to `<tasks>` and execs
+//! `<program>`. Linux charges `RLIMIT_NPROC` to the (user namespace, UID)
+//! pair of the forking task, so inside the jail's own new user namespace it
+//! counts only the jail's tasks, threads included: an exact per-jail bound.
+//! Outside a new user namespace the same limit would count every task of the
+//! UID on the host, so the shim refuses rather than apply a meaningless or
+//! starving bound. With `- -` it only execs.
+//!
+//! `<status-fd>` is the inherited write end of the runner's exec-status
+//! channel (a socket pair). The first byte on it decides the outcome. On a
+//! refusal, or any failure before the program is dispatched (`setrlimit`,
+//! marking the descriptor close-on-exec), the shim writes
+//! [`JAIL_EXEC_REFUSED`] there first and exits 126. Otherwise it marks the
+//! descriptor close-on-exec, so the program never holds it, and writes
+//! [`JAIL_EXEC_DISPATCHING`] immediately before `exec`. If `exec` then fails
+//! it writes [`JAIL_EXEC_REFUSED`] too, but second: the runner treats that
+//! run, conservatively, as dispatched. It never forks and never writes to
+//! stdio.
+//!
+//! bubblewrap's in-jail init (pid 1, outside `--as-pid-1`) closes the
+//! inherited descriptors it does not need, but still holds this one briefly
+//! after it forks the shim, and in an unprivileged user namespace it is the
+//! jail's UID and dumpable. A jailed command could therefore reach the
+//! descriptor through pid 1 (`pidfd_getfd`; `/proc/1/fd/N` cannot open a
+//! socket, unlike a pipe, whose read end it could open to consume the first
+//! byte). Nothing inside the jail runs before the shim's first byte, so
+//! whatever such a command writes comes second and cannot turn a dispatched
+//! run into a refusal.
 
 use std::{ffi::OsString, path::PathBuf};
 
@@ -25,6 +64,26 @@ use std::{ffi::OsString, path::PathBuf};
 pub const FORWARDER_EXIT_USAGE: i32 = 125;
 /// Exit status when the child cannot be started.
 pub const FORWARDER_EXIT_SPAWN: i32 = 127;
+/// Exec shim: exit status after a refusal or a failed exec. Only the status
+/// channel's first byte, never this code, tells the runner that nothing ran.
+pub const JAIL_EXEC_EXIT_REFUSED: i32 = 126;
+/// The byte the exec shim writes to the status channel when the program
+/// never ran. It means a refusal only as the channel's first byte.
+pub const JAIL_EXEC_REFUSED: u8 = b'R';
+/// The byte the exec shim writes to the status channel immediately before
+/// `exec`: from then on the run counts as dispatched, whatever follows.
+pub const JAIL_EXEC_DISPATCHING: u8 = b'D';
+
+/// Whether an exec-status report (every byte the runner could read, in
+/// order) means the program never ran: only if its first byte is
+/// [`JAIL_EXEC_REFUSED`]. [`JAIL_EXEC_DISPATCHING`] first, or no byte at all,
+/// means dispatched; later bytes never change the outcome, so nothing written
+/// after the shim's first byte can forge a refusal.
+pub fn jail_exec_report_refused(report: &[u8]) -> bool {
+    report.first() == Some(&JAIL_EXEC_REFUSED)
+}
+/// argv marker of the in-jail exec-shim protocol.
+pub const GOVERNED_JAIL_EXEC_PROTOCOL_V1: &str = "--magicrun-jail-exec-v1";
 /// Concurrent relayed connections; further connections wait in the listen
 /// backlog. The forwarder clamps this to what its `RLIMIT_NOFILE` allows (see
 /// [`connection_capacity_for`]).
@@ -107,11 +166,77 @@ pub fn parse_forwarder_arguments(
     })
 }
 
+/// A parsed exec-shim invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JailExecInvocation {
+    /// `RLIMIT_NPROC` to apply, and the host user-namespace inode the shim
+    /// must differ from; `None` for `- -` (exec only).
+    pub task_ceiling: Option<(u64, u64)>,
+    /// Write end of the runner's exec-status channel (at least 3).
+    pub status_fd: i32,
+    pub program: OsString,
+    pub arguments: Vec<OsString>,
+}
+
+/// Parse the exec-shim argument vector after argv[0]. Anything but the
+/// exact layout is refused: both values numeric (ceiling at least 1) or both
+/// `-`, a status descriptor of at least 3, then `--` and an absolute program.
+pub fn parse_exec_arguments(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Option<JailExecInvocation> {
+    let mut arguments = arguments.into_iter();
+    if arguments.next()? != GOVERNED_JAIL_EXEC_PROTOCOL_V1 {
+        return None;
+    }
+    let tasks = arguments.next()?;
+    let namespace = arguments.next()?;
+    let task_ceiling = match (tasks.to_str()?, namespace.to_str()?) {
+        ("-", "-") => None,
+        (tasks, namespace) => {
+            let tasks = tasks.parse::<u64>().ok().filter(|tasks| *tasks > 0)?;
+            let namespace = namespace.parse::<u64>().ok()?;
+            Some((tasks, namespace))
+        },
+    };
+    let status_fd = arguments.next()?.to_str()?.parse::<i32>().ok().filter(|fd| *fd >= 3)?;
+    if arguments.next()? != "--" {
+        return None;
+    }
+    let program = arguments.next()?;
+    if !std::path::Path::new(&program).is_absolute() {
+        return None;
+    }
+    Some(JailExecInvocation {
+        task_ceiling,
+        status_fd,
+        program,
+        arguments: arguments.collect(),
+    })
+}
+
+/// The inode of a `user:[N]` namespace link target.
+pub fn parse_user_namespace_link(target: &std::path::Path) -> Option<u64> {
+    target
+        .to_str()?
+        .strip_prefix("user:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
 /// Process entry point of `magicrun-jail-egress-forwarder`. Runs the relay
 /// until the child exits, then exits with the child's status (re-raising a
-/// terminating signal). Never returns.
+/// terminating signal); or, in exec-shim mode, applies the task ceiling and
+/// execs. Never returns.
 #[cfg(unix)]
 pub fn forwarder_main(arguments: impl IntoIterator<Item = OsString>) -> ! {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    if arguments.first().is_some_and(|first| first == GOVERNED_JAIL_EXEC_PROTOCOL_V1) {
+        let Some(invocation) = parse_exec_arguments(arguments) else {
+            std::process::exit(FORWARDER_EXIT_USAGE);
+        };
+        std::process::exit(unix::exec_shim(&invocation));
+    }
     let Some(invocation) = parse_forwarder_arguments(arguments) else {
         std::process::exit(FORWARDER_EXIT_USAGE);
     };
@@ -140,6 +265,82 @@ mod unix {
         EXIT_DRAIN_MS, FORWARDER_EXIT_SPAWN, FORWARDER_EXIT_USAGE, POLL_INTERVAL_MS, PUMP_ROUNDS,
         RELAY_BUFFER_BYTES,
     };
+
+    /// Apply the task ceiling (only inside a user namespace of the jail's
+    /// own) and exec the program. Returns only on failure, with the exit code.
+    pub(super) fn exec_shim(invocation: &super::JailExecInvocation) -> i32 {
+        use std::os::unix::process::CommandExt;
+
+        let status = invocation.status_fd;
+        // Write one byte to the status channel; `true` once it is written.
+        let report = |byte: u8| loop {
+            let byte = [byte];
+            // SAFETY: writes one byte from a live buffer to a descriptor
+            // number; a closed or foreign number fails harmlessly.
+            let written = unsafe { libc::write(status, byte.as_ptr().cast(), 1) };
+            if written == 1 {
+                break true;
+            }
+            if written < 0 && io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            break false;
+        };
+        // Report that the program never ran. Decisive only as the first byte.
+        let refuse = || {
+            let _ = report(super::JAIL_EXEC_REFUSED);
+            super::JAIL_EXEC_EXIT_REFUSED
+        };
+        // SAFETY: `F_GETFD` only queries the descriptor number.
+        if unsafe { libc::fcntl(status, libc::F_GETFD) } < 0 {
+            return FORWARDER_EXIT_USAGE;
+        }
+        if let Some((tasks, host_namespace)) = invocation.task_ceiling {
+            let own = std::fs::read_link("/proc/self/ns/user")
+                .ok()
+                .and_then(|target| super::parse_user_namespace_link(&target));
+            // bubblewrap keeps the caller's UID inside the sandbox (no
+            // `--uid`), so UID 0 here means the service runs as host root.
+            // `/proc/self/uid_map` cannot tell: to mount devpts, unprivileged
+            // bubblewrap nests the sandbox namespace in one that maps the
+            // caller to 0, so the map is relative to that intermediate one.
+            // SAFETY: `getuid` has no preconditions and cannot fail.
+            let root = unsafe { libc::getuid() } == 0;
+            if own.is_none() || own == Some(host_namespace) || root {
+                return refuse();
+            }
+            // `rlim_t` is 64-bit on every supported target.
+            let value = tasks as libc::rlim_t;
+            let limit = libc::rlimit {
+                rlim_cur: value,
+                rlim_max: value,
+            };
+            // SAFETY: `setrlimit` reads only the live `limit`.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limit) } != 0 {
+                return refuse();
+            }
+        }
+        // The program must never hold the status channel.
+        // SAFETY: `F_SETFD` on the inherited descriptor checked above.
+        if unsafe { libc::fcntl(status, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return refuse();
+        }
+        // The first byte decides: from here on the run counts as dispatched.
+        // Nothing in the jail has run yet, so no other writer can be first.
+        // If even this byte cannot be written, try to refuse instead: the
+        // program has not run.
+        if !report(super::JAIL_EXEC_DISPATCHING) {
+            return refuse();
+        }
+        // `exec` replaces this process and returns only on failure (the
+        // descriptor is then still open). No PATH search: the program is
+        // absolute. A failed exec still writes the refusal byte, but second:
+        // the runner conservatively counts the run as dispatched.
+        let _error = Command::new(&invocation.program)
+            .args(&invocation.arguments)
+            .exec();
+        refuse()
+    }
 
     pub(super) fn run(invocation: &ForwarderInvocation) -> Result<ExitStatus, i32> {
         // Bind before the child exists so its first connection cannot race
@@ -180,7 +381,7 @@ mod unix {
                 return Err(FORWARDER_EXIT_USAGE);
             }
             if let Some(status) = child.try_wait().map_err(|_| FORWARDER_EXIT_USAGE)? {
-                drain_outbound(&mut connections);
+                drain_outbound(&listener, &invocation.socket, &mut connections, capacity);
                 return Ok(status);
             }
             if listening
@@ -290,8 +491,19 @@ mod unix {
 
     /// The child has exited: deliver what it already sent to the broker, for
     /// at most `EXIT_DRAIN_MS`, so a fire-and-forget upload is not cut short.
-    fn drain_outbound(connections: &mut Vec<Connection>) {
+    /// A connection the child completed just before exiting may still sit in
+    /// the listen queue (Linux reports a fully closed client only once its
+    /// peer closes), so the queue is accepted once, at exit, while under
+    /// capacity. Never again afterwards: a descendant that outlives the child
+    /// must not open new brokered connections during the drain.
+    fn drain_outbound(
+        listener: &TcpListener,
+        socket: &Path,
+        connections: &mut Vec<Connection>,
+        capacity: usize,
+    ) {
         let deadline = Instant::now() + Duration::from_millis(EXIT_DRAIN_MS);
+        let _ = accept_pending(listener, socket, connections, capacity);
         loop {
             for connection in connections.iter_mut() {
                 connection.pump_outbound();
@@ -644,6 +856,22 @@ mod tests {
         values.iter().map(OsString::from).collect()
     }
 
+    /// Only the first byte decides: a refusal written after the dispatching
+    /// byte (a failed exec, or a forger reaching the descriptor through the
+    /// jail's init) is still dispatched.
+    #[test]
+    fn only_a_first_refusal_byte_is_a_refusal() {
+        let (refused, dispatching) = (JAIL_EXEC_REFUSED, JAIL_EXEC_DISPATCHING);
+        assert!(jail_exec_report_refused(&[refused]));
+        assert!(jail_exec_report_refused(&[refused, dispatching]));
+        assert!(jail_exec_report_refused(&[refused, refused]));
+        assert!(!jail_exec_report_refused(&[]));
+        assert!(!jail_exec_report_refused(&[dispatching]));
+        assert!(!jail_exec_report_refused(&[dispatching, refused]));
+        assert!(!jail_exec_report_refused(&[dispatching, refused, refused]));
+        assert!(!jail_exec_report_refused(b"x"));
+    }
+
     #[test]
     fn capacity_fits_the_descriptor_limit() {
         assert_eq!(FORWARDER_MIN_OPEN_FILES, 8);
@@ -659,6 +887,48 @@ mod tests {
         assert_eq!(connection_capacity_for(16, 6), 4);
         // Never fewer reserved than stdio plus the listener.
         assert_eq!(connection_capacity_for(12, 0), 3);
+    }
+
+    #[test]
+    fn exec_shim_parses_only_the_exact_layout() {
+        let parsed = parse_exec_arguments(args(&[
+            "--magicrun-jail-exec-v1",
+            "258",
+            "4026531837",
+            "9",
+            "--",
+            "/app/tool",
+            "--flag",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.task_ceiling, Some((258, 4026531837)));
+        assert_eq!(parsed.status_fd, 9);
+        assert_eq!(parsed.program, OsString::from("/app/tool"));
+        assert_eq!(parsed.arguments, args(&["--flag"]));
+        let exec_only =
+            parse_exec_arguments(args(&["--magicrun-jail-exec-v1", "-", "-", "3", "--", "/app/tool"])).unwrap();
+        assert_eq!(exec_only.task_ceiling, None);
+        for refused in [
+            &["--magicrun-jail-exec-v1", "0", "1", "9", "--", "/app/tool"][..],
+            &["--magicrun-jail-exec-v1", "8", "-", "9", "--", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "-", "1", "9", "--", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "8", "1", "9", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "8", "1", "9", "--", "relative"],
+            &["--magicrun-jail-exec-v1", "8", "1", "9", "--"],
+            &["--magicrun-jail-exec-v1", "8", "1", "--", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "8", "1", "2", "--", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "8", "1", "x", "--", "/app/tool"],
+            &["--magicrun-jail-egress-forwarder-v1", "8", "1", "9", "--", "/app/tool"],
+        ] {
+            assert_eq!(parse_exec_arguments(args(refused)), None, "{refused:?}");
+        }
+        assert_eq!(
+            parse_user_namespace_link(std::path::Path::new("user:[4026531837]")),
+            Some(4026531837)
+        );
+        for refused in ["pid:[1]", "user:[x]", "user:4026531837"] {
+            assert_eq!(parse_user_namespace_link(std::path::Path::new(refused)), None);
+        }
     }
 
     #[test]

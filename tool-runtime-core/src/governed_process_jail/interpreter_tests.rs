@@ -31,7 +31,10 @@ fn strings(args: &[OsString]) -> Vec<&str> {
 }
 
 /// Golden: the reviewed profile identities consumers fold into lock digests.
-/// The Linux values are unchanged since `0.1.76`. `0.1.77` deliberately
+/// `0.1.78` deliberately rotated the Linux values: every Linux jail now binds
+/// the trusted helper and runs through its exec shim, which takes the
+/// runner's exec-status descriptor (strict was `blake3:1fc54240…cc61a0`,
+/// brokered `blake3:3c4fcba8…e142cc` in `0.1.77`). `0.1.77` deliberately
 /// rotated both macOS values by adding
 /// `(deny file-map-executable (subpath "<workdir>"))` to the strict profile:
 /// strict was `blake3:e783cb6b…020d31`, brokered `blake3:89b6c07b…2f09f6`.
@@ -42,8 +45,8 @@ fn profile_identities_match_the_reviewed_goldens() {
     for (platform, network, expected) in [
         (MacosSandboxExec, Denied, "blake3:8a06b6cf39f973f5e72e7f56919d42e28949205f84f4a1de52f81d383d32dcd2"),
         (MacosSandboxExec, BrokeredEgress, "blake3:97a0d14fc4da175cd3f231dbbfc6ce35f3305052c339f83cc86b65da8860aacb"),
-        (LinuxBubblewrap, Denied, "blake3:1fc542409c879a757ff387254a29e17370f76b458e98367e4d08b45311cc61a0"),
-        (LinuxBubblewrap, BrokeredEgress, "blake3:3c4fcba8aed50880e5899981acc4bb009fe43ec4325eddb62e5301b19ee142cc"),
+        (LinuxBubblewrap, Denied, "blake3:f93c909af6f3b44677d16f371dd30ef34a56a9b2ec2d49cc67dedeb661ee214f"),
+        (LinuxBubblewrap, BrokeredEgress, "blake3:ec0957f299eac640eecaa8f37db703f1ba18058a27101946873b983805dae380"),
     ] {
         assert_eq!(
             governed_process_jail_profile_identity(platform, network).to_string(),
@@ -62,8 +65,8 @@ fn interpreter_profile_identities_match_the_reviewed_goldens() {
         (MacosSandboxExec, Denied, 9, "blake3:cf6750189aa80f18332c78698ce51576d45aa2dde6a94beb2a2612336d2a7494"),
         (MacosSandboxExec, Denied, 14, "blake3:a47ea4ba6a97e7bb1ef057b346f63c67c749ab33e262e947f59868b9cfcc4ac3"),
         (MacosSandboxExec, BrokeredEgress, 9, "blake3:cc6fa6d8a746bd393d35fe92b8aa090add58f61f0fe45595e31bb365482b4116"),
-        (LinuxBubblewrap, Denied, 9, "blake3:58e25e84baf6c46db8c0473fdfa1f0023a1dc3e74b1ae33e0fabf4038dcd57ae"),
-        (LinuxBubblewrap, BrokeredEgress, 14, "blake3:d2b1152346f41b29a61b777239e8a533800df75753c1136a1044ad1d51047852"),
+        (LinuxBubblewrap, Denied, 9, "blake3:5937555cff22f94743612df70ecd6663285c57334339b18b3d1054cab2047d54"),
+        (LinuxBubblewrap, BrokeredEgress, 14, "blake3:1201c006a857ee995ada7f094333e80e2fd6e8e5f36c65f49c459403ad5ed29d"),
     ] {
         let identity = governed_process_jail_interpreter_profile_identity(
             platform,
@@ -169,12 +172,18 @@ fn linux_interpreter_argv_binds_the_interpreter_and_prepends_it() {
     let bundle = Path::new("/private/bundle");
     let workdir = Path::new("/private/work");
     let script = Path::new("skill");
+    let exec = LinuxJailExec {
+        helper: Path::new("/usr/libexec/magicrun/magicrun-jail-egress-forwarder"),
+        status_fd: OsString::from("9"),
+        task_ceiling: Some((OsString::from("258"), OsString::from("4026531837"))),
+    };
     assert_eq!(
-        linux_bwrap_args_with_interpreter(&lib_roots, bundle, workdir, script, None, None),
-        linux_bwrap_args(&lib_roots, bundle, workdir, script, None)
+        linux_bwrap_args_with_interpreter(&lib_roots, bundle, workdir, script, &exec, None, None),
+        linux_bwrap_args(&lib_roots, bundle, workdir, script, &exec, None)
     );
     let grants = linux_grants();
-    let args = linux_bwrap_args_with_interpreter(&lib_roots, bundle, workdir, script, None, Some(&grants));
+    let args =
+        linux_bwrap_args_with_interpreter(&lib_roots, bundle, workdir, script, &exec, None, Some(&grants));
     let args = strings(&args);
     let has = |window: &[&str]| args.windows(window.len()).any(|pair| pair == window);
     assert!(has(&["--ro-bind", "/usr/bin/python3.11", "/usr/bin/python3.11"]));
@@ -184,22 +193,51 @@ fn linux_interpreter_argv_binds_the_interpreter_and_prepends_it() {
     let remount = args.iter().position(|arg| *arg == "--remount-ro").unwrap();
     assert!(args.iter().rposition(|arg| *arg == "--ro-bind").unwrap() < remount);
     let separator = args.iter().position(|arg| *arg == "--").unwrap();
-    assert_eq!(&args[separator..], ["--", "/usr/bin/python3.11", "-I", "-S", "-B", "/app/skill"]);
+    assert_eq!(
+        &args[separator..],
+        [
+            "--",
+            LINUX_JAIL_HELPER,
+            "--magicrun-jail-exec-v1",
+            "258",
+            "4026531837",
+            "9",
+            "--",
+            "/usr/bin/python3.11",
+            "-I",
+            "-S",
+            "-B",
+            "/app/skill",
+        ]
+    );
 
     let mounts = LinuxEgressMounts {
-        forwarder: Path::new("/usr/libexec/magicrun/magicrun-jail-egress-forwarder"),
         socket: Path::new("/run/magician/egress/broker.sock"),
         trust_bundle: None,
         environment: Vec::new(),
     };
-    let args = linux_bwrap_args_with_interpreter(&lib_roots, bundle, workdir, script, Some(&mounts), Some(&grants));
+    let args = linux_bwrap_args_with_interpreter(
+        &lib_roots,
+        bundle,
+        workdir,
+        script,
+        &exec,
+        Some(&mounts),
+        Some(&grants),
+    );
     let args = strings(&args);
     let separator = args.iter().position(|arg| *arg == "--").unwrap();
     assert_eq!(
         &args[separator..],
         [
             "--",
-            LINUX_JAIL_EGRESS_FORWARDER,
+            LINUX_JAIL_HELPER,
+            "--magicrun-jail-exec-v1",
+            "258",
+            "4026531837",
+            "9",
+            "--",
+            LINUX_JAIL_HELPER,
             GOVERNED_JAIL_EGRESS_FORWARDER_PROTOCOL_V1,
             "3128",
             LINUX_JAIL_EGRESS_SOCKET,
@@ -524,8 +562,14 @@ fn host_interpreter() -> Option<GovernedJailInterpreter> {
 fn strict_jail(interpreter: GovernedJailInterpreter) -> Option<GovernedProcessJail> {
     match GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) {
         Ok(jail) => Some(jail.with_interpreter(interpreter).unwrap()),
-        Err(error) if error.code == GovernedProcessJailErrorCode::LauncherUnavailable => {
-            skip(&format!("no jail launcher on this host: {error}"));
+        Err(error)
+            if matches!(
+                error.code,
+                GovernedProcessJailErrorCode::LauncherUnavailable
+                    | GovernedProcessJailErrorCode::JailHelperUnavailable
+            ) =>
+        {
+            skip(&format!("no jail launcher or helper on this host: {error}"));
             None
         },
         Err(error) => panic!("unexpected strict jail setup failure: {error}"),
@@ -1068,6 +1112,270 @@ mod macos {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+
+    fn strict_jail_with(limits: GovernedProcessJailLimits) -> Option<GovernedProcessJail> {
+        let interpreter = host_interpreter()?;
+        match GovernedProcessJail::strict_app(limits) {
+            Ok(jail) => Some(jail.with_interpreter(interpreter).unwrap()),
+            Err(error) => {
+                skip(&format!("no Linux strict jail on this host: {error}"));
+                None
+            },
+        }
+    }
+
+    /// CI states per leg whether the jail gets a user namespace of its own
+    /// (`MAGICRUN_EXPECT_PROCESS_CEILING`); the guarantee must agree.
+    #[test]
+    fn the_process_ceiling_guarantee_matches_the_host() {
+        let Some(jail) = strict_jail_with(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        match std::env::var("MAGICRUN_EXPECT_PROCESS_CEILING").as_deref() {
+            Ok("true") => assert!(jail.guarantees().process_ceiling),
+            Ok("false") => assert!(!jail.guarantees().process_ceiling),
+            _ => eprintln!("process_ceiling = {}", jail.guarantees().process_ceiling),
+        }
+    }
+
+    /// Threads count against the task ceiling. With a user namespace of the
+    /// jail's own, the kernel stops thread creation at the ceiling (`EAGAIN`,
+    /// told apart from memory exhaustion by a `fork` probe at the limit);
+    /// without one, the watchdog ends the run while the threads are held.
+    /// Small stacks and one malloc arena keep the address-space ceiling out
+    /// of the picture: with glibc's defaults, memory ran out after 11-14
+    /// threads, well before the ceiling.
+    #[test]
+    fn a_thread_bomb_is_bounded() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let limits = GovernedProcessJailLimits {
+            max_tasks: 32,
+            ..GovernedProcessJailLimits::default()
+        };
+        let Some(jail) = strict_jail_with(limits) else {
+            return;
+        };
+        let exact = jail.guarantees().process_ceiling;
+        let script = Script::new(
+            "import errno, json, os, sys, threading, time\n\
+             threading.stack_size(64 * 1024)\n\
+             hold = threading.Event()\n\
+             threads = 0\n\
+             out = {}\n\
+             try:\n\
+             \x20   while threads < 200:\n\
+             \x20       threading.Thread(target=hold.wait, daemon=True).start()\n\
+             \x20       threads += 1\n\
+             except RuntimeError as error:\n\
+             \x20   out['error'] = str(error)\n\
+             out['threads'] = threads\n\
+             try:\n\
+             \x20   pid = os.fork()\n\
+             \x20   if pid == 0:\n\
+             \x20       os._exit(0)\n\
+             \x20   os.waitpid(pid, 0)\n\
+             \x20   out['fork'] = 'ok'\n\
+             except OSError as error:\n\
+             \x20   out['fork'] = errno.errorcode.get(error.errno, str(error.errno))\n\
+             time.sleep(3)\n\
+             print(json.dumps(out))\n\
+             sys.stdout.flush()\n\
+             os._exit(0)\n",
+        );
+        // One malloc arena: glibc otherwise reserves 64 MiB of address space
+        // per thread's arena, which exhausted the address-space ceiling
+        // after 11-14 threads, before the task ceiling was reached.
+        let run = try_run_in_jail(
+            jail,
+            &script.search_path(),
+            SCRIPT_NAME,
+            &[],
+            &[("MALLOC_ARENA_MAX", "1")],
+            Some(script.digest),
+        )
+        .unwrap();
+        if exact {
+            let output = json(&run);
+            // Strict mode: the ceiling is max_tasks + 1 (bubblewrap's init),
+            // and the interpreter's main thread is one of them.
+            let threads = output["threads"].as_u64().unwrap();
+            assert!((26..=31).contains(&threads), "{output}");
+            assert!(output["error"].as_str().is_some(), "{output}");
+            assert_eq!(output["fork"], "EAGAIN", "the task ceiling, not memory: {output}");
+        } else {
+            assert_eq!(run.terminal, GovernedExecutionTerminal::ProcessLimitExceeded, "stdout={}", run.stdout);
+        }
+    }
+
+    /// Processes too: forks stop at the ceiling (exact) or the watchdog ends
+    /// the run.
+    #[test]
+    fn a_fork_bomb_is_bounded() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let limits = GovernedProcessJailLimits {
+            max_tasks: 16,
+            ..GovernedProcessJailLimits::default()
+        };
+        let Some(jail) = strict_jail_with(limits) else {
+            return;
+        };
+        let exact = jail.guarantees().process_ceiling;
+        let script = Script::new(
+            "import json, os, signal, time\n\
+             children = []\n\
+             out = {}\n\
+             try:\n\
+             \x20   while len(children) < 60:\n\
+             \x20       pid = os.fork()\n\
+             \x20       if pid == 0:\n\
+             \x20           time.sleep(10)\n\
+             \x20           os._exit(0)\n\
+             \x20       children.append(pid)\n\
+             except OSError as error:\n\
+             \x20   out['error'] = type(error).__name__\n\
+             out['forks'] = len(children)\n\
+             time.sleep(2)\n\
+             for pid in children:\n\
+             \x20   os.kill(pid, signal.SIGKILL)\n\
+             \x20   os.waitpid(pid, 0)\n\
+             print(json.dumps(out))\n",
+        );
+        let run = script.run(jail, &[]);
+        if exact {
+            let output = json(&run);
+            let forks = output["forks"].as_u64().unwrap();
+            assert!(forks <= 16 && forks >= 8, "{output}");
+            assert_eq!(output["error"], "BlockingIOError", "{output}");
+        } else {
+            assert_eq!(run.terminal, GovernedExecutionTerminal::ProcessLimitExceeded, "stdout={}", run.stdout);
+        }
+    }
+
+    /// A command cannot pass for a helper refusal: whatever it prints and
+    /// whatever it exits with, it ran, so the run is dispatched. (This output
+    /// forged the 0.1.78 pre-release stderr marker, which the runner no
+    /// longer reads.)
+    #[test]
+    fn a_forged_helper_refusal_is_the_commands_own_exit() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(jail) = strict_jail_with(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let script = Script::new(
+            "import sys\n\
+             sys.stderr.write('magicrun-jail-helper: refused: no per-jail task ceiling is possible here\\n')\n\
+             sys.stderr.flush()\n\
+             sys.exit(126)\n",
+        );
+        let run = script.run(jail, &[]);
+        assert_eq!(run.terminal, GovernedExecutionTerminal::NonZeroExit);
+        assert_eq!(run.exit_code, Some(126));
+    }
+
+    /// A command that reaches the jail init's descriptors through `/proc/1`
+    /// cannot forge a refusal either: the status channel is a socket, which
+    /// `/proc/1/fd/N` cannot open (so the helper's first byte cannot be read
+    /// away), and a refusal byte after the helper's dispatching byte does
+    /// not count.
+    #[test]
+    fn a_refusal_forged_through_the_jail_init_is_dispatched() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(jail) = strict_jail_with(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let script = Script::new(
+            "import os, time\n\
+             deadline = time.monotonic() + 0.5\n\
+             while time.monotonic() < deadline:\n\
+             \x20   try:\n\
+             \x20       fds = [fd for fd in os.listdir('/proc/1/fd') if int(fd) > 2]\n\
+             \x20   except OSError:\n\
+             \x20       break\n\
+             \x20   for fd in fds:\n\
+             \x20       for flags in (os.O_RDONLY, os.O_WRONLY):\n\
+             \x20           try:\n\
+             \x20               f = os.open('/proc/1/fd/' + fd, flags | os.O_NONBLOCK)\n\
+             \x20           except OSError:\n\
+             \x20               continue\n\
+             \x20           try:\n\
+             \x20               if flags == os.O_RDONLY:\n\
+             \x20                   os.read(f, 64)\n\
+             \x20               else:\n\
+             \x20                   os.write(f, b'R' * 64)\n\
+             \x20           except OSError:\n\
+             \x20               pass\n\
+             \x20           finally:\n\
+             \x20               os.close(f)\n\
+             print('forged')\n",
+        );
+        let run = script.run(jail, &[]);
+        assert_eq!(run.terminal, GovernedExecutionTerminal::Success, "stderr={}", run.stderr);
+        assert_eq!(run.stdout.trim(), "forged");
+    }
+
+    /// The helper's exec fails after it wrote the dispatching byte: its
+    /// later refusal byte does not count, so the run is conservatively
+    /// dispatched (a non-zero exit), never `JailHelperRefused`. Refusals
+    /// before dispatch are covered by the shim's own tests.
+    #[test]
+    fn a_failed_exec_after_dispatching_is_dispatched() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut jail = match GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) {
+            Ok(jail) => jail,
+            Err(error) => {
+                skip(&format!("no Linux strict jail on this host: {error}"));
+                return;
+            },
+        };
+        jail.missing_program_for_test = true;
+        let run = try_run_in_jail(jail, "/usr/bin:/bin", "true", &[], &[], None)
+            .unwrap_or_else(|error| panic!("expected a dispatched run, got {error:?}"));
+        assert_eq!(run.terminal, GovernedExecutionTerminal::NonZeroExit);
+        assert_eq!(run.exit_code, Some(126));
+    }
+
+    /// A process that leaves the jail's process group and session is still
+    /// counted: the watchdog follows descendants, not the group.
+    #[test]
+    fn the_watchdog_counts_a_setsid_escapee() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(jail) = strict_jail_with(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let script = Script::new(
+            "import json, os, time\n\
+             if os.fork() == 0:\n\
+             \x20   os.setsid()\n\
+             \x20   for _ in range(24):\n\
+             \x20       if os.fork() == 0:\n\
+             \x20           time.sleep(20)\n\
+             \x20           os._exit(0)\n\
+             \x20   time.sleep(20)\n\
+             \x20   os._exit(0)\n\
+             time.sleep(8)\n\
+             print(json.dumps({'escaped': True}))\n",
+        );
+        let run = script.run(jail, &[]);
+        assert_eq!(
+            run.terminal,
+            GovernedExecutionTerminal::ProcessLimitExceeded,
+            "stdout={} stderr={}",
+            run.stdout,
+            run.stderr
+        );
+    }
 
     #[test]
     fn linux_script_prints_json_in_the_strict_jail() {

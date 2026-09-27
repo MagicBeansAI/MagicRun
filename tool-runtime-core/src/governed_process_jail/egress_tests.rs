@@ -142,7 +142,7 @@ pub(super) struct JailedRun {
 /// A skipped real-jail test says so on stderr. On a Linux host that sets
 /// `MAGICRUN_REQUIRE_LINUX_JAIL=1` (CI with `bwrap`, the forwarder and a
 /// trusted python3 installed) a skip is a failure instead.
-pub(super) fn skip(reason: &str) {
+pub(crate) fn skip(reason: &str) {
     if cfg!(target_os = "linux") && std::env::var_os("MAGICRUN_REQUIRE_LINUX_JAIL").is_some_and(|value| value == "1") {
         panic!("MAGICRUN_REQUIRE_LINUX_JAIL=1 but the real-jail test would skip: {reason}");
     }
@@ -294,6 +294,22 @@ mod macos {
             Err(error) if error.code == GovernedProcessJailErrorCode::LauncherUnavailable => None,
             Err(error) => panic!("unexpected brokered jail setup failure: {error}"),
         }
+    }
+
+    /// A file staged before launch is readable by the jailed child by its
+    /// plain name, relative to the private workdir.
+    #[test]
+    fn a_staged_input_file_is_readable_by_the_child() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Ok(jail) = GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let name = jail.stage_input_file("input.txt", b"staged-content").unwrap();
+        let run = run_in_jail(jail, "cat", &[&name]);
+        assert_eq!(run.exit_code, Some(0), "stderr={}", run.stderr);
+        assert_eq!(run.stdout, "staged-content");
     }
 
     /// (a) A standard CLI reaches the broker through the proxy environment
@@ -533,6 +549,31 @@ mod linux {
     use std::os::unix::net::UnixListener;
 
     use super::*;
+
+    /// A system tool (snapshotted `/usr/bin/jq`, dynamically linked) runs in
+    /// the strict jail on a file staged before launch: the base library
+    /// binds are enough and staging reaches the child's `/work`.
+    #[test]
+    fn a_system_tool_reads_a_staged_input_in_the_strict_jail() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !Path::new("/usr/bin/jq").exists() {
+            skip("no /usr/bin/jq on this host");
+            return;
+        }
+        let jail = match GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) {
+            Ok(jail) => jail,
+            Err(error) => {
+                skip(&format!("no Linux strict jail on this host: {error}"));
+                return;
+            },
+        };
+        let name = jail.stage_input_file("in-data.json", br#"{"items":[1,2,3]}"#).unwrap();
+        let run = run_in_jail(jail, "jq", &[".items | length", &name]);
+        assert_eq!(run.exit_code, Some(0), "stderr={}", run.stderr);
+        assert_eq!(run.stdout.trim(), "3");
+    }
 
     struct UnixBroker {
         _directory: tempfile::TempDir,

@@ -117,6 +117,8 @@ struct FileIdentity {
     length: u64,
 }
 
+/// Exact equality (derived) compares two recorded identities. Revalidating
+/// a directory against its recorded identity uses [`DirectoryIdentity::matches`].
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DirectoryIdentity {
     #[cfg(unix)]
@@ -125,6 +127,56 @@ struct DirectoryIdentity {
     inode: u64,
     #[cfg(unix)]
     owner: u32,
+    /// Linux only: birth time (`statx`), recorded once, when the identity is
+    /// taken, where the filesystem records it and the directory is not on
+    /// overlayfs. Linux filesystems reuse a freed inode number at once, so a
+    /// directory removed and recreated under the same name can match on
+    /// device and inode alone; its birth time still differs. Change time
+    /// cannot serve: it moves whenever an entry is created inside. Not on
+    /// macOS, where APFS birth time is writable (`touch -t` to an earlier time
+    /// moves it) and inode numbers are not reused promptly; and not on
+    /// overlayfs (or an unknown filesystem type), where a copy-up gives the
+    /// directory a new birth time. `None` means birth time does not apply to
+    /// this directory; `Some` means it must match at every revalidation.
+    #[cfg(target_os = "linux")]
+    created: Option<std::time::SystemTime>,
+}
+
+impl DirectoryIdentity {
+    /// Whether `current` (fresh metadata) still names the directory this
+    /// identity recorded. It must pass the same safety checks as when the
+    /// identity was taken. Where birth time was recorded, the current birth
+    /// time is read directly and must equal it; a birth time that can no
+    /// longer be read counts as changed (fail closed). No overlay probe is
+    /// repeated: the device already matched, so the filesystem is the one
+    /// the recorded decision was made for.
+    fn matches(&self, current: &fs::Metadata) -> Result<bool, GovernedExecutionAuthorityError> {
+        let fresh = directory_identity_fields(current)?;
+        #[cfg(unix)]
+        if (self.device, self.inode, self.owner) != (fresh.device, fresh.inode, fresh.owner) {
+            return Ok(false);
+        }
+        #[cfg(target_os = "linux")]
+        if !birth_time_matches(self.created, current.created().ok()) {
+            return Ok(false);
+        }
+        let _ = fresh;
+        Ok(true)
+    }
+}
+
+/// The recorded birth time, if any, against the current one: nothing to
+/// compare when none was recorded; otherwise the current one must be present
+/// and equal.
+#[cfg(any(target_os = "linux", test))]
+fn birth_time_matches(
+    recorded: Option<std::time::SystemTime>,
+    current: Option<std::time::SystemTime>,
+) -> bool {
+    match recorded {
+        None => true,
+        Some(recorded) => current == Some(recorded),
+    }
 }
 
 /// Trusted workspace or output-root authority. Opening a root accepts no relative path,
@@ -156,7 +208,7 @@ impl GovernedWorkingDirectoryRoot {
             fs::symlink_metadata(&canonical).map_err(|_| working_directory_unsafe())?;
         if canonical_metadata.file_type().is_symlink()
             || !canonical_metadata.is_dir()
-            || directory_identity(&canonical_metadata)? != directory_identity(&metadata)?
+            || !directory_identity(&canonical_metadata)?.matches(&metadata)?
         {
             return Err(working_directory_unsafe());
         }
@@ -176,7 +228,7 @@ impl GovernedWorkingDirectoryRoot {
         let metadata = fs::symlink_metadata(&self.path).map_err(|_| working_directory_changed())?;
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
-            || directory_identity(&metadata)? != self.identity
+            || !self.identity.matches(&metadata)?
             || fs::canonicalize(&self.path).map_err(|_| working_directory_changed())? != self.path
         {
             return Err(working_directory_changed());
@@ -240,7 +292,7 @@ impl ResolvedWorkingDirectory {
             let metadata = fs::symlink_metadata(path).map_err(|_| working_directory_changed())?;
             if metadata.file_type().is_symlink()
                 || !metadata.is_dir()
-                || directory_identity(&metadata)? != *expected
+                || !expected.matches(&metadata)?
             {
                 return Err(working_directory_changed());
             }
@@ -274,7 +326,7 @@ impl ResolvedWorkingDirectory {
             .last()
             .map(|entry| entry.1)
             .ok_or_else(working_directory_changed)?;
-        if directory_identity(&metadata)? != expected {
+        if !expected.matches(&metadata)? {
             return Err(working_directory_changed());
         }
         Ok(GovernedWorkingDirectoryHandle {
@@ -771,13 +823,13 @@ impl GovernedWorkingDirectoryHandle {
             .file
             .metadata()
             .map_err(|_| working_directory_changed())?;
-        if directory_identity(&opened)? != self.identity {
+        if !self.identity.matches(&opened)? {
             return Err(working_directory_changed());
         }
         let current = fs::symlink_metadata(&self.path).map_err(|_| working_directory_changed())?;
         if current.file_type().is_symlink()
             || !current.is_dir()
-            || directory_identity(&current)? != self.identity
+            || !self.identity.matches(&current)?
             || fs::canonicalize(&self.path).map_err(|_| working_directory_changed())? != self.path
         {
             return Err(working_directory_changed());
@@ -1033,8 +1085,27 @@ fn executable_identity(
     Err(unsupported_platform())
 }
 
+/// Take a directory's identity, deciding once whether birth time applies.
 #[cfg(unix)]
 fn directory_identity(
+    metadata: &fs::Metadata,
+) -> Result<DirectoryIdentity, GovernedExecutionAuthorityError> {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut identity = directory_identity_fields(metadata)?;
+    #[cfg(target_os = "linux")]
+    {
+        identity.created = if on_overlayfs(metadata.dev()) {
+            None
+        } else {
+            metadata.created().ok()
+        };
+    }
+    Ok(identity)
+}
+
+/// The safety checks and the device, inode and owner, without birth time.
+#[cfg(unix)]
+fn directory_identity_fields(
     metadata: &fs::Metadata,
 ) -> Result<DirectoryIdentity, GovernedExecutionAuthorityError> {
     if !metadata.is_dir()
@@ -1047,11 +1118,46 @@ fn directory_identity(
         device: metadata.dev(),
         inode: metadata.ino(),
         owner: metadata.uid(),
+        #[cfg(target_os = "linux")]
+        created: None,
+    })
+}
+
+/// Linux: whether `device` is an overlayfs mount (`/proc/self/mountinfo`
+/// field 3 is the mount's `major:minor`, and a directory on overlayfs reports
+/// the overlay's device). Unknown counts as overlay: birth time is then only
+/// left out, never a false "changed".
+#[cfg(target_os = "linux")]
+fn on_overlayfs(device: u64) -> bool {
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return true;
+    };
+    mountinfo_has_overlay_device(&mountinfo, libc::major(device), libc::minor(device))
+}
+
+/// The mount lines whose filesystem type (first field after ` - `) is
+/// `overlay` or `fuse.fuse-overlayfs`, matched on `major:minor`.
+#[cfg(any(target_os = "linux", test))]
+fn mountinfo_has_overlay_device(mountinfo: &str, major: u32, minor: u32) -> bool {
+    let device = format!("{major}:{minor}");
+    mountinfo.lines().any(|line| {
+        let mut halves = line.splitn(2, " - ");
+        let head = halves.next().unwrap_or_default();
+        let fstype = halves.next().and_then(|tail| tail.split_whitespace().next());
+        matches!(fstype, Some("overlay" | "fuse.fuse-overlayfs"))
+            && head.split_whitespace().nth(2) == Some(device.as_str())
     })
 }
 
 #[cfg(not(unix))]
 fn directory_identity(
+    _metadata: &fs::Metadata,
+) -> Result<DirectoryIdentity, GovernedExecutionAuthorityError> {
+    Err(unsupported_platform())
+}
+
+#[cfg(not(unix))]
+fn directory_identity_fields(
     _metadata: &fs::Metadata,
 ) -> Result<DirectoryIdentity, GovernedExecutionAuthorityError> {
     Err(unsupported_platform())
@@ -1224,6 +1330,66 @@ const fn unsupported_platform() -> GovernedExecutionAuthorityError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overlay_mounts_are_found_by_device() {
+        let mountinfo = "\
+22 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
+301 22 0:52 / /var/lib/docker/overlay2/x/merged rw,relatime - overlay overlay rw,lowerdir=/a:/b
+302 22 0:53 / /tmp rw - tmpfs tmpfs rw
+";
+        assert!(super::mountinfo_has_overlay_device(mountinfo, 0, 52));
+        assert!(!super::mountinfo_has_overlay_device(mountinfo, 0, 53));
+        assert!(!super::mountinfo_has_overlay_device(mountinfo, 259, 2));
+        assert!(!super::mountinfo_has_overlay_device("", 0, 52));
+        let rootless = "40 22 0:61 / /home/u/.local/share/containers/storage/overlay/x/merged rw - fuse.fuse-overlayfs fuse-overlayfs rw\n";
+        assert!(super::mountinfo_has_overlay_device(rootless, 0, 61));
+    }
+
+    /// macOS moves a directory's APFS birth time when its modification time
+    /// is set earlier (`touch -t <past>`). That is not a replaced directory.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_modification_time_is_not_a_changed_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let before = super::directory_identity(&std::fs::metadata(directory.path()).unwrap()).unwrap();
+        let past = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800);
+        std::fs::File::open(directory.path()).unwrap().set_modified(past).unwrap();
+        let after = std::fs::metadata(directory.path()).unwrap();
+        assert!(before.matches(&after).unwrap());
+    }
+
+    /// A recorded birth time must be present and equal at revalidation: a
+    /// current sample without one is a changed directory (fail closed), and
+    /// an identity recorded without one (overlayfs, unknown filesystem)
+    /// compares device, inode and owner only.
+    #[test]
+    fn a_recorded_birth_time_must_still_match() {
+        let then = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let later = then + std::time::Duration::from_secs(1);
+        assert!(super::birth_time_matches(Some(then), Some(then)));
+        assert!(!super::birth_time_matches(Some(then), Some(later)));
+        assert!(!super::birth_time_matches(Some(then), None));
+        assert!(super::birth_time_matches(None, None));
+        assert!(super::birth_time_matches(None, Some(later)));
+    }
+
+    /// Linux: a directory whose recorded birth time differs from its current
+    /// one (as after remove and recreate with a reused inode) no longer
+    /// matches, and one recorded without a birth time (as on overlayfs)
+    /// still does.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_directory_with_another_birth_time_is_changed() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata = std::fs::metadata(directory.path()).unwrap();
+        let mut identity = super::directory_identity(&metadata).unwrap();
+        assert!(identity.matches(&metadata).unwrap());
+        identity.created = Some(std::time::SystemTime::UNIX_EPOCH);
+        assert!(!identity.matches(&metadata).unwrap());
+        identity.created = None;
+        assert!(identity.matches(&metadata).unwrap());
+    }
+
     use std::{collections::BTreeSet, fmt, fs};
 
     #[cfg(unix)]

@@ -8,7 +8,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.77`._
+_Current development version: `0.1.78`._
+
+### Staged input files (`0.1.78`)
+
+- Add `GovernedProcessJail::stage_input_file(name, bytes)`: one fresh,
+  owner-read-only file in the private workdir before launch, addressed by a
+  plain single-component name, bounded by the jail's file ceilings; the host
+  path is never returned. New error code `InvalidInputFile` (an existing name
+  or a planted link); other I/O failures are `PrivateWorkdirUnavailable`.
+  Staging is serialized per jail so concurrent calls respect the quota.
+
+### Linux fixes found by the first real Linux run (`0.1.78`)
+
+- **Linux task ceiling moved into the jail.** `RLIMIT_NPROC` is no longer
+  set on bubblewrap (first set to the ceiling, which failed for any busy
+  user; then to the UID's task count plus the ceiling, which still failed
+  with setuid bubblewrap and was a shared, host-wide budget). Linux charges
+  it per (user namespace, UID) and checks ancestor namespace owners against
+  a limit snapshotted at namespace creation. Every Linux jail now binds the
+  trusted `magicrun-jail-egress-forwarder` at `/run/magicrun/jail-helper` and
+  runs it first as an exec shim (`--magicrun-jail-exec-v1`), which sets
+  `RLIMIT_NPROC = max_tasks + GOVERNED_JAIL_HELPER_TASKS` inside the jail's
+  own user namespace and execs; in the brokered mode it then execs the
+  forwarder role. It refuses (exit 126) to apply a ceiling outside a new user
+  namespace. Setuid bubblewrap without user namespaces gets no ceiling and
+  reports `guarantees().process_ceiling == false` (watchdog only).
+  - **Install:** the helper is now required for every Linux jail mode, not
+    only brokered egress. Without it a Linux jail fails to build with the new
+    `JailHelperUnavailable`.
+  - New `GovernedProcessJailLimits::max_tasks` (threads; default 256, max
+    1024, at least `max_processes`), `DEFAULT_GOVERNED_JAIL_TASKS`,
+    `MAX_GOVERNED_JAIL_TASKS`, `GOVERNED_JAIL_HELPER_TASKS`, and
+    `GovernedProcessJailAudit::linux_helper_digest`. The audit JSON gains
+    `max_tasks` (all platforms) and, on Linux, `linux_helper_digest`; the
+    Linux strict argv golden and the Linux profile identities rotate (helper
+    bind, exec shim and its status descriptor), `0.1.77` → `0.1.78`:
+    - strict `blake3:1fc54240…cc61a0` → `blake3:f93c909a…ee214f`
+    - brokered `blake3:3c4fcba8…e142cc` → `blake3:ec0957f2…dae380`
+    - interpreter, denied, Python 3.9 `blake3:58e25e84…dcd57ae` →
+      `blake3:5937555c…2047d54`
+    - interpreter, brokered, Python 3.14 `blake3:d2b11523…1047852` →
+      `blake3:1201c006…5ed29d`
+
+    macOS identities are unchanged.
+- **Exact ceiling only where the kernel enforces it.** The in-jail ceiling
+  also needs a kernel at least `MIN_GOVERNED_JAIL_TASK_CEILING_KERNEL` (5.17;
+  older kernels count the UID's tasks host-wide inside a user namespace, and
+  5.14-5.16 carry ucounts bugs) and a non-root real UID (never held to
+  `RLIMIT_NPROC`); otherwise the shim only execs and `process_ceiling` is
+  `false`. The shim also refuses a ceiling when it runs as UID 0, and claims
+  none unless the inherited hard `RLIMIT_NPROC` admits it.
+- **Out-of-band refusal.** The runner passes the shim, as its third
+  argument, one end of an exec-status Unix socket pair, and only the first
+  byte there counts. The shim writes `JAIL_EXEC_REFUSED` first if the
+  command never ran (a refused ceiling, a failed `setrlimit`); otherwise it
+  marks its end close-on-exec, so the command never holds it, and writes
+  `JAIL_EXEC_DISPATCHING` just before exec. Only a first refusal byte maps to
+  the new `GovernedBatchProcessErrorCode::JailHelperRefused` (not
+  dispatched); the dispatching byte first, later bytes or no byte mean
+  dispatched, and the command's exit status and output are never consulted.
+  bubblewrap's in-jail init briefly still holds the descriptor and is
+  reachable by a same-UID jailed command, but nothing in the jail runs before
+  the shim's first byte, and a socket (unlike a pipe) cannot be reopened
+  through `/proc/1/fd` to read that byte away. A failed exec writes the
+  refusal byte second and so counts, conservatively, as dispatched (exit
+  126). New `jail_exec_report_refused` and `JAIL_EXEC_DISPATCHING` in
+  `governed_process_jail::egress_forwarder`. (A pre-release stderr-marker
+  scheme could be forged by a command after real side effects, turning them
+  into "not dispatched".) The ceiling's machinery allowance is per mode (bubblewrap's
+  init, plus the forwarder when brokered); the watchdog allows the same plus
+  the launcher on Linux, and nothing on macOS. A helper whose device, inode,
+  size or times changed since the jail was built is refused at launch.
+- **Compatibility.** `0.1.78` adds public fields
+  (`GovernedProcessJailLimits::max_tasks`,
+  `GovernedProcessJailAudit::linux_helper_digest`) and enum variants
+  (`GovernedProcessJailErrorCode::JailHelperUnavailable`,
+  `GovernedBatchProcessErrorCode::JailHelperRefused`). Struct literals and
+  exhaustive matches in consumers need updating, which a `0.1.x` patch bump
+  does not signal under strict semver; this crate is pre-1.0 and consumers
+  pin exact revisions.
+- **Watchdog CPU (Linux)** also counts reaped children (`cutime`,
+  `cstime`) of jail members; a malformed `/proc` sample fails the observation
+  only for a jail member. Whether directory birth time applies is decided
+  once, when the identity is taken (not on overlayfs, `fuse-overlayfs`, or
+  when mountinfo is unreadable); where it was recorded, revalidation reads
+  the current birth time directly and a missing or different one is a
+  changed directory (fail closed, as before this release).
+- **Known limit.** The helper is re-checked by path metadata before launch,
+  not bound by descriptor (`bwrap --ro-bind-fd`).
+- **Watchdog escape (Linux).** The watchdog found jail members by process
+  group, so a jailed command that called `setsid()` escaped process, CPU and
+  memory sampling. It now follows the launcher's descendants by parent link
+  (nothing leaves the pid namespace) and sums threads as well as processes;
+  both counts allow the launcher, the in-jail init and the forwarder on top
+  of `max_processes`/`max_tasks`. macOS also counts threads.
+- **Egress forwarder: sends lost at child exit on Linux.** A connection the
+  child completed just before exiting could still be in the listen queue, and
+  the post-exit drain never accepted it, so a fire-and-forget upload
+  delivered nothing. The drain accepts the queue once, at exit; never again,
+  so a surviving descendant cannot open new brokered connections.
+- **A recreated working directory could pass revalidation on Linux.** Linux
+  filesystems reuse a freed inode number immediately, so a directory removed
+  and recreated under the same name matched on device and inode alone.
+  Directory identity now includes birth time on Linux (`statx`), except on
+  overlayfs, where copy-up changes it. Not on macOS: APFS birth time moves
+  with `touch -t <past>`, which gave false "changed" errors.
+- **CI.** The manual workflow gains a `linux-jail` job (Ubuntu 24.04) with
+  the helper installed and `MAGICRUN_REQUIRE_LINUX_JAIL=1`, over three legs:
+  unprivileged user namespaces, setuid bubblewrap, and setuid bubblewrap with
+  `user.max_user_namespaces=0`. Checkouts do not persist credentials.
 
 ### Interpreter mode for the governed process jail (`0.1.77`)
 

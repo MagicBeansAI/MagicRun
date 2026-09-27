@@ -46,7 +46,7 @@ use crate::{
     },
     governed_process_jail::{
         GovernedProcessJail, GovernedProcessJailErrorCode, GovernedProcessJailLimits,
-        GovernedProcessJailWatch, MAX_GOVERNED_JAIL_PROCESSES,
+        GovernedProcessJailWatch,
     },
     manifest::CliInteraction,
 };
@@ -149,6 +149,10 @@ pub enum GovernedBatchProcessErrorCode {
     /// The jail's pinned interpreter is no longer trusted or changed its
     /// bytes; nothing was dispatched.
     InterpreterUnavailable,
+    /// Linux: the in-jail helper reported, as the first byte on its
+    /// exec-status channel, that the command never ran (it refused the task
+    /// ceiling, or failed before dispatching it).
+    JailHelperRefused,
     StreamUnavailable,
     StreamWriteFailed,
     StreamReadFailed,
@@ -443,7 +447,36 @@ impl GovernedBatchExecutor {
                 Zeroizing::new(Vec::new()),
             ));
         }
-        let mut raw = execute_spawned(process, executable, cwd, cancellation, started, deadline)?;
+        // Linux: the in-jail helper's out-of-band report. Only its first
+        // byte counts, and only the helper, before the command exists, can
+        // write that one.
+        #[cfg(target_os = "linux")]
+        let mut exec_status = match process.jail.as_ref() {
+            Some(jail) if jail.uses_exec_status() => {
+                Some(JailExecStatus::new().ok_or_else(jail_unavailable)?)
+            },
+            _ => None,
+        };
+        let raw = execute_spawned(
+            process,
+            executable,
+            cwd,
+            cancellation,
+            started,
+            deadline,
+            #[cfg(target_os = "linux")]
+            exec_status.as_mut(),
+        )?;
+        // The helper refused before dispatching: the command never ran. (A
+        // failed exec after the dispatching byte counts as dispatched.)
+        // Its exit status and output are not consulted, so nothing the
+        // command prints or returns can produce this outcome.
+        #[cfg(target_os = "linux")]
+        if exec_status.as_ref().is_some_and(JailExecStatus::refused) {
+            drop(permit);
+            return Err(jail_helper_refused());
+        }
+        let mut raw = raw;
         if raw.terminal.dispatch() == GovernedExecutionDispatch::NotDispatched {
             drop(permit);
         } else {
@@ -460,8 +493,13 @@ fn execute_spawned(
     cancellation: &GovernedBatchCancellation,
     started: Instant,
     deadline: Instant,
+    #[cfg(target_os = "linux")] mut exec_status: Option<&mut JailExecStatus>,
 ) -> Result<GovernedRawBatchExecution, GovernedBatchProcessError> {
     let jail_watch = process.jail.as_ref().map(GovernedProcessJail::watch);
+    #[cfg(target_os = "linux")]
+    let status_fd = exec_status.as_ref().and_then(|status| status.write_fd());
+    #[cfg(not(target_os = "linux"))]
+    let status_fd: Option<i32> = None;
     if let Some(jail) = process.jail.as_ref() {
         let owned_workdir = cwd.as_ref().ok_or_else(jail_unavailable)?;
         if !jail
@@ -502,7 +540,7 @@ fn execute_spawned(
     #[cfg(not(target_os = "macos"))]
     let standard_launch = true;
     let mut command = match process.jail.as_ref() {
-        Some(jail) => jail.command(&executable).map_err(|error| match error.code {
+        Some(jail) => jail.command(&executable, status_fd).map_err(|error| match error.code {
             GovernedProcessJailErrorCode::InterpreterUnavailable => interpreter_unavailable(),
             _ => jail_unavailable(),
         })?,
@@ -579,6 +617,14 @@ fn execute_spawned(
                 if let Some(limits) = jail_limits {
                     apply_jail_rlimits(limits)?;
                 }
+                // Only this child (bubblewrap) inherits the status channel's
+                // helper end; everywhere else it stays close-on-exec.
+                #[cfg(target_os = "linux")]
+                if let Some(fd) = status_fd {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 if let Some(directory_fd) = directory_fd {
                     if libc::fchdir(directory_fd) == 0 {
                         #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
@@ -627,6 +673,12 @@ fn execute_spawned(
     #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
     crate::process_test_diagnostics::launch::record(launch_probe.as_deref());
     let child = child.map_err(|_| spawn_failed())?;
+    // The runner keeps only the read end: once bubblewrap has its copy, the
+    // parent's write end is closed.
+    #[cfg(target_os = "linux")]
+    if let Some(status) = exec_status.as_mut() {
+        status.close_write();
+    }
     let mut tree = ProcessTreeGuard::new(child);
     let stdout = tree
         .child_mut()?
@@ -1594,12 +1646,14 @@ fn apply_jail_rlimits(limits: GovernedProcessJailLimits) -> std::io::Result<()> 
     apply!(libc::RLIMIT_CPU, limits.cpu_seconds);
     apply!(libc::RLIMIT_NOFILE, limits.max_open_files);
     apply!(libc::RLIMIT_FSIZE, limits.max_file_bytes);
-    // Linux enforces this against the real UID. Existing same-UID processes
-    // can only make the bound stricter (new forks fail sooner), never allow the
-    // jailed group to exceed it. macOS denies process-fork in SBPL instead;
-    // its RLIMIT_NPROC is also user-wide and adds no useful precision there.
-    #[cfg(target_os = "linux")]
-    apply!(libc::RLIMIT_NPROC, limits.max_processes);
+    // RLIMIT_NPROC is deliberately NOT applied to the launcher. Linux charges
+    // it per (user namespace, UID) and also checks every ancestor namespace's
+    // owner against a limit snapshotted when that namespace is created, so a
+    // small limit here bounds the UID's tasks host-wide, starves concurrent
+    // jails and, with setuid bubblewrap (namespace owned by root), fails the
+    // namespace helper's own fork. The trusted in-jail helper sets it instead,
+    // once the jail's user namespace exists, where it counts only the jail's
+    // tasks. macOS denies process-fork in SBPL.
     Ok(())
 }
 
@@ -1612,7 +1666,13 @@ fn observe_jail_limits(
     }
     let usage = owned_group_usage(pid).ok_or(())?;
     let limits = watch.limits();
-    if usage.processes > limits.max_processes {
+    // Both counts allow the jail's own machinery: on Linux the launcher,
+    // bubblewrap's in-jail init and the brokered forwarder, each one
+    // single-threaded process; on macOS nothing (`sandbox-exec` execs).
+    let overhead = watch.overhead();
+    if usage.processes > limits.max_processes.saturating_add(overhead)
+        || usage.tasks > limits.max_tasks.saturating_add(overhead)
+    {
         return Ok(Some(GovernedExecutionTerminal::ProcessLimitExceeded));
     }
     if usage.cpu_micros > limits.cpu_seconds.saturating_mul(1_000_000) {
@@ -1626,16 +1686,126 @@ fn observe_jail_limits(
 
 struct OwnedGroupUsage {
     processes: u64,
+    /// Threads of every member process.
+    tasks: u64,
     cpu_micros: u64,
     memory_bytes: u64,
 }
+
+/// Linux: the runner's side of the in-jail helper's exec-status channel, a
+/// Unix socket pair rather than a pipe: `/proc/<pid>/fd/N` cannot open a
+/// socket, whereas a pipe reopened there read-only would let a jailed
+/// command consume the helper's first byte. Both ends are created
+/// close-on-exec and non-blocking; only the forked launcher clears
+/// close-on-exec on its copy of the helper's end. The helper writes
+/// `JAIL_EXEC_REFUSED` first only if the command never ran, and
+/// `JAIL_EXEC_DISPATCHING` first, after marking its end close-on-exec, just
+/// before exec. Only the first byte counts.
+#[cfg(target_os = "linux")]
+struct JailExecStatus {
+    read: std::os::fd::OwnedFd,
+    write: Option<std::os::fd::OwnedFd>,
+}
+
+/// Bytes of the exec-status report the runner reads after the launcher
+/// exits; only the first decides.
+#[cfg(target_os = "linux")]
+const JAIL_EXEC_REPORT_BYTES: usize = 64;
+
+#[cfg(target_os = "linux")]
+impl JailExecStatus {
+    fn new() -> Option<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        let mut fds = [0; 2];
+        // SAFETY: `socketpair` writes two descriptors into the live array.
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                fds.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return None;
+        }
+        // SAFETY: both descriptors are fresh and owned by nothing else.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // The runner only reads; nothing it holds sends to the helper's end.
+        // SAFETY: `shutdown` on a socket this struct owns.
+        if unsafe { libc::shutdown(read.as_raw_fd(), libc::SHUT_WR) } != 0 {
+            return None;
+        }
+        // Never 0-2, which the child's stdio setup overwrites.
+        let write = if write.as_raw_fd() < 3 {
+            // SAFETY: duplicates a live descriptor, close-on-exec, at >= 3.
+            let duplicate = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if duplicate < 0 {
+                return None;
+            }
+            // SAFETY: `duplicate` is fresh and owned by nothing else.
+            unsafe { OwnedFd::from_raw_fd(duplicate) }
+        } else {
+            write
+        };
+        Some(Self {
+            read,
+            write: Some(write),
+        })
+    }
+
+    fn write_fd(&self) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+
+        self.write.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
+    fn close_write(&mut self) {
+        self.write = None;
+    }
+
+    /// Read after the launcher has exited, without blocking: whatever is
+    /// available, decided by its first byte alone. A refusal only if that
+    /// byte is `JAIL_EXEC_REFUSED`; the dispatching byte first, or nothing,
+    /// means the command was dispatched.
+    fn refused(&self) -> bool {
+        use std::os::fd::AsRawFd;
+
+        let mut report = [0_u8; JAIL_EXEC_REPORT_BYTES];
+        let mut filled = 0;
+        while filled < report.len() {
+            // SAFETY: reads into the live remainder of the buffer from the
+            // non-blocking read end this struct owns.
+            let read = unsafe {
+                libc::read(
+                    self.read.as_raw_fd(),
+                    report[filled..].as_mut_ptr().cast(),
+                    report.len() - filled,
+                )
+            };
+            match usize::try_from(read) {
+                Ok(0) => break,
+                Ok(count) => filled += count,
+                Err(_) if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {},
+                Err(_) => break,
+            }
+        }
+        crate::governed_process_jail::egress_forwarder::jail_exec_report_refused(&report[..filled])
+    }
+}
+
+/// Bound on `/proc` entries one Linux sample visits.
+#[cfg(target_os = "linux")]
+const MAX_PROC_ENTRIES: usize = 1 << 20;
 
 #[cfg(target_os = "macos")]
 fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
     const PROC_PGRP_ONLY: u32 = 2;
     const PID_BYTES: usize = std::mem::size_of::<libc::pid_t>();
     const GROWTH_HEADROOM: usize = 8;
-    const MAX_OBSERVED_GROUP_MEMBERS: usize = MAX_GOVERNED_JAIL_PROCESSES as usize + 1;
+    const MAX_OBSERVED_GROUP_MEMBERS: usize =
+        crate::governed_process_jail::MAX_GOVERNED_JAIL_PROCESSES as usize + 1;
 
     let leader = pid.and_then(|value| i32::try_from(value).ok())?;
     let group = u32::try_from(leader).ok()?;
@@ -1662,11 +1832,13 @@ fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
     if live >= members.len() {
         return Some(OwnedGroupUsage {
             processes: live as u64,
+            tasks: live as u64,
             cpu_micros: 0,
             memory_bytes: 0,
         });
     }
     let mut processes = 0_u64;
+    let mut tasks = 0_u64;
     let mut cpu_nanos = 0_u64;
     let mut memory_bytes = 0_u64;
     for member in members[..live].iter().copied().filter(|value| *value > 0) {
@@ -1689,18 +1861,43 @@ fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
             .saturating_add(info.ri_user_time)
             .saturating_add(info.ri_system_time);
         memory_bytes = memory_bytes.saturating_add(info.ri_phys_footprint);
+        let mut task = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+        let task_bytes = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+        // SAFETY: PROC_PIDTASKINFO writes at most `task_bytes` into `task`.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                member,
+                libc::PROC_PIDTASKINFO,
+                0,
+                task.as_mut_ptr().cast::<libc::c_void>(),
+                task_bytes,
+            )
+        };
+        let threads = if written == task_bytes {
+            // SAFETY: the kernel filled the whole structure.
+            u64::try_from(unsafe { task.assume_init() }.pti_threadnum).unwrap_or(1)
+        } else {
+            1
+        };
+        tasks = tasks.saturating_add(threads.max(1));
     }
     (processes > 0).then_some(OwnedGroupUsage {
         processes,
+        tasks,
         cpu_micros: cpu_nanos / 1_000,
         memory_bytes,
     })
 }
 
+/// Linux: the launcher and every descendant, found by parent links. Every
+/// task of the jail descends from the launcher: bubblewrap's pid-namespace
+/// init is its child, and a jailed process can leave its process group or
+/// session (`setsid`, `setpgid`) but never the pid namespace, whose orphans
+/// are reparented to that init. Sums processes, threads, CPU and resident
+/// memory.
 #[cfg(target_os = "linux")]
 fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
-    const MAX_PROC_ENTRIES: usize = 65_536;
-    let group = i64::from(pid?);
+    let root = pid?;
     // SAFETY: sysconf is read-only and `_SC_CLK_TCK` has no pointer argument.
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     // SAFETY: sysconf is read-only and `_SC_PAGESIZE` has no pointer argument.
@@ -1708,48 +1905,72 @@ fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
     if ticks_per_second <= 0 || page_size <= 0 {
         return None;
     }
-    let mut processes = 0_u64;
-    let mut cpu_ticks = 0_u64;
-    let mut resident_pages = 0_u64;
-    let mut visited = 0_usize;
-    for entry in std::fs::read_dir("/proc").ok()? {
-        let entry = entry.ok()?;
-        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
-            continue;
-        }
-        visited = visited.checked_add(1)?;
-        if visited > MAX_PROC_ENTRIES {
+    let mut samples = std::collections::HashMap::<u32, (u32, Option<(u64, u64)>)>::new();
+    let mut children = std::collections::HashMap::<u32, Vec<u32>>::new();
+    for (visited, entry) in std::fs::read_dir("/proc").ok()?.enumerate() {
+        if visited >= MAX_PROC_ENTRIES {
             return None;
         }
-        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(_) => continue,
+        let entry = entry.ok()?;
+        let Ok(member) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
         };
-        let tail = match stat.rsplit_once(')') {
-            Some((_, tail)) => tail.trim(),
-            None => continue,
+        // A process can exit between listing and reading; that is not an error.
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, tail)) = stat.rsplit_once(')') else {
+            continue;
         };
         let fields = tail.split_whitespace().collect::<Vec<_>>();
-        if fields.len() <= 12 || fields[2].parse::<i64>().ok() != Some(group) {
+        let Some(parent) = fields.get(1).and_then(|field| field.parse::<u32>().ok()) else {
             continue;
+        };
+        // Own CPU plus that of reaped children (`cutime`, `cstime`), so a
+        // burst of short-lived processes still counts. A malformed sample is
+        // an error only if the process turns out to be a jail member.
+        let sample = (|| {
+            let mut cpu = 0_u64;
+            for field in [11, 12, 13, 14] {
+                cpu = cpu.saturating_add(fields.get(field)?.parse::<u64>().ok()?);
+            }
+            Some((cpu, fields.get(17)?.parse::<u64>().ok()?.max(1)))
+        })();
+        samples.insert(member, (parent, sample));
+        children.entry(parent).or_default().push(member);
+    }
+    let mut processes = 0_u64;
+    let mut tasks = 0_u64;
+    let mut cpu_ticks = 0_u64;
+    let mut resident_pages = 0_u64;
+    let mut pending = vec![root];
+    let mut seen = std::collections::HashSet::from([root]);
+    while let Some(member) = pending.pop() {
+        if let Some(&(_, sample)) = samples.get(&member) {
+            let (cpu, threads) = sample?;
+            processes = processes.saturating_add(1);
+            tasks = tasks.saturating_add(threads);
+            cpu_ticks = cpu_ticks.saturating_add(cpu);
+            // A process that exits after its stat sample holds no resident
+            // pages; otherwise a malformed statm loses the observation.
+            match std::fs::read_to_string(format!("/proc/{member}/statm")) {
+                Ok(statm) => {
+                    let resident = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+                    resident_pages = resident_pages.saturating_add(resident);
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(_) => return None,
+            }
         }
-        let user = fields[11].parse::<u64>().ok()?;
-        let system = fields[12].parse::<u64>().ok()?;
-        processes = processes.saturating_add(1);
-        cpu_ticks = cpu_ticks.saturating_add(user).saturating_add(system);
-        // A process that exits after its stat sample holds no resident pages;
-        // otherwise a malformed statm loses the required observation.
-        match std::fs::read_to_string(entry.path().join("statm")) {
-            Ok(statm) => {
-                let resident = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
-                resident_pages = resident_pages.saturating_add(resident);
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(_) => return None,
+        for child in children.get(&member).into_iter().flatten() {
+            if seen.insert(*child) {
+                pending.push(*child);
+            }
         }
     }
     (processes > 0).then_some(OwnedGroupUsage {
         processes,
+        tasks,
         cpu_micros: cpu_ticks.saturating_mul(1_000_000) / ticks_per_second as u64,
         memory_bytes: resident_pages.saturating_mul(page_size as u64),
     })
@@ -1881,6 +2102,16 @@ const fn jail_unavailable() -> GovernedBatchProcessError {
     )
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const fn jail_helper_refused() -> GovernedBatchProcessError {
+    GovernedBatchProcessError::new(
+        GovernedBatchProcessErrorCode::JailHelperRefused,
+        "jail.helper",
+        "the in-jail helper refused or failed before exec; the command never ran",
+        GovernedExecutionDispatch::NotDispatched,
+    )
+}
+
 const fn interpreter_unavailable() -> GovernedBatchProcessError {
     GovernedBatchProcessError::new(
         GovernedBatchProcessErrorCode::InterpreterUnavailable,
@@ -1911,6 +2142,42 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// Linux: the runner reads the whole available report and decides on its
+    /// first byte, so a refusal byte after the dispatching byte is ignored.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_runner_decides_on_the_first_exec_status_byte() {
+        use crate::governed_process_jail::egress_forwarder::{
+            JAIL_EXEC_DISPATCHING, JAIL_EXEC_REFUSED,
+        };
+
+        let report = |bytes: &[u8]| {
+            let mut status = JailExecStatus::new().unwrap();
+            let fd = status.write_fd().unwrap();
+            assert!(fd >= 3);
+            for byte in bytes {
+                // SAFETY: writes one byte from a live buffer to the write end
+                // `status` still owns.
+                assert_eq!(unsafe { libc::write(fd, (byte as *const u8).cast(), 1) }, 1);
+            }
+            status.close_write();
+            status.refused()
+        };
+        assert!(report(&[JAIL_EXEC_REFUSED]));
+        assert!(report(&[JAIL_EXEC_REFUSED, JAIL_EXEC_DISPATCHING]));
+        assert!(!report(&[]));
+        assert!(!report(&[JAIL_EXEC_DISPATCHING]));
+        assert!(!report(&[JAIL_EXEC_DISPATCHING, JAIL_EXEC_REFUSED]));
+        let mut forged = vec![JAIL_EXEC_DISPATCHING];
+        forged.extend([JAIL_EXEC_REFUSED; 200]);
+        assert!(!report(&forged));
+        // The write end stays open (a descriptor pid 1 still holds): still
+        // no blocking read.
+        let status = JailExecStatus::new().unwrap();
+        assert!(!status.refused());
+    }
+
     use crate::{
         credential_injection::{ChildEnvironmentBaseline, ChildEnvironmentVariable},
         credential_materialization::ChildEnvironmentValues,
@@ -2200,9 +2467,13 @@ mod tests {
                 if matches!(
                     error.code,
                     crate::governed_process_jail::GovernedProcessJailErrorCode::LauncherUnavailable
+                        | crate::governed_process_jail::GovernedProcessJailErrorCode::JailHelperUnavailable
                         | crate::governed_process_jail::GovernedProcessJailErrorCode::UnsupportedPlatform
                 ) =>
             {
+                crate::governed_process_jail::egress_tests::skip(&format!(
+                    "no strict jail on this host: {error}"
+                ));
                 return;
             },
             Err(error) => panic!("unexpected strict jail setup failure: {error}"),

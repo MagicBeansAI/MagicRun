@@ -41,6 +41,19 @@ pub const MAX_GOVERNED_JAIL_WALL_SECONDS: u64 = 300;
 pub const MAX_GOVERNED_JAIL_CPU_SECONDS: u64 = 300;
 pub const MAX_GOVERNED_JAIL_MEMORY_BYTES: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_GOVERNED_JAIL_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+/// Default task (thread) ceiling. Tasks, not processes: Node, Go and threaded
+/// Python start many threads in one process.
+pub const DEFAULT_GOVERNED_JAIL_TASKS: u64 = 256;
+pub const MAX_GOVERNED_JAIL_TASKS: u64 = 1024;
+/// Most tasks of the jail's own machinery inside its Linux user namespace, on
+/// top of `max_tasks`: bubblewrap's in-jail init and, when brokered, the
+/// forwarder (strict and interpreter mode: the init only).
+pub const GOVERNED_JAIL_HELPER_TASKS: u64 = 2;
+/// Oldest kernel (`major.minor`) whose per-user-namespace `RLIMIT_NPROC`
+/// accounting (the 5.14 ucounts rework, with its fixes through 5.17) makes the
+/// in-jail task ceiling a per-jail bound. Older kernels count the UID's tasks
+/// host-wide even inside a user namespace.
+pub const MIN_GOVERNED_JAIL_TASK_CEILING_KERNEL: (u32, u32) = (5, 17);
 
 /// Schema of the opt-in brokered-egress mode. The strict profile keeps
 /// [`GOVERNED_PROCESS_JAIL_V1`]; a jail built with
@@ -72,7 +85,10 @@ pub const GOVERNED_JAIL_EGRESS_NO_PROXY_VARIABLES: [&str; 2] = ["NO_PROXY", "no_
 /// its argument layout.
 pub const GOVERNED_JAIL_EGRESS_FORWARDER_PROTOCOL_V1: &str = "--magicrun-jail-egress-forwarder-v1";
 const MAX_GOVERNED_JAIL_FORWARDER_BYTES: u64 = 64 * 1024 * 1024;
-const LINUX_JAIL_EGRESS_FORWARDER: &str = "/run/magicrun/egress-forwarder";
+/// In-jail path of the trusted helper (`magicrun-jail-egress-forwarder`),
+/// bound read-only in every Linux mode: the exec shim that applies the task
+/// ceiling, and the egress forwarder in the brokered mode.
+const LINUX_JAIL_HELPER: &str = "/run/magicrun/jail-helper";
 const LINUX_JAIL_EGRESS_SOCKET: &str = "/run/magicrun/egress.sock";
 const LINUX_JAIL_TRUST_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 const LINUX_HOST_TRUST_BUNDLES: [&str; 3] = [
@@ -114,7 +130,7 @@ const MAX_GOVERNED_JAIL_INTERPRETER_TREE_ENTRIES: usize = 200_000;
 
 pub mod egress_forwarder;
 #[cfg(test)]
-mod egress_tests;
+pub(crate) mod egress_tests;
 #[cfg(all(test, unix))]
 mod interpreter_tests;
 
@@ -134,9 +150,15 @@ pub enum GovernedProcessJailErrorCode {
     EgressBrokerUnavailable,
     /// Linux only: no trusted in-jail egress forwarder is installed.
     EgressForwarderUnavailable,
+    /// Linux only: the trusted in-jail helper (`magicrun-jail-egress-forwarder`,
+    /// the exec shim every Linux jail runs first) is not installed.
+    JailHelperUnavailable,
     /// No trusted interpreter is installed, a pinned interpreter changed, or
     /// the jail cannot take one.
     InterpreterUnavailable,
+    /// A staged input file has an unsafe name, already exists, or would
+    /// exceed the jail's file limits.
+    InvalidInputFile,
 }
 
 /// Stable and value-free. Host paths and launcher diagnostics never cross the
@@ -418,7 +440,13 @@ pub struct GovernedProcessJailLimits {
     pub wall_seconds: u64,
     pub cpu_seconds: u64,
     pub max_memory_bytes: u64,
+    /// Processes, sampled by the watchdog.
     pub max_processes: u64,
+    /// Tasks (threads of every process). Linux with a jail user namespace:
+    /// an exact kernel bound (`RLIMIT_NPROC` inside the namespace, plus
+    /// [`GOVERNED_JAIL_HELPER_TASKS`]); the Linux and macOS watchdogs also
+    /// sample it.
+    pub max_tasks: u64,
     pub max_open_files: u64,
     pub max_files: u64,
     pub max_file_bytes: u64,
@@ -432,6 +460,7 @@ impl Default for GovernedProcessJailLimits {
             cpu_seconds: 30,
             max_memory_bytes: DEFAULT_GOVERNED_JAIL_MEMORY_BYTES,
             max_processes: MAX_GOVERNED_JAIL_PROCESSES,
+            max_tasks: DEFAULT_GOVERNED_JAIL_TASKS,
             max_open_files: MAX_GOVERNED_JAIL_OPEN_FILES,
             max_files: MAX_GOVERNED_JAIL_FILES,
             max_file_bytes: MAX_GOVERNED_JAIL_FILE_BYTES,
@@ -451,6 +480,8 @@ impl GovernedProcessJailLimits {
             || self.max_file_bytes == 0
             || self.max_total_file_bytes == 0
             || self.max_processes > MAX_GOVERNED_JAIL_PROCESSES
+            || self.max_tasks < self.max_processes
+            || self.max_tasks > MAX_GOVERNED_JAIL_TASKS
             || self.wall_seconds > MAX_GOVERNED_JAIL_WALL_SECONDS
             || self.cpu_seconds > MAX_GOVERNED_JAIL_CPU_SECONDS
             || self.max_memory_bytes > MAX_GOVERNED_JAIL_MEMORY_BYTES
@@ -496,6 +527,9 @@ pub struct GovernedProcessJailAudit {
     pub egress: Option<GovernedProcessJailEgressAudit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interpreter: Option<GovernedJailInterpreterAudit>,
+    /// Linux: BLAKE3 of the trusted in-jail helper every jail runs first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linux_helper_digest: Option<GovernedProcessJailDigest>,
 }
 
 /// Move-only strict app profile. There is no constructor accepting a caller
@@ -510,6 +544,60 @@ pub struct GovernedProcessJail {
     limits: GovernedProcessJailLimits,
     egress: Option<BrokeredEgress>,
     interpreter: Option<GovernedJailInterpreter>,
+    linux_helper: Option<LinuxJailHelper>,
+    /// Serializes staging: the quota check and the write happen as one.
+    staging: std::sync::Mutex<()>,
+    /// Tests only: launch a program that does not exist in the jail, so the
+    /// helper's exec fails and it reports a refusal.
+    #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    missing_program_for_test: bool,
+}
+
+/// Linux: the trusted in-jail helper, its file identity at build time, and
+/// whether the helper can bound the jail's tasks exactly (a user namespace of
+/// the jail's own, a kernel with per-namespace accounting, a non-root UID).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct LinuxJailHelper {
+    path: PathBuf,
+    digest: GovernedProcessJailDigest,
+    identity: Option<HelperFileIdentity>,
+    exact_task_ceiling: bool,
+}
+
+/// Device, inode, size and times of the helper when the jail was built; a
+/// replaced or rewritten helper no longer matches at launch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct HelperFileIdentity {
+    device: u64,
+    inode: u64,
+    length: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl HelperFileIdentity {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn of(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let metadata = fs::symlink_metadata(path).ok()?;
+            Some(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                length: metadata.len(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
+                changed: (metadata.ctime(), metadata.ctime_nsec()),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
 }
 
 /// Host-validated binding of the brokered-egress mode.
@@ -584,6 +672,29 @@ impl GovernedProcessJail {
         {
             return Err(invalid_limits());
         }
+        // Every Linux jail runs the trusted helper first (the exec shim that
+        // applies the task ceiling inside the jail's user namespace). The
+        // brokered mode already bound it as its forwarder.
+        let linux_helper = match platform {
+            GovernedProcessJailPlatform::LinuxBubblewrap => {
+                let (path, digest) = match egress.as_ref().and_then(|egress| egress.forwarder.clone()) {
+                    Some(forwarder) => forwarder,
+                    None => trusted_egress_forwarder().map_err(|_| jail_helper_unavailable())?,
+                };
+                // The shim sets soft and hard `RLIMIT_NPROC`; it cannot raise
+                // the hard limit it inherits. Below the ceiling, no exact
+                // bound is claimed.
+                let ceiling = limits.max_tasks.saturating_add(1 + u64::from(egress.is_some()));
+                Some(LinuxJailHelper {
+                    identity: HelperFileIdentity::of(&path),
+                    path,
+                    digest,
+                    exact_task_ceiling: linux_exact_task_ceiling_expected(&launcher)
+                        && task_hard_limit() >= ceiling,
+                })
+            },
+            GovernedProcessJailPlatform::MacosSandboxExec => None,
+        };
         let workdir = Builder::new()
             .prefix("magician-app-jail-")
             .tempdir()
@@ -600,6 +711,10 @@ impl GovernedProcessJail {
             limits,
             egress,
             interpreter: None,
+            linux_helper,
+            staging: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            missing_program_for_test: false,
         })
     }
 
@@ -673,12 +788,16 @@ impl GovernedProcessJail {
             wall_ceiling: true,
             cpu_ceiling: true,
             memory_ceiling: true,
-            // Linux combines the PID/user namespace with inherited
-            // RLIMIT_NPROC. macOS has no per-invocation process namespace and
-            // its RLIMIT_NPROC is user-wide, so that platform intentionally
-            // reports only the sampled process watchdog rather than claiming
-            // an exact hard ceiling.
-            process_ceiling: matches!(self.platform, GovernedProcessJailPlatform::LinuxBubblewrap),
+            // An exact kernel bound exists only where the jail has a user
+            // namespace of its own: the in-jail helper then sets
+            // RLIMIT_NPROC, which Linux charges per (namespace, UID). Setuid
+            // bubblewrap without user namespaces, and macOS (user-wide
+            // RLIMIT_NPROC, no per-invocation namespace), report only the
+            // sampled watchdog rather than claim a hard ceiling.
+            process_ceiling: self
+                .linux_helper
+                .as_ref()
+                .is_some_and(|helper| helper.exact_task_ceiling),
             file_ceiling: true,
             output_ceiling: true,
         }
@@ -694,6 +813,7 @@ impl GovernedProcessJail {
             limits: self.limits,
             egress: self.egress_audit(),
             interpreter: self.interpreter_audit(),
+            linux_helper_digest: self.linux_helper.as_ref().map(|helper| helper.digest),
         }
     }
 
@@ -769,11 +889,99 @@ impl GovernedProcessJail {
             .map_err(|_| private_workdir_unavailable())
     }
 
+    /// Write one input file into the jail's private workdir before launch and
+    /// return the plain name the child opens relative to its working
+    /// directory. The host path is never returned. The name is a single
+    /// component (`[A-Za-z0-9._-]`, not hidden, not starting with `-` since it
+    /// is passed as an argument, at most 128 bytes); the file
+    /// is created fresh (never overwriting or following a link), read-only to
+    /// its owner, and counts against the jail's file ceilings exactly as the
+    /// child's own files do.
+    pub fn stage_input_file(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<String, GovernedProcessJailError> {
+        if !is_plain_input_file_name(name) {
+            return Err(invalid_input_file());
+        }
+        let length = u64::try_from(bytes.len()).map_err(|_| invalid_input_file())?;
+        if length > self.limits.max_file_bytes {
+            return Err(invalid_input_file());
+        }
+        validate_real_absolute_directory(&self.canonical_workdir)
+            .map_err(|_| private_workdir_unavailable())?;
+        // One staging at a time: concurrent calls would otherwise all pass
+        // the quota check before any of them wrote.
+        let _staging = self
+            .staging
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (files, total) = staged_workdir_usage(&self.canonical_workdir, &self.limits)?;
+        if files.saturating_add(1) > self.limits.max_files
+            || total.saturating_add(length) > self.limits.max_total_file_bytes
+        {
+            return Err(invalid_input_file());
+        }
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o400).custom_flags(libc::O_NOFOLLOW);
+        }
+        let path = self.canonical_workdir.join(name);
+        // An existing name or a planted link fails here (O_EXCL, O_NOFOLLOW)
+        // and is the caller's input error; any other failure is the workdir's.
+        let mut file = options.open(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                || error.raw_os_error() == Some(libc::ELOOP)
+            {
+                invalid_input_file()
+            } else {
+                private_workdir_unavailable()
+            }
+        })?;
+        let written = std::io::Write::write_all(&mut file, bytes).and_then(|()| file.sync_all());
+        if written.is_err() {
+            // Never leave a partial input behind to count against the quota.
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(private_workdir_unavailable());
+        }
+        Ok(name.to_owned())
+    }
+
     pub(crate) fn watch(&self) -> GovernedProcessJailWatch {
         GovernedProcessJailWatch {
             workdir: self.canonical_workdir.clone(),
             limits: self.limits,
+            overhead: self.watchdog_overhead(),
         }
+    }
+
+    /// Linux: tasks of the jail's machinery inside its user namespace:
+    /// bubblewrap's in-jail init, plus the forwarder when brokered.
+    fn helper_tasks(&self) -> u64 {
+        1 + u64::from(self.egress.is_some())
+    }
+
+    /// Processes (each single-threaded) the watchdog sees besides the
+    /// admitted command. Linux: the launcher plus the helper tasks. macOS:
+    /// none, since `sandbox-exec` execs the command in place.
+    fn watchdog_overhead(&self) -> u64 {
+        match self.platform {
+            GovernedProcessJailPlatform::LinuxBubblewrap => 1 + self.helper_tasks(),
+            GovernedProcessJailPlatform::MacosSandboxExec => 0,
+        }
+    }
+
+    /// Linux: the jail runs the in-jail helper, which reports a refusal, or
+    /// that it is dispatching the command, through the runner's exec-status
+    /// channel.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn uses_exec_status(&self) -> bool {
+        self.linux_helper.is_some()
     }
 
     /// Require the governed invocation to be bound to the exact directory
@@ -798,9 +1006,15 @@ impl GovernedProcessJail {
         }
     }
 
+    /// `status_fd` (Linux): the helper's end of the runner's exec-status
+    /// channel, passed to the in-jail helper. Its first byte there is a
+    /// refusal only if the command never ran; before exec it marks the
+    /// descriptor close-on-exec, so the command never holds it, and writes
+    /// the dispatching byte.
     pub(crate) fn command(
         &self,
         executable: &GovernedExecutableSnapshot,
+        status_fd: Option<i32>,
     ) -> Result<Command, GovernedProcessJailError> {
         validate_trusted_launcher(&self.launcher)?;
         validate_real_absolute_file(executable.as_path())?;
@@ -811,7 +1025,7 @@ impl GovernedProcessJail {
         }
         match self.platform {
             GovernedProcessJailPlatform::MacosSandboxExec => self.macos_command(executable),
-            GovernedProcessJailPlatform::LinuxBubblewrap => self.linux_command(executable),
+            GovernedProcessJailPlatform::LinuxBubblewrap => self.linux_command(executable, status_fd),
         }
     }
 
@@ -921,6 +1135,7 @@ impl GovernedProcessJail {
     fn linux_command(
         &self,
         snapshot: &GovernedExecutableSnapshot,
+        status_fd: Option<i32>,
     ) -> Result<Command, GovernedProcessJailError> {
         // Linux snapshots are always broker-owned copies. Never mount the
         // resolved executable's original parent: for `/usr/bin/tool` that
@@ -931,7 +1146,7 @@ impl GovernedProcessJail {
         let private_bundle_root = snapshot
             .private_bundle_root()
             .ok_or_else(unsafe_host_path)?;
-        self.linux_command_for_private_snapshot(snapshot.as_path(), private_bundle_root)
+        self.linux_command_for_private_snapshot(snapshot.as_path(), private_bundle_root, status_fd)
     }
 
     #[cfg(target_os = "linux")]
@@ -939,11 +1154,18 @@ impl GovernedProcessJail {
         &self,
         executable: &Path,
         private_bundle_root: &Path,
+        status_fd: Option<i32>,
     ) -> Result<Command, GovernedProcessJailError> {
         validate_real_absolute_directory(private_bundle_root)?;
         validate_real_absolute_file(executable)?;
         let relative_executable =
             private_snapshot_relative_executable(executable, private_bundle_root)?;
+        #[cfg(test)]
+        let relative_executable = if self.missing_program_for_test {
+            Path::new(".magicrun-missing-for-test")
+        } else {
+            relative_executable
+        };
         let name = executable.file_name().ok_or_else(unsafe_host_path)?;
         if name.is_empty() {
             return Err(unsafe_host_path());
@@ -953,6 +1175,39 @@ impl GovernedProcessJail {
             .map(Path::new)
             .filter(|root| root.exists())
             .collect::<Vec<_>>();
+        let helper = self.linux_helper.as_ref().ok_or_else(jail_helper_unavailable)?;
+        validate_trusted_launcher(&helper.path).map_err(|_| jail_helper_unavailable())?;
+        // The helper whose digest the audit reports is the one that runs.
+        if helper.identity.is_none() || HelperFileIdentity::of(&helper.path) != helper.identity {
+            return Err(jail_helper_unavailable());
+        }
+        let status_fd = status_fd
+            .filter(|fd| *fd >= 3)
+            .ok_or_else(jail_helper_unavailable)?;
+        let ceiling = self.limits.max_tasks.saturating_add(self.helper_tasks());
+        if helper.exact_task_ceiling && task_hard_limit() < ceiling {
+            // The hard limit fell after the jail was built; the guarantee
+            // already reported can no longer be kept.
+            return Err(jail_helper_unavailable());
+        }
+        let exec = LinuxJailExec {
+            helper: &helper.path,
+            status_fd: OsString::from(status_fd.to_string()),
+            task_ceiling: if helper.exact_task_ceiling {
+                // The shim refuses to run unless its user namespace differs
+                // from this one, so a mispredicted namespace fails closed.
+                let host_namespace = fs::read_link("/proc/self/ns/user")
+                    .ok()
+                    .and_then(|target| egress_forwarder::parse_user_namespace_link(&target))
+                    .ok_or_else(jail_helper_unavailable)?;
+                Some((
+                    OsString::from(ceiling.to_string()),
+                    OsString::from(host_namespace.to_string()),
+                ))
+            } else {
+                None
+            },
+        };
         let egress = match self.egress.as_ref() {
             None => None,
             Some(egress) => {
@@ -960,18 +1215,11 @@ impl GovernedProcessJail {
                 else {
                     return Err(unsupported_egress_broker());
                 };
-                let (forwarder, _) = egress
-                    .forwarder
-                    .as_ref()
-                    .ok_or_else(egress_forwarder_unavailable)?;
-                validate_trusted_launcher(forwarder)
-                    .map_err(|_| egress_forwarder_unavailable())?;
                 validate_broker_socket(socket)?;
                 if let Some(bundle) = egress.trust_bundle.as_deref() {
                     validate_trusted_launcher(bundle)?;
                 }
                 Some(LinuxEgressMounts {
-                    forwarder,
                     socket,
                     trust_bundle: egress.trust_bundle.as_deref(),
                     environment: egress_environment(egress, self.platform),
@@ -985,6 +1233,7 @@ impl GovernedProcessJail {
                 private_bundle_root,
                 &self.canonical_workdir,
                 relative_executable,
+                &exec,
                 egress.as_ref(),
             )),
             Some(interpreter) => command.args(linux_bwrap_args_with_interpreter(
@@ -992,6 +1241,7 @@ impl GovernedProcessJail {
                 private_bundle_root,
                 &self.canonical_workdir,
                 relative_executable,
+                &exec,
                 egress.as_ref(),
                 Some(&interpreter.grants()),
             )),
@@ -1003,6 +1253,7 @@ impl GovernedProcessJail {
     fn linux_command(
         &self,
         _snapshot: &GovernedExecutableSnapshot,
+        _status_fd: Option<i32>,
     ) -> Result<Command, GovernedProcessJailError> {
         Err(unsupported_platform())
     }
@@ -1491,6 +1742,125 @@ fn walk_tree(
     Ok(())
 }
 
+/// Whether the in-jail helper can bound the jail's tasks exactly on this
+/// host: see [`TaskCeilingHost::exact`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_exact_task_ceiling_expected(launcher: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        // SAFETY: `uname` writes only the provided, live `utsname`.
+        let release = unsafe {
+            let mut name = std::mem::zeroed::<libc::utsname>();
+            (libc::uname(&mut name) == 0)
+                .then(|| std::ffi::CStr::from_ptr(name.release.as_ptr()).to_string_lossy().into_owned())
+        };
+        TaskCeilingHost {
+            setuid_launcher: fs::metadata(launcher)
+                .is_ok_and(|metadata| metadata.uid() == 0 && metadata.mode() & 0o4000 != 0),
+            kernel_has_user_namespaces: Path::new("/proc/self/ns/user").exists(),
+            rhel_enable: fs::read_to_string("/sys/module/user_namespace/parameters/enable").ok(),
+            max_user_namespaces: fs::read_to_string("/proc/sys/user/max_user_namespaces").ok(),
+            // SAFETY: `getuid` has no preconditions and cannot fail.
+            root_uid: unsafe { libc::getuid() } == 0,
+            kernel_release: release,
+        }
+        .exact()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = launcher;
+        false
+    }
+}
+
+/// The host facts that decide whether an in-jail `RLIMIT_NPROC` is an exact
+/// per-jail bound.
+#[cfg_attr(not(unix), allow(dead_code))]
+struct TaskCeilingHost {
+    setuid_launcher: bool,
+    kernel_has_user_namespaces: bool,
+    rhel_enable: Option<String>,
+    max_user_namespaces: Option<String>,
+    root_uid: bool,
+    kernel_release: Option<String>,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl TaskCeilingHost {
+    /// All of:
+    /// - a non-root real UID: Linux never enforces `RLIMIT_NPROC` for a task
+    ///   charged to the initial root user;
+    /// - a kernel at least [`MIN_GOVERNED_JAIL_TASK_CEILING_KERNEL`] (fail
+    ///   closed on an unparsable release);
+    /// - a user namespace of the jail's own, predicted as bubblewrap decides:
+    ///   unprivileged bubblewrap always creates one (or fails to start);
+    ///   setuid bubblewrap's `--unshare-user-try` creates one unless the
+    ///   kernel has none, the RHEL 7 module parameter disables them, or
+    ///   `user.max_user_namespaces` is 0.
+    ///
+    /// A misprediction fails closed: the shim refuses a requested ceiling
+    /// outside a new namespace or when it runs as UID 0.
+    fn exact(&self) -> bool {
+        !self.root_uid
+            && self
+                .kernel_release
+                .as_deref()
+                .and_then(kernel_major_minor)
+                .is_some_and(|release| release >= MIN_GOVERNED_JAIL_TASK_CEILING_KERNEL)
+            && (!self.setuid_launcher
+                || (self.kernel_has_user_namespaces
+                    && self
+                        .rhel_enable
+                        .as_deref()
+                        .is_none_or(|value| !value.trim_start().starts_with('N'))
+                    && self
+                        .max_user_namespaces
+                        .as_deref()
+                        .is_none_or(|value| value.trim() != "0")))
+    }
+}
+
+/// `major.minor` of a kernel release such as `5.15.0-1034-azure` or `6.8.0`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn kernel_major_minor(release: &str) -> Option<(u32, u32)> {
+    let mut parts = release.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?;
+    let digits = minor.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    Some((major, minor[..digits].parse().ok()?))
+}
+
+/// This process's hard `RLIMIT_NPROC`, inherited by bubblewrap and the
+/// helper; `u64::MAX` when unlimited or unknown on this platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn task_hard_limit() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes only the provided, live `rlimit`.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut limit) } != 0 {
+            return 0;
+        }
+        if limit.rlim_max == libc::RLIM_INFINITY {
+            u64::MAX
+        } else {
+            limit.rlim_max as u64
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        u64::MAX
+    }
+}
+
 fn trusted_egress_forwarder() -> Result<(PathBuf, GovernedProcessJailDigest), GovernedProcessJailError>
 {
     for candidate in GOVERNED_JAIL_EGRESS_FORWARDER_PATHS {
@@ -1670,16 +2040,27 @@ fn profile_identity(
                 Vec::new()
             };
             let egress = brokered.then(|| LinuxEgressMounts {
-                forwarder: Path::new("/<forwarder>"),
                 socket: Path::new("/<broker-socket>"),
                 trust_bundle: Some(Path::new("/<trust-bundle>")),
                 environment: environment.clone(),
             });
+            // The task-ceiling value and the host namespace are per host and
+            // per limits; whether a ceiling applies is reported by
+            // `guarantees().process_ceiling`, not by this template.
+            let exec = LinuxJailExec {
+                helper: Path::new("/<helper>"),
+                status_fd: OsString::from("<status-fd>"),
+                task_ceiling: Some((
+                    OsString::from("<task-ceiling>"),
+                    OsString::from("<host-user-namespace>"),
+                )),
+            };
             let args = linux_bwrap_args_with_interpreter(
                 &[Path::new("/lib"), Path::new("/lib64")],
                 Path::new("/<bundle>"),
                 Path::new("/<workdir>"),
                 Path::new("<executable>"),
+                &exec,
                 egress.as_ref(),
                 grants,
             );
@@ -1735,19 +2116,30 @@ fn profile_identity(
     GovernedProcessJailDigest(*hasher.finalize().as_bytes())
 }
 
-/// Host resources and fixed overlay of the Linux brokered mode.
+/// The trusted helper every Linux jail runs first, and the task ceiling it
+/// applies (`None`: exec only, no user namespace of the jail's own).
+struct LinuxJailExec<'a> {
+    helper: &'a Path,
+    /// The inherited helper end of the runner's exec-status channel.
+    status_fd: OsString,
+    /// `(max_tasks + helper tasks, host user-namespace inode)`.
+    task_ceiling: Option<(OsString, OsString)>,
+}
+
+/// Host resources and fixed overlay of the Linux brokered mode. The
+/// forwarder is the jail helper itself.
 struct LinuxEgressMounts<'a> {
-    forwarder: &'a Path,
     socket: &'a Path,
     trust_bundle: Option<&'a Path>,
     environment: Vec<(&'static str, OsString)>,
 }
 
-/// Pure bubblewrap argv builder. The strict (`egress == None`) argv is
-/// byte-identical to the reviewed strict profile. The brokered argv adds only
-/// read-only binds of the forwarder, the broker socket and the trust bundle,
-/// the fixed environment overlay, and runs the exact executable under the
-/// forwarder. The network namespace stays unshared: only `lo` exists and no
+/// Pure bubblewrap argv builder. Every jail binds the trusted helper
+/// read-only and runs the exact executable through it (the exec shim applies
+/// the task ceiling once the jail's namespaces exist). The brokered argv adds
+/// only read-only binds of the broker socket and the trust bundle, the fixed
+/// environment overlay, and runs the executable under the helper's forwarder
+/// role. The network namespace stays unshared: only `lo` exists and no
 /// resolver configuration is mounted, so DNS and every other address fail.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_bwrap_args(
@@ -1755,6 +2147,7 @@ fn linux_bwrap_args(
     private_bundle_root: &Path,
     workdir: &Path,
     relative_executable: &Path,
+    exec: &LinuxJailExec<'_>,
     egress: Option<&LinuxEgressMounts<'_>>,
 ) -> Vec<OsString> {
     linux_bwrap_args_with_interpreter(
@@ -1762,6 +2155,7 @@ fn linux_bwrap_args(
         private_bundle_root,
         workdir,
         relative_executable,
+        exec,
         egress,
         None,
     )
@@ -1777,6 +2171,7 @@ fn linux_bwrap_args_with_interpreter(
     private_bundle_root: &Path,
     workdir: &Path,
     relative_executable: &Path,
+    exec: &LinuxJailExec<'_>,
     egress: Option<&LinuxEgressMounts<'_>>,
     interpreter: Option<&InterpreterGrants<'_>>,
 ) -> Vec<OsString> {
@@ -1812,12 +2207,12 @@ fn linux_bwrap_args_with_interpreter(
         OsString::from("--bind"),
         workdir.into(),
         OsString::from("/work"),
+        OsString::from("--ro-bind"),
+        exec.helper.into(),
+        OsString::from(LINUX_JAIL_HELPER),
     ]);
     if let Some(egress) = egress {
         args.extend([
-            OsString::from("--ro-bind"),
-            egress.forwarder.into(),
-            OsString::from(LINUX_JAIL_EGRESS_FORWARDER),
             // A read-only bind still admits `connect(2)`: Linux exempts
             // sockets from the read-only-filesystem write check, while chmod
             // or replacement of the host socket stays impossible.
@@ -1859,9 +2254,21 @@ fn linux_bwrap_args_with_interpreter(
         }
     }
     args.push(OsString::from("--"));
+    let (tasks, namespace) = exec
+        .task_ceiling
+        .clone()
+        .unwrap_or_else(|| (OsString::from("-"), OsString::from("-")));
+    args.extend([
+        OsString::from(LINUX_JAIL_HELPER),
+        OsString::from(egress_forwarder::GOVERNED_JAIL_EXEC_PROTOCOL_V1),
+        tasks,
+        namespace,
+        exec.status_fd.clone(),
+        OsString::from("--"),
+    ]);
     if egress.is_some() {
         args.extend([
-            OsString::from(LINUX_JAIL_EGRESS_FORWARDER),
+            OsString::from(LINUX_JAIL_HELPER),
             OsString::from(GOVERNED_JAIL_EGRESS_FORWARDER_PROTOCOL_V1),
             OsString::from(GOVERNED_JAIL_EGRESS_LINUX_PROXY_PORT.to_string()),
             OsString::from(LINUX_JAIL_EGRESS_SOCKET),
@@ -2014,11 +2421,18 @@ fn macos_profile(
 pub(crate) struct GovernedProcessJailWatch {
     workdir: PathBuf,
     limits: GovernedProcessJailLimits,
+    overhead: u64,
 }
 
 impl GovernedProcessJailWatch {
     pub(crate) fn limits(&self) -> GovernedProcessJailLimits {
         self.limits
+    }
+
+    /// Single-threaded processes of the jail's own machinery the watchdog
+    /// allows on top of `max_processes` and `max_tasks`.
+    pub(crate) fn overhead(&self) -> u64 {
+        self.overhead
     }
 
     pub(crate) fn workdir_within_limits(&self) -> Result<bool, ()> {
@@ -2209,6 +2623,54 @@ const fn launcher_unavailable() -> GovernedProcessJailError {
     )
 }
 
+fn is_plain_input_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && !name.starts_with('.')
+        // The name is handed to the child as an argument: never a flag or `-`.
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Files and bytes already in the private workdir, walked without following
+/// links; anything unexpected refuses staging.
+fn staged_workdir_usage(
+    workdir: &Path,
+    limits: &GovernedProcessJailLimits,
+) -> Result<(u64, u64), GovernedProcessJailError> {
+    let mut pending = vec![workdir.to_path_buf()];
+    let (mut files, mut total) = (0_u64, 0_u64);
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).map_err(|_| private_workdir_unavailable())? {
+            let entry = entry.map_err(|_| private_workdir_unavailable())?;
+            let metadata =
+                fs::symlink_metadata(entry.path()).map_err(|_| private_workdir_unavailable())?;
+            files = files.saturating_add(1);
+            if files > limits.max_files || total > limits.max_total_file_bytes {
+                return Err(invalid_input_file());
+            }
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+            } else {
+                return Err(invalid_input_file());
+            }
+        }
+    }
+    Ok((files, total))
+}
+
+const fn invalid_input_file() -> GovernedProcessJailError {
+    GovernedProcessJailError::new(
+        GovernedProcessJailErrorCode::InvalidInputFile,
+        "jail.input_file",
+        "a staged input file is unsafe or exceeds the jail's file limits",
+    )
+}
+
 const fn private_workdir_unavailable() -> GovernedProcessJailError {
     GovernedProcessJailError::new(
         GovernedProcessJailErrorCode::PrivateWorkdirUnavailable,
@@ -2258,6 +2720,14 @@ const fn egress_forwarder_unavailable() -> GovernedProcessJailError {
     )
 }
 
+const fn jail_helper_unavailable() -> GovernedProcessJailError {
+    GovernedProcessJailError::new(
+        GovernedProcessJailErrorCode::JailHelperUnavailable,
+        "jail.helper",
+        "no trusted in-jail helper (magicrun-jail-egress-forwarder) is installed",
+    )
+}
+
 const fn interpreter_unavailable() -> GovernedProcessJailError {
     GovernedProcessJailError::new(
         GovernedProcessJailErrorCode::InterpreterUnavailable,
@@ -2278,6 +2748,154 @@ const fn unsafe_host_path() -> GovernedProcessJailError {
 mod tests {
     use super::*;
     use static_assertions::assert_not_impl_any;
+
+    /// Staging needs no launcher: build the jail around a private tempdir
+    /// directly so these tests run on every host.
+    fn staging_jail(limits: GovernedProcessJailLimits) -> GovernedProcessJail {
+        let directory = tempfile::tempdir().unwrap();
+        let canonical_workdir = fs::canonicalize(directory.path()).unwrap();
+        GovernedProcessJail {
+            platform: GovernedProcessJailPlatform::MacosSandboxExec,
+            launcher: PathBuf::from("/usr/bin/sandbox-exec"),
+            canonical_workdir,
+            _workdir: directory,
+            limits,
+            egress: None,
+            interpreter: None,
+            linux_helper: None,
+            staging: std::sync::Mutex::new(()),
+            missing_program_for_test: false,
+        }
+    }
+
+    /// Concurrent staging cannot exceed the quota: the check and the write
+    /// happen under one lock.
+    #[test]
+    fn concurrent_staging_respects_the_total_quota() {
+        let jail = staging_jail(GovernedProcessJailLimits {
+            max_file_bytes: 256 * 1024,
+            max_total_file_bytes: 1024 * 1024,
+            ..GovernedProcessJailLimits::default()
+        });
+        let bytes = vec![7_u8; 128 * 1024];
+        let staged = std::thread::scope(|scope| {
+            let handles = (0..16)
+                .map(|index| {
+                    let (jail, bytes) = (&jail, &bytes);
+                    scope.spawn(move || jail.stage_input_file(&format!("in-{index}.bin"), bytes).is_ok())
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|ok| *ok)
+                .count()
+        });
+        assert_eq!(staged, 8);
+        let total = fs::read_dir(&jail.canonical_workdir)
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .sum::<u64>();
+        assert_eq!(total, 1024 * 1024);
+    }
+
+    /// Only a clash with an existing name or link is the caller's input
+    /// error; other failures belong to the workdir.
+    #[test]
+    fn staging_failures_are_attributed() {
+        let jail = staging_jail(GovernedProcessJailLimits::default());
+        jail.stage_input_file("taken.json", b"{}").unwrap();
+        assert_eq!(
+            jail.stage_input_file("taken.json", b"{}").unwrap_err().code,
+            GovernedProcessJailErrorCode::InvalidInputFile
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/private/etc/hosts", jail.canonical_workdir.join("link.json")).unwrap();
+            assert_eq!(
+                jail.stage_input_file("link.json", b"{}").unwrap_err().code,
+                GovernedProcessJailErrorCode::InvalidInputFile
+            );
+            fs::remove_file(jail.canonical_workdir.join("link.json")).unwrap();
+            // A workdir that cannot be written is not the caller's input.
+            let before = fs::metadata(&jail.canonical_workdir).unwrap().permissions();
+            fs::set_permissions(&jail.canonical_workdir, fs::Permissions::from_mode(0o500)).unwrap();
+            // SAFETY: `geteuid` has no preconditions and cannot fail.
+            if unsafe { libc::geteuid() } != 0 {
+                assert_eq!(
+                    jail.stage_input_file("fresh.json", b"{}").unwrap_err().code,
+                    GovernedProcessJailErrorCode::PrivateWorkdirUnavailable
+                );
+            }
+            fs::set_permissions(&jail.canonical_workdir, before).unwrap();
+        }
+    }
+
+    #[test]
+    fn staged_input_names_are_single_plain_components() {
+        for good in ["input.json", "doc-1.pdf", "a_b.C9"] {
+            assert!(is_plain_input_file_name(good), "{good}");
+        }
+        let long = "x".repeat(129);
+        for bad in ["", ".hidden", "..", "a/b", "../x", "a b", "a\\b", "é.txt", "-", "--output=x", "-rf", long.as_str()] {
+            assert!(!is_plain_input_file_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn staging_writes_a_fresh_read_only_file_and_refuses_existing_names_and_links() {
+        let jail = staging_jail(GovernedProcessJailLimits::default());
+        assert_eq!(jail.stage_input_file("input.json", b"{}").unwrap(), "input.json");
+        let staged = jail.canonical_workdir.join("input.json");
+        assert_eq!(fs::read(&staged).unwrap(), b"{}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&staged).unwrap().permissions().mode() & 0o777, 0o400);
+        }
+        assert_eq!(
+            jail.stage_input_file("input.json", b"again").unwrap_err().code,
+            GovernedProcessJailErrorCode::InvalidInputFile
+        );
+        assert_eq!(
+            jail.stage_input_file("../escape", b"x").unwrap_err().code,
+            GovernedProcessJailErrorCode::InvalidInputFile
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staging_never_follows_a_link_at_the_target_name() {
+        // A dangling link at the name: O_EXCL refuses it and nothing is
+        // written through it.
+        let jail = staging_jail(GovernedProcessJailLimits::default());
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("written-through");
+        std::os::unix::fs::symlink(&target, jail.canonical_workdir.join("link")).unwrap();
+        // The walk already refuses any link in the workdir.
+        assert_eq!(
+            jail.stage_input_file("other", b"x").unwrap_err().code,
+            GovernedProcessJailErrorCode::InvalidInputFile
+        );
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn staging_respects_the_jail_file_ceilings() {
+        let mut limits = GovernedProcessJailLimits::default();
+        limits.max_file_bytes = 8;
+        limits.max_total_file_bytes = 12;
+        limits.max_files = 2;
+        let jail = staging_jail(limits);
+        let refused = |result: Result<String, GovernedProcessJailError>| {
+            result.unwrap_err().code == GovernedProcessJailErrorCode::InvalidInputFile
+        };
+        assert!(refused(jail.stage_input_file("big", b"123456789")));
+        jail.stage_input_file("one", b"12345678").unwrap();
+        assert!(refused(jail.stage_input_file("two", b"12345")), "total ceiling");
+        jail.stage_input_file("two", b"1234").unwrap();
+        assert!(refused(jail.stage_input_file("three", b"")), "file-count ceiling");
+    }
 
     #[test]
     fn limits_refuse_zero_and_widening() {
@@ -2318,6 +2936,7 @@ mod tests {
                 max_total_file_bytes: 2,
                 ..GovernedProcessJailLimits::default()
             },
+            overhead: 0,
         };
         fs::write(directory.path().join("one"), b"12").unwrap();
         assert_eq!(watch.workdir_within_limits(), Ok(true));
@@ -2385,14 +3004,31 @@ mod tests {
     fn strict_audit_serialization_is_unchanged() {
         let jail = match GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) {
             Ok(jail) => jail,
-            Err(error) if error.code == GovernedProcessJailErrorCode::LauncherUnavailable => return,
+            Err(error)
+                if matches!(
+                    error.code,
+                    GovernedProcessJailErrorCode::LauncherUnavailable
+                        | GovernedProcessJailErrorCode::JailHelperUnavailable
+                ) =>
+            {
+                super::egress_tests::skip(&format!("no strict jail on this host: {error}"));
+                return;
+            },
             Err(error) => panic!("unexpected strict jail setup failure: {error}"),
         };
         assert_eq!(jail.schema_version(), GOVERNED_PROCESS_JAIL_V1);
-        let platform = if cfg!(target_os = "macos") {
-            ("macos_sandbox_exec", false)
+        // `0.1.78` added `max_tasks` to the limits and, on Linux, the helper
+        // digest; Linux reports an exact process ceiling only where the jail
+        // gets a user namespace of its own.
+        let (platform, ceiling, helper) = if cfg!(target_os = "macos") {
+            ("macos_sandbox_exec", false, String::new())
         } else {
-            ("linux_bubblewrap", true)
+            let helper = jail.linux_helper.as_ref().unwrap();
+            (
+                "linux_bubblewrap",
+                jail.linux_helper.as_ref().unwrap().exact_task_ceiling,
+                format!(",\"linux_helper_digest\":\"{}\"", helper.digest),
+            )
         };
         assert_eq!(
             serde_json::to_string(&jail.audit()).unwrap(),
@@ -2404,10 +3040,10 @@ mod tests {
                  \"wall_ceiling\":true,\"cpu_ceiling\":true,\"memory_ceiling\":true,\
                  \"process_ceiling\":{},\"file_ceiling\":true,\"output_ceiling\":true}},\
                  \"limits\":{{\"wall_seconds\":30,\"cpu_seconds\":30,\
-                 \"max_memory_bytes\":536870912,\"max_processes\":16,\
+                 \"max_memory_bytes\":536870912,\"max_processes\":16,\"max_tasks\":256,\
                  \"max_open_files\":64,\"max_files\":256,\"max_file_bytes\":16777216,\
-                 \"max_total_file_bytes\":67108864}}}}",
-                platform.0, platform.1
+                 \"max_total_file_bytes\":67108864}}{}}}",
+                platform, ceiling, helper
             )
         );
     }
@@ -2420,11 +3056,20 @@ mod tests {
     /// the pure builder. Runs on every host; the builder is platform-free.
     #[test]
     fn linux_strict_argv_is_identical_to_the_reviewed_golden() {
+        // `0.1.78` binds the trusted helper and runs the executable through
+        // its exec shim, which sets the task ceiling inside the jail's user
+        // namespace.
+        let exec = LinuxJailExec {
+            helper: Path::new("/usr/libexec/magicrun/magicrun-jail-egress-forwarder"),
+            status_fd: OsString::from("9"),
+            task_ceiling: Some((OsString::from("258"), OsString::from("4026531837"))),
+        };
         let args = linux_bwrap_args(
             &[Path::new("/lib"), Path::new("/lib64")],
             Path::new("/private/bundle"),
             Path::new("/private/work"),
             Path::new("bin/tool"),
+            &exec,
             None,
         );
         assert_eq!(
@@ -2433,13 +3078,112 @@ mod tests {
                 "--die-with-parent", "--unshare-all", "--tmpfs", "/", "--dir", "/app", "--dir",
                 "/work", "--proc", "/proc", "--dev", "/dev", "--ro-bind", "/lib", "/lib",
                 "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/private/bundle", "/app",
-                "--bind", "/private/work", "/work", "--remount-ro", "/", "--remount-ro",
+                "--bind", "/private/work", "/work", "--ro-bind",
+                "/usr/libexec/magicrun/magicrun-jail-egress-forwarder", "/run/magicrun/jail-helper",
+                "--remount-ro", "/", "--remount-ro",
                 "/proc", "--remount-ro", "/dev", "--chdir", "/work", "--setenv", "HOME",
                 "/work", "--setenv", "TMPDIR", "/work", "--setenv", "TMP", "/work",
                 "--setenv", "TEMP", "/work", "--setenv", "PATH", "/app", "--",
-                "/app/bin/tool",
+                "/run/magicrun/jail-helper", "--magicrun-jail-exec-v1", "258", "4026531837", "9",
+                "--", "/app/bin/tool",
             ]
         );
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert!(egress_forwarder::parse_exec_arguments(args[separator + 2..].iter().cloned()).is_some());
+        // Without a user namespace of the jail's own, the shim only execs.
+        let exec_only = LinuxJailExec {
+            helper: exec.helper,
+            status_fd: OsString::from("9"),
+            task_ceiling: None,
+        };
+        let args = linux_bwrap_args(
+            &[Path::new("/lib")],
+            Path::new("/private/bundle"),
+            Path::new("/private/work"),
+            Path::new("bin/tool"),
+            &exec_only,
+            None,
+        );
+        let separator = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(
+            strings(&args[separator..]),
+            ["--", LINUX_JAIL_HELPER, "--magicrun-jail-exec-v1", "-", "-", "9", "--", "/app/bin/tool"]
+        );
+    }
+
+    #[test]
+    fn user_namespace_prediction_mirrors_bubblewrap() {
+        let host = |setuid, has, rhel: Option<&str>, max: Option<&str>| TaskCeilingHost {
+            setuid_launcher: setuid,
+            kernel_has_user_namespaces: has,
+            rhel_enable: rhel.map(str::to_owned),
+            max_user_namespaces: max.map(str::to_owned),
+            root_uid: false,
+            kernel_release: Some("6.8.0-1017-azure".to_owned()),
+        };
+        // Unprivileged bubblewrap always creates one (or fails to start).
+        assert!(host(false, false, None, Some("0")).exact());
+        // Setuid bubblewrap tries, unless the kernel disables them.
+        assert!(host(true, true, None, Some("63412\n")).exact());
+        assert!(host(true, true, Some("Y\n"), None).exact());
+        assert!(!host(true, true, None, Some("0\n")).exact());
+        assert!(!host(true, true, Some("N\n"), Some("100")).exact());
+        assert!(!host(true, false, None, None).exact());
+        // A root UID is never held to RLIMIT_NPROC by the kernel.
+        assert!(!TaskCeilingHost { root_uid: true, ..host(false, true, None, None) }.exact());
+        assert!(!TaskCeilingHost { root_uid: true, ..host(true, true, None, None) }.exact());
+    }
+
+    #[test]
+    fn the_task_ceiling_needs_per_namespace_accounting() {
+        for (release, parsed) in [
+            ("5.15.0-1034-azure", Some((5, 15))),
+            ("6.8.0", Some((6, 8))),
+            ("5.17", Some((5, 17))),
+            ("4.19.0-26-amd64", Some((4, 19))),
+            ("6.1.0-rc3", Some((6, 1))),
+            ("5.16rc1", Some((5, 16))),
+            ("5.x", None),
+            ("", None),
+            ("Linux", None),
+            ("6", None),
+        ] {
+            assert_eq!(kernel_major_minor(release), parsed, "{release}");
+        }
+        let host = |release: Option<&str>| TaskCeilingHost {
+            setuid_launcher: false,
+            kernel_has_user_namespaces: true,
+            rhel_enable: None,
+            max_user_namespaces: None,
+            root_uid: false,
+            kernel_release: release.map(str::to_owned),
+        };
+        for exact in ["5.17.0", "6.8.0", "10.0.1"] {
+            assert!(host(Some(exact)).exact(), "{exact}");
+        }
+        // Debian 11, Ubuntu 20.04/22.04 GA, RHEL 8, and the buggy 5.14-5.16.
+        for coarse in ["5.10.0-28-amd64", "5.4.0-182-generic", "4.18.0-513.el8.x86_64", "5.15.0-1034-azure", "5.16.20"] {
+            assert!(!host(Some(coarse)).exact(), "{coarse}");
+        }
+        // Fail closed.
+        assert!(!host(Some("unknown")).exact());
+        assert!(!host(None).exact());
+    }
+
+    #[test]
+    fn limits_bound_tasks_separately_from_processes() {
+        let defaults = GovernedProcessJailLimits::default();
+        assert_eq!((defaults.max_processes, defaults.max_tasks), (16, DEFAULT_GOVERNED_JAIL_TASKS));
+        assert!(defaults.validate().is_ok());
+        for refused in [
+            GovernedProcessJailLimits { max_tasks: 0, ..defaults },
+            GovernedProcessJailLimits { max_tasks: 8, ..defaults },
+            GovernedProcessJailLimits { max_tasks: MAX_GOVERNED_JAIL_TASKS + 1, ..defaults },
+        ] {
+            assert_eq!(refused.validate().unwrap_err().code, GovernedProcessJailErrorCode::InvalidLimits);
+        }
+        assert!(GovernedProcessJailLimits { max_tasks: 16, ..defaults }.validate().is_ok());
+        assert!(GovernedProcessJailLimits { max_tasks: MAX_GOVERNED_JAIL_TASKS, ..defaults }.validate().is_ok());
     }
 
     #[test]
@@ -2449,16 +3193,21 @@ mod tests {
             Some(Path::new(LINUX_JAIL_TRUST_BUNDLE)),
         );
         let mounts = LinuxEgressMounts {
-            forwarder: Path::new("/usr/libexec/magicrun/magicrun-jail-egress-forwarder"),
             socket: Path::new("/run/magician/egress/broker.sock"),
             trust_bundle: Some(Path::new("/etc/ssl/certs/ca-certificates.crt")),
             environment,
+        };
+        let exec = LinuxJailExec {
+            helper: Path::new("/usr/libexec/magicrun/magicrun-jail-egress-forwarder"),
+            status_fd: OsString::from("9"),
+            task_ceiling: Some((OsString::from("258"), OsString::from("4026531837"))),
         };
         let args = linux_bwrap_args(
             &[Path::new("/lib")],
             Path::new("/private/bundle"),
             Path::new("/private/work"),
             Path::new("tool"),
+            &exec,
             Some(&mounts),
         );
         let args = strings(&args);
@@ -2470,7 +3219,7 @@ mod tests {
         assert!(has(&[
             "--ro-bind",
             "/usr/libexec/magicrun/magicrun-jail-egress-forwarder",
-            LINUX_JAIL_EGRESS_FORWARDER
+            LINUX_JAIL_HELPER
         ]));
         assert!(has(&["--ro-bind", "/run/magician/egress/broker.sock", LINUX_JAIL_EGRESS_SOCKET]));
         assert!(has(&["--ro-bind", "/etc/ssl/certs/ca-certificates.crt", LINUX_JAIL_TRUST_BUNDLE]));
@@ -2490,7 +3239,13 @@ mod tests {
             &args[separator..],
             [
                 "--",
-                LINUX_JAIL_EGRESS_FORWARDER,
+                LINUX_JAIL_HELPER,
+                egress_forwarder::GOVERNED_JAIL_EXEC_PROTOCOL_V1,
+                "258",
+                "4026531837",
+                "9",
+                "--",
+                LINUX_JAIL_HELPER,
                 GOVERNED_JAIL_EGRESS_FORWARDER_PROTOCOL_V1,
                 "3128",
                 LINUX_JAIL_EGRESS_SOCKET,
@@ -2499,7 +3254,7 @@ mod tests {
             ]
         );
         assert!(egress_forwarder::parse_forwarder_arguments(
-            args[separator + 2..].iter().map(OsString::from)
+            args[separator + 8..].iter().map(OsString::from)
         )
         .is_some());
     }
@@ -2560,7 +3315,16 @@ mod tests {
     fn strict_jail_reports_denied_network_and_its_profile_identity() {
         let jail = match GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) {
             Ok(jail) => jail,
-            Err(error) if error.code == GovernedProcessJailErrorCode::LauncherUnavailable => return,
+            Err(error)
+                if matches!(
+                    error.code,
+                    GovernedProcessJailErrorCode::LauncherUnavailable
+                        | GovernedProcessJailErrorCode::JailHelperUnavailable
+                ) =>
+            {
+                super::egress_tests::skip(&format!("no strict jail on this host: {error}"));
+                return;
+            },
             Err(error) => panic!("unexpected strict jail setup failure: {error}"),
         };
         assert_eq!(jail.network(), GovernedProcessJailNetwork::Denied);
@@ -2581,7 +3345,16 @@ mod tests {
             },
         ) {
             Ok(jail) => jail,
-            Err(error) if error.code == GovernedProcessJailErrorCode::LauncherUnavailable => return,
+            Err(error)
+                if matches!(
+                    error.code,
+                    GovernedProcessJailErrorCode::LauncherUnavailable
+                        | GovernedProcessJailErrorCode::JailHelperUnavailable
+                ) =>
+            {
+                super::egress_tests::skip(&format!("no strict jail on this host: {error}"));
+                return;
+            },
             Err(error) => panic!("unexpected brokered jail setup failure: {error}"),
         };
         assert_eq!(jail.schema_version(), GOVERNED_PROCESS_JAIL_BROKERED_EGRESS_V1);
@@ -2681,6 +3454,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_profile_does_not_mount_host_command_directories() {
+        let Ok((helper, digest)) = trusted_egress_forwarder() else {
+            super::egress_tests::skip("no trusted in-jail helper is installed");
+            return;
+        };
         use std::ffi::OsStr;
         use std::os::unix::fs::PermissionsExt;
 
@@ -2694,6 +3471,14 @@ mod tests {
             limits: GovernedProcessJailLimits::default(),
             egress: None,
             interpreter: None,
+            linux_helper: Some(LinuxJailHelper {
+                identity: HelperFileIdentity::of(&helper),
+                path: helper,
+                digest,
+                exact_task_ceiling: true,
+            }),
+            staging: std::sync::Mutex::new(()),
+            missing_program_for_test: false,
         };
         let snapshot = tempfile::tempdir().unwrap();
         let snapshot_root = fs::canonicalize(snapshot.path()).unwrap();
@@ -2701,7 +3486,7 @@ mod tests {
         fs::write(&executable, b"exact executable bytes").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         let command = jail
-            .linux_command_for_private_snapshot(&executable, &snapshot_root)
+            .linux_command_for_private_snapshot(&executable, &snapshot_root, Some(9))
             .unwrap();
         let args = command.get_args().collect::<Vec<_>>();
         assert!(args
