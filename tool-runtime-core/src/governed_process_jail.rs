@@ -976,8 +976,9 @@ impl GovernedProcessJail {
         }
     }
 
-    /// Linux: the jail runs the in-jail helper, which reports a refusal or a
-    /// failure before exec through the runner's exec-status pipe.
+    /// Linux: the jail runs the in-jail helper, which reports a refusal, or
+    /// that it is dispatching the command, through the runner's exec-status
+    /// channel.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn uses_exec_status(&self) -> bool {
         self.linux_helper.is_some()
@@ -1005,10 +1006,11 @@ impl GovernedProcessJail {
         }
     }
 
-    /// `status_fd` (Linux): the write end of the runner's exec-status pipe,
-    /// passed to the in-jail helper. The helper writes one byte there only
-    /// if it refuses or fails before exec, and marks it close-on-exec before
-    /// a successful exec, so the command never holds it.
+    /// `status_fd` (Linux): the helper's end of the runner's exec-status
+    /// channel, passed to the in-jail helper. Its first byte there is a
+    /// refusal only if the command never ran; before exec it marks the
+    /// descriptor close-on-exec, so the command never holds it, and writes
+    /// the dispatching byte.
     pub(crate) fn command(
         &self,
         executable: &GovernedExecutableSnapshot,
@@ -2118,7 +2120,7 @@ fn profile_identity(
 /// applies (`None`: exec only, no user namespace of the jail's own).
 struct LinuxJailExec<'a> {
     helper: &'a Path,
-    /// The inherited write end of the runner's exec-status pipe.
+    /// The inherited helper end of the runner's exec-status channel.
     status_fd: OsString,
     /// `(max_tasks + helper tasks, host user-namespace inode)`.
     task_ceiling: Option<(OsString, OsString)>,

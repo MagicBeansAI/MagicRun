@@ -324,19 +324,28 @@ flowchart LR
   soft and hard to `max_tasks` plus the machinery in the namespace
   (bubblewrap's init; plus the forwarder when brokered) and execs. In the
   brokered mode it execs the forwarder role, which spawns the command.
-- **Out-of-band exec status.** The shim's third argument is the write end of
-  a pipe the batch runner creates (both ends close-on-exec; only the forked
-  bubblewrap clears it on its copy; the runner closes its write end after
-  spawn). bubblewrap's in-jail init closes inherited descriptors, so only the
-  shim and the outer monitor, outside the jail's pid namespace, hold it. The
-  shim writes one byte (`JAIL_EXEC_REFUSED`) only if the command never ran:
-  a refused ceiling, a failed `setrlimit` or a failed exec. Before a
-  successful exec it marks the descriptor close-on-exec, so the command never
-  holds it. After the launcher exits the runner reads the pipe: the byte
-  means `GovernedBatchProcessErrorCode::JailHelperRefused`, not dispatched;
-  no byte means the command ran, whatever it printed or exited with. Nothing
-  the command does can report a refusal (an earlier stderr-marker design
-  could be forged after real side effects and was never released).
+- **Out-of-band exec status.** The shim's third argument is one end of a
+  Unix socket pair the batch runner creates (both ends close-on-exec and
+  non-blocking; only the forked bubblewrap clears close-on-exec on its copy;
+  the runner closes that end after spawn and shuts down sending on its own).
+  Besides the shim and the outer monitor, bubblewrap's in-jail init (pid 1,
+  without `--as-pid-1`) still holds it briefly after forking the shim, and in
+  an unprivileged user namespace it is the jail's UID and dumpable, so a
+  racing jailed command could reach it through pid 1. The first byte
+  therefore decides. The shim writes `JAIL_EXEC_REFUSED` first only if the
+  command never ran (a refused ceiling, a failed `setrlimit`); otherwise it
+  marks the descriptor close-on-exec, so the command never holds it, and
+  writes `JAIL_EXEC_DISPATCHING` immediately before exec. Nothing in the jail
+  runs before that first byte, so any forged byte comes second. A socket
+  rather than a pipe, because `/proc/1/fd/N` can reopen a pipe's read end
+  and consume the first byte, but cannot open a socket. After the launcher
+  exits the runner reads what is available, without blocking: a first
+  `JAIL_EXEC_REFUSED` means `GovernedBatchProcessErrorCode::JailHelperRefused`,
+  not dispatched; the dispatching byte first, any later bytes, or no byte
+  mean dispatched, whatever the command printed or exited with. A failed
+  exec writes the refusal byte after the dispatching byte and so counts,
+  conservatively, as dispatched (exit 126). (An earlier stderr-marker design
+  could be forged after real side effects and was never released.)
 - **Build and launch checks.** A Linux jail without the helper fails to build
   with `JailHelperUnavailable` (brokered: `EgressForwarderUnavailable`). An
   exact ceiling is claimed only if the inherited hard `RLIMIT_NPROC` admits
@@ -386,13 +395,16 @@ flowchart LR
   Killing the launcher's group still tears the jail down (the init dies with
   its parent, and the pid namespace with it). macOS also counts threads
   (`PROC_PIDTASKINFO`). Known limits: each sample re-reads `/proc` whole (a
-  process forked between two reads is seen next sample), and directory
-  identity re-reads `/proc/self/mountinfo` on every check; neither is cached.
+  process forked between two reads is seen next sample), and taking a
+  directory identity reads `/proc/self/mountinfo`; it is not cached.
 - **Directory identity.** Birth time is part of a working directory's
   identity on Linux only (inode numbers are reused at once), and not on
-  overlayfs (or `fuse-overlayfs`), where copy-up changes it; it is compared
-  only when both samples have it. macOS leaves it out: `touch -t` to an
-  earlier time moves APFS birth time.
+  overlayfs (or `fuse-overlayfs`, or when mountinfo is unreadable), where
+  copy-up changes it. Whether it applies is decided once, when the identity
+  is taken. Where it was recorded, every revalidation reads the current
+  birth time directly (no new overlay probe: the device already matched) and
+  a missing or different one is a changed directory (fail closed). macOS
+  leaves it out: `touch -t` to an earlier time moves APFS birth time.
 
 ## Declared login prompts
 

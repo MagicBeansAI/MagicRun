@@ -149,9 +149,9 @@ pub enum GovernedBatchProcessErrorCode {
     /// The jail's pinned interpreter is no longer trusted or changed its
     /// bytes; nothing was dispatched.
     InterpreterUnavailable,
-    /// Linux: the in-jail helper reported through its exec-status pipe that
-    /// the command never ran (it refused the task ceiling, or failed before
-    /// exec).
+    /// Linux: the in-jail helper reported, as the first byte on its
+    /// exec-status channel, that the command never ran (it refused the task
+    /// ceiling, or failed before dispatching it).
     JailHelperRefused,
     StreamUnavailable,
     StreamWriteFailed,
@@ -447,8 +447,9 @@ impl GovernedBatchExecutor {
                 Zeroizing::new(Vec::new()),
             ));
         }
-        // Linux: the in-jail helper's out-of-band report. Only the helper,
-        // before the command exists, can write to it.
+        // Linux: the in-jail helper's out-of-band report. Only its first
+        // byte counts, and only the helper, before the command exists, can
+        // write that one.
         #[cfg(target_os = "linux")]
         let mut exec_status = match process.jail.as_ref() {
             Some(jail) if jail.uses_exec_status() => {
@@ -466,7 +467,8 @@ impl GovernedBatchExecutor {
             #[cfg(target_os = "linux")]
             exec_status.as_mut(),
         )?;
-        // The helper refused, or failed before exec: the command never ran.
+        // The helper refused before dispatching: the command never ran. (A
+        // failed exec after the dispatching byte counts as dispatched.)
         // Its exit status and output are not consulted, so nothing the
         // command prints or returns can produce this outcome.
         #[cfg(target_os = "linux")]
@@ -615,8 +617,8 @@ fn execute_spawned(
                 if let Some(limits) = jail_limits {
                     apply_jail_rlimits(limits)?;
                 }
-                // Only this child (bubblewrap) inherits the status pipe's
-                // write end; everywhere else it stays close-on-exec.
+                // Only this child (bubblewrap) inherits the status channel's
+                // helper end; everywhere else it stays close-on-exec.
                 #[cfg(target_os = "linux")]
                 if let Some(fd) = status_fd {
                     if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
@@ -1690,16 +1692,25 @@ struct OwnedGroupUsage {
     memory_bytes: u64,
 }
 
-/// Linux: the runner's side of the in-jail helper's exec-status pipe. Both
-/// ends are created close-on-exec and non-blocking; only the forked launcher
-/// clears close-on-exec on its copy of the write end. The helper writes
-/// `JAIL_EXEC_REFUSED` there only if the command never ran, and marks it
-/// close-on-exec before a successful exec.
+/// Linux: the runner's side of the in-jail helper's exec-status channel, a
+/// Unix socket pair rather than a pipe: `/proc/<pid>/fd/N` cannot open a
+/// socket, whereas a pipe reopened there read-only would let a jailed
+/// command consume the helper's first byte. Both ends are created
+/// close-on-exec and non-blocking; only the forked launcher clears
+/// close-on-exec on its copy of the helper's end. The helper writes
+/// `JAIL_EXEC_REFUSED` first only if the command never ran, and
+/// `JAIL_EXEC_DISPATCHING` first, after marking its end close-on-exec, just
+/// before exec. Only the first byte counts.
 #[cfg(target_os = "linux")]
 struct JailExecStatus {
     read: std::os::fd::OwnedFd,
     write: Option<std::os::fd::OwnedFd>,
 }
+
+/// Bytes of the exec-status report the runner reads after the launcher
+/// exits; only the first decides.
+#[cfg(target_os = "linux")]
+const JAIL_EXEC_REPORT_BYTES: usize = 64;
 
 #[cfg(target_os = "linux")]
 impl JailExecStatus {
@@ -1707,12 +1718,25 @@ impl JailExecStatus {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
         let mut fds = [0; 2];
-        // SAFETY: `pipe2` writes two descriptors into the live array.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        // SAFETY: `socketpair` writes two descriptors into the live array.
+        if unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                0,
+                fds.as_mut_ptr(),
+            )
+        } != 0
+        {
             return None;
         }
         // SAFETY: both descriptors are fresh and owned by nothing else.
         let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // The runner only reads; nothing it holds sends to the helper's end.
+        // SAFETY: `shutdown` on a socket this struct owns.
+        if unsafe { libc::shutdown(read.as_raw_fd(), libc::SHUT_WR) } != 0 {
+            return None;
+        }
         // Never 0-2, which the child's stdio setup overwrites.
         let write = if write.as_raw_fd() < 3 {
             // SAFETY: duplicates a live descriptor, close-on-exec, at >= 3.
@@ -1741,15 +1765,33 @@ impl JailExecStatus {
         self.write = None;
     }
 
-    /// Read after the launcher has exited: the refusal byte, or nothing.
+    /// Read after the launcher has exited, without blocking: whatever is
+    /// available, decided by its first byte alone. A refusal only if that
+    /// byte is `JAIL_EXEC_REFUSED`; the dispatching byte first, or nothing,
+    /// means the command was dispatched.
     fn refused(&self) -> bool {
         use std::os::fd::AsRawFd;
 
-        let mut byte = [0_u8; 1];
-        // SAFETY: reads at most one byte into the live buffer from the
-        // non-blocking read end this struct owns.
-        let read = unsafe { libc::read(self.read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
-        read == 1 && byte[0] == crate::governed_process_jail::egress_forwarder::JAIL_EXEC_REFUSED
+        let mut report = [0_u8; JAIL_EXEC_REPORT_BYTES];
+        let mut filled = 0;
+        while filled < report.len() {
+            // SAFETY: reads into the live remainder of the buffer from the
+            // non-blocking read end this struct owns.
+            let read = unsafe {
+                libc::read(
+                    self.read.as_raw_fd(),
+                    report[filled..].as_mut_ptr().cast(),
+                    report.len() - filled,
+                )
+            };
+            match usize::try_from(read) {
+                Ok(0) => break,
+                Ok(count) => filled += count,
+                Err(_) if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {},
+                Err(_) => break,
+            }
+        }
+        crate::governed_process_jail::egress_forwarder::jail_exec_report_refused(&report[..filled])
     }
 }
 
@@ -2100,6 +2142,42 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// Linux: the runner reads the whole available report and decides on its
+    /// first byte, so a refusal byte after the dispatching byte is ignored.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_runner_decides_on_the_first_exec_status_byte() {
+        use crate::governed_process_jail::egress_forwarder::{
+            JAIL_EXEC_DISPATCHING, JAIL_EXEC_REFUSED,
+        };
+
+        let report = |bytes: &[u8]| {
+            let mut status = JailExecStatus::new().unwrap();
+            let fd = status.write_fd().unwrap();
+            assert!(fd >= 3);
+            for byte in bytes {
+                // SAFETY: writes one byte from a live buffer to the write end
+                // `status` still owns.
+                assert_eq!(unsafe { libc::write(fd, (byte as *const u8).cast(), 1) }, 1);
+            }
+            status.close_write();
+            status.refused()
+        };
+        assert!(report(&[JAIL_EXEC_REFUSED]));
+        assert!(report(&[JAIL_EXEC_REFUSED, JAIL_EXEC_DISPATCHING]));
+        assert!(!report(&[]));
+        assert!(!report(&[JAIL_EXEC_DISPATCHING]));
+        assert!(!report(&[JAIL_EXEC_DISPATCHING, JAIL_EXEC_REFUSED]));
+        let mut forged = vec![JAIL_EXEC_DISPATCHING];
+        forged.extend([JAIL_EXEC_REFUSED; 200]);
+        assert!(!report(&forged));
+        // The write end stays open (a descriptor pid 1 still holds): still
+        // no blocking read.
+        let status = JailExecStatus::new().unwrap();
+        assert!(!status.refused());
+    }
+
     use crate::{
         credential_injection::{ChildEnvironmentBaseline, ChildEnvironmentVariable},
         credential_materialization::ChildEnvironmentValues,

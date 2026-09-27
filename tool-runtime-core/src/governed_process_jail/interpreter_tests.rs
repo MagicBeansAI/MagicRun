@@ -1278,10 +1278,55 @@ mod linux {
         assert_eq!(run.exit_code, Some(126));
     }
 
-    /// A real refusal (here: the helper's exec fails) reaches the runner out
-    /// of band as `JailHelperRefused`, not dispatched.
+    /// A command that reaches the jail init's descriptors through `/proc/1`
+    /// cannot forge a refusal either: the status channel is a socket, which
+    /// `/proc/1/fd/N` cannot open (so the helper's first byte cannot be read
+    /// away), and a refusal byte after the helper's dispatching byte does
+    /// not count.
     #[test]
-    fn a_helper_failure_before_exec_is_a_jail_error() {
+    fn a_refusal_forged_through_the_jail_init_is_dispatched() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(jail) = strict_jail_with(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let script = Script::new(
+            "import os, time\n\
+             deadline = time.monotonic() + 0.5\n\
+             while time.monotonic() < deadline:\n\
+             \x20   try:\n\
+             \x20       fds = [fd for fd in os.listdir('/proc/1/fd') if int(fd) > 2]\n\
+             \x20   except OSError:\n\
+             \x20       break\n\
+             \x20   for fd in fds:\n\
+             \x20       for flags in (os.O_RDONLY, os.O_WRONLY):\n\
+             \x20           try:\n\
+             \x20               f = os.open('/proc/1/fd/' + fd, flags | os.O_NONBLOCK)\n\
+             \x20           except OSError:\n\
+             \x20               continue\n\
+             \x20           try:\n\
+             \x20               if flags == os.O_RDONLY:\n\
+             \x20                   os.read(f, 64)\n\
+             \x20               else:\n\
+             \x20                   os.write(f, b'R' * 64)\n\
+             \x20           except OSError:\n\
+             \x20               pass\n\
+             \x20           finally:\n\
+             \x20               os.close(f)\n\
+             print('forged')\n",
+        );
+        let run = script.run(jail, &[]);
+        assert_eq!(run.terminal, GovernedExecutionTerminal::Success, "stderr={}", run.stderr);
+        assert_eq!(run.stdout.trim(), "forged");
+    }
+
+    /// The helper's exec fails after it wrote the dispatching byte: its
+    /// later refusal byte does not count, so the run is conservatively
+    /// dispatched (a non-zero exit), never `JailHelperRefused`. Refusals
+    /// before dispatch are covered by the shim's own tests.
+    #[test]
+    fn a_failed_exec_after_dispatching_is_dispatched() {
         let _budget = JAIL_PROCESS_BUDGET
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1293,13 +1338,10 @@ mod linux {
             },
         };
         jail.missing_program_for_test = true;
-        let result = try_run_in_jail(jail, "/usr/bin:/bin", "true", &[], &[], None);
-        assert_eq!(
-            result.err(),
-            Some(super::super::egress_tests::JailRunError::Batch(
-                crate::governed_batch_process::GovernedBatchProcessErrorCode::JailHelperRefused
-            ))
-        );
+        let run = try_run_in_jail(jail, "/usr/bin:/bin", "true", &[], &[], None)
+            .unwrap_or_else(|error| panic!("expected a dispatched run, got {error:?}"));
+        assert_eq!(run.terminal, GovernedExecutionTerminal::NonZeroExit);
+        assert_eq!(run.exit_code, Some(126));
     }
 
     /// A process that leaves the jail's process group and session is still

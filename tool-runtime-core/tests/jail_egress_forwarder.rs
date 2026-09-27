@@ -481,9 +481,10 @@ fn the_minimum_descriptor_budget_serves_concurrent_clients_in_turn() {
     assert!(cpu < Duration::from_millis(800), "used {cpu:?} of CPU");
 }
 
-/// Run the exec shim with a fresh status pipe as `<status-fd>`, like the
-/// batch runner: only the shim inherits the write end; the parent closes its
-/// copy after spawn and reads the pipe after exit.
+/// Run the exec shim with a fresh status pipe as `<status-fd>` (the shim
+/// writes to a pipe as to the runner's socket pair): only the shim inherits
+/// the write end; the parent closes its copy after spawn and reads the pipe
+/// after exit.
 fn exec_shim(tasks: &str, namespace: &str, program: &[&str]) -> (Output, Vec<u8>, i32) {
     use std::os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -530,24 +531,33 @@ fn exec_shim(tasks: &str, namespace: &str, program: &[&str]) -> (Output, Vec<u8>
 }
 
 /// The exec shim without a ceiling only execs: same exit status and output,
-/// nothing on the status pipe, and the program does not hold the pipe.
+/// only the dispatching byte on the status channel, and the program does not
+/// hold the channel.
 #[test]
 fn the_exec_shim_without_a_ceiling_only_execs() {
     let (output, status, _) = exec_shim("-", "-", &["/bin/sh", "-c", "echo ran; exit 7"]);
     assert_eq!(output.status.code(), Some(7));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "ran\n");
     assert!(output.stderr.is_empty());
-    assert!(status.is_empty(), "{status:?}");
+    assert_eq!(status, [DISPATCHING], "{status:?}");
     let (output, status, fd) = exec_shim("-", "-", &["/bin/ls", "/dev/fd/"]);
     assert_eq!(output.status.code(), Some(0));
     let open = String::from_utf8_lossy(&output.stdout);
     assert!(!open.split_whitespace().any(|entry| entry == fd.to_string()), "fd {fd} leaked: {open}");
-    assert!(status.is_empty());
+    assert_eq!(status, [DISPATCHING]);
+}
+
+const DISPATCHING: u8 =
+    tool_runtime_core::governed_process_jail::egress_forwarder::JAIL_EXEC_DISPATCHING;
+
+fn crate_refused(report: &[u8]) -> bool {
+    tool_runtime_core::governed_process_jail::egress_forwarder::jail_exec_report_refused(report)
 }
 
 /// A requested ceiling outside a user namespace of the jail's own would
-/// count every task of the UID on the host: the shim refuses, reports it on
-/// the status pipe, and runs nothing. So does a failed exec.
+/// count every task of the UID on the host: the shim refuses, reports it as
+/// the status channel's first byte, and runs nothing. A failed exec reports
+/// the refusal only after the dispatching byte, so it counts as dispatched.
 #[test]
 fn the_exec_shim_reports_a_refusal_on_the_status_pipe() {
     let host = std::fs::read_link("/proc/self/ns/user")
@@ -565,15 +575,18 @@ fn the_exec_shim_reports_a_refusal_on_the_status_pipe() {
     let (output, status, _) = exec_shim("64", &host, &["/usr/bin/touch", path.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(126));
     assert_eq!(status, refused);
+    assert!(crate_refused(&status));
     assert!(output.stdout.is_empty() && output.stderr.is_empty());
     assert!(!path.exists());
     let (output, status, _) = exec_shim("-", "-", &["/nonexistent/program"]);
     assert_eq!(output.status.code(), Some(126));
-    assert_eq!(status, refused);
+    assert_eq!(status, [DISPATCHING, refused[0]]);
+    assert!(!crate_refused(&status));
     // A program that exits 126 by itself is not a refusal.
     let (output, status, _) = exec_shim("-", "-", &["/bin/sh", "-c", "exit 126"]);
     assert_eq!(output.status.code(), Some(126));
-    assert!(status.is_empty());
+    assert_eq!(status, [DISPATCHING]);
+    assert!(!crate_refused(&status));
     // Malformed (no status descriptor): refused before anything runs.
     let output = Command::new(FORWARDER)
         .args(["--magicrun-jail-exec-v1", "64", "-", "--", "/usr/bin/touch", path.to_str().unwrap()])
@@ -596,7 +609,7 @@ fn the_exec_shim_sets_the_task_ceiling_before_exec() {
     // `/bin/cat` reads its own limits; dash (Ubuntu's /bin/sh) has no `ulimit -u`.
     let (output, status, _) = exec_shim("4242", "1", &["/bin/cat", "/proc/self/limits"]);
     assert_eq!(output.status.code(), Some(0), "stderr={}", String::from_utf8_lossy(&output.stderr));
-    assert!(status.is_empty());
+    assert_eq!(status, [DISPATCHING]);
     let limits = String::from_utf8_lossy(&output.stdout);
     let processes = limits
         .lines()

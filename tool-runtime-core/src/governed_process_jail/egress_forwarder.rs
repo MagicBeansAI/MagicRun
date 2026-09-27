@@ -37,14 +37,26 @@
 //! UID on the host, so the shim refuses rather than apply a meaningless or
 //! starving bound. With `- -` it only execs.
 //!
-//! `<status-fd>` is the inherited write end of the runner's exec-status pipe.
-//! On a refusal, or any failure before the program runs (`setrlimit`, exec),
-//! the shim writes [`JAIL_EXEC_REFUSED`] there and exits 126. Before a
-//! successful exec it marks the descriptor close-on-exec, so the program
-//! never holds it: nothing the program does can report a refusal. (bubblewrap
-//! closes inherited descriptors in its in-jail init; only the shim and the
-//! outer monitor, outside the jail's pid namespace, hold it.) It never forks
-//! and never writes to stdio.
+//! `<status-fd>` is the inherited write end of the runner's exec-status
+//! channel (a socket pair). The first byte on it decides the outcome. On a
+//! refusal, or any failure before the program is dispatched (`setrlimit`,
+//! marking the descriptor close-on-exec), the shim writes
+//! [`JAIL_EXEC_REFUSED`] there first and exits 126. Otherwise it marks the
+//! descriptor close-on-exec, so the program never holds it, and writes
+//! [`JAIL_EXEC_DISPATCHING`] immediately before `exec`. If `exec` then fails
+//! it writes [`JAIL_EXEC_REFUSED`] too, but second: the runner treats that
+//! run, conservatively, as dispatched. It never forks and never writes to
+//! stdio.
+//!
+//! bubblewrap's in-jail init (pid 1, outside `--as-pid-1`) closes the
+//! inherited descriptors it does not need, but still holds this one briefly
+//! after it forks the shim, and in an unprivileged user namespace it is the
+//! jail's UID and dumpable. A jailed command could therefore reach the
+//! descriptor through pid 1 (`pidfd_getfd`; `/proc/1/fd/N` cannot open a
+//! socket, unlike a pipe, whose read end it could open to consume the first
+//! byte). Nothing inside the jail runs before the shim's first byte, so
+//! whatever such a command writes comes second and cannot turn a dispatched
+//! run into a refusal.
 
 use std::{ffi::OsString, path::PathBuf};
 
@@ -52,12 +64,24 @@ use std::{ffi::OsString, path::PathBuf};
 pub const FORWARDER_EXIT_USAGE: i32 = 125;
 /// Exit status when the child cannot be started.
 pub const FORWARDER_EXIT_SPAWN: i32 = 127;
-/// Exec shim: exit status after a refusal or a failure before exec. Only the
-/// status pipe, never this code, tells the runner that nothing ran.
+/// Exec shim: exit status after a refusal or a failed exec. Only the status
+/// channel's first byte, never this code, tells the runner that nothing ran.
 pub const JAIL_EXEC_EXIT_REFUSED: i32 = 126;
-/// The byte the exec shim writes to the status pipe when the program never
-/// ran.
+/// The byte the exec shim writes to the status channel when the program
+/// never ran. It means a refusal only as the channel's first byte.
 pub const JAIL_EXEC_REFUSED: u8 = b'R';
+/// The byte the exec shim writes to the status channel immediately before
+/// `exec`: from then on the run counts as dispatched, whatever follows.
+pub const JAIL_EXEC_DISPATCHING: u8 = b'D';
+
+/// Whether an exec-status report (every byte the runner could read, in
+/// order) means the program never ran: only if its first byte is
+/// [`JAIL_EXEC_REFUSED`]. [`JAIL_EXEC_DISPATCHING`] first, or no byte at all,
+/// means dispatched; later bytes never change the outcome, so nothing written
+/// after the shim's first byte can forge a refusal.
+pub fn jail_exec_report_refused(report: &[u8]) -> bool {
+    report.first() == Some(&JAIL_EXEC_REFUSED)
+}
 /// argv marker of the in-jail exec-shim protocol.
 pub const GOVERNED_JAIL_EXEC_PROTOCOL_V1: &str = "--magicrun-jail-exec-v1";
 /// Concurrent relayed connections; further connections wait in the listen
@@ -148,7 +172,7 @@ pub struct JailExecInvocation {
     /// `RLIMIT_NPROC` to apply, and the host user-namespace inode the shim
     /// must differ from; `None` for `- -` (exec only).
     pub task_ceiling: Option<(u64, u64)>,
-    /// Write end of the runner's exec-status pipe (at least 3).
+    /// Write end of the runner's exec-status channel (at least 3).
     pub status_fd: i32,
     pub program: OsString,
     pub arguments: Vec<OsString>,
@@ -248,12 +272,23 @@ mod unix {
         use std::os::unix::process::CommandExt;
 
         let status = invocation.status_fd;
-        // Report on the status pipe that the program never ran.
-        let refuse = || {
-            let byte = [super::JAIL_EXEC_REFUSED];
+        // Write one byte to the status channel; `true` once it is written.
+        let report = |byte: u8| loop {
+            let byte = [byte];
             // SAFETY: writes one byte from a live buffer to a descriptor
             // number; a closed or foreign number fails harmlessly.
-            let _ = unsafe { libc::write(status, byte.as_ptr().cast(), 1) };
+            let written = unsafe { libc::write(status, byte.as_ptr().cast(), 1) };
+            if written == 1 {
+                break true;
+            }
+            if written < 0 && io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            break false;
+        };
+        // Report that the program never ran. Decisive only as the first byte.
+        let refuse = || {
+            let _ = report(super::JAIL_EXEC_REFUSED);
             super::JAIL_EXEC_EXIT_REFUSED
         };
         // SAFETY: `F_GETFD` only queries the descriptor number.
@@ -285,14 +320,22 @@ mod unix {
                 return refuse();
             }
         }
-        // The program must never hold the status pipe.
+        // The program must never hold the status channel.
         // SAFETY: `F_SETFD` on the inherited descriptor checked above.
         if unsafe { libc::fcntl(status, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
             return refuse();
         }
+        // The first byte decides: from here on the run counts as dispatched.
+        // Nothing in the jail has run yet, so no other writer can be first.
+        // If even this byte cannot be written, try to refuse instead: the
+        // program has not run.
+        if !report(super::JAIL_EXEC_DISPATCHING) {
+            return refuse();
+        }
         // `exec` replaces this process and returns only on failure (the
         // descriptor is then still open). No PATH search: the program is
-        // absolute.
+        // absolute. A failed exec still writes the refusal byte, but second:
+        // the runner conservatively counts the run as dispatched.
         let _error = Command::new(&invocation.program)
             .args(&invocation.arguments)
             .exec();
@@ -811,6 +854,22 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    /// Only the first byte decides: a refusal written after the dispatching
+    /// byte (a failed exec, or a forger reaching the descriptor through the
+    /// jail's init) is still dispatched.
+    #[test]
+    fn only_a_first_refusal_byte_is_a_refusal() {
+        let (refused, dispatching) = (JAIL_EXEC_REFUSED, JAIL_EXEC_DISPATCHING);
+        assert!(jail_exec_report_refused(&[refused]));
+        assert!(jail_exec_report_refused(&[refused, dispatching]));
+        assert!(jail_exec_report_refused(&[refused, refused]));
+        assert!(!jail_exec_report_refused(&[]));
+        assert!(!jail_exec_report_refused(&[dispatching]));
+        assert!(!jail_exec_report_refused(&[dispatching, refused]));
+        assert!(!jail_exec_report_refused(&[dispatching, refused, refused]));
+        assert!(!jail_exec_report_refused(b"x"));
     }
 
     #[test]

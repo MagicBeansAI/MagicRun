@@ -59,14 +59,24 @@ _Current development version: `0.1.78`._
   `RLIMIT_NPROC`); otherwise the shim only execs and `process_ceiling` is
   `false`. The shim also refuses a ceiling when it runs as UID 0, and claims
   none unless the inherited hard `RLIMIT_NPROC` admits it.
-- **Out-of-band refusal.** The shim reports a refusal, or any failure before
-  the command runs (`setrlimit`, exec), by writing one byte to an exec-status
-  pipe the runner passes as its third argument; it marks the pipe
-  close-on-exec before a successful exec, so the command never holds it. Only
-  that byte maps to the new `GovernedBatchProcessErrorCode::JailHelperRefused`
-  (not dispatched); the command's exit status and output are never
-  consulted. (A pre-release stderr-marker scheme could be forged by a command
-  after real side effects, turning them into "not dispatched".) The ceiling's machinery allowance is per mode (bubblewrap's
+- **Out-of-band refusal.** The runner passes the shim, as its third
+  argument, one end of an exec-status Unix socket pair, and only the first
+  byte there counts. The shim writes `JAIL_EXEC_REFUSED` first if the
+  command never ran (a refused ceiling, a failed `setrlimit`); otherwise it
+  marks its end close-on-exec, so the command never holds it, and writes
+  `JAIL_EXEC_DISPATCHING` just before exec. Only a first refusal byte maps to
+  the new `GovernedBatchProcessErrorCode::JailHelperRefused` (not
+  dispatched); the dispatching byte first, later bytes or no byte mean
+  dispatched, and the command's exit status and output are never consulted.
+  bubblewrap's in-jail init briefly still holds the descriptor and is
+  reachable by a same-UID jailed command, but nothing in the jail runs before
+  the shim's first byte, and a socket (unlike a pipe) cannot be reopened
+  through `/proc/1/fd` to read that byte away. A failed exec writes the
+  refusal byte second and so counts, conservatively, as dispatched (exit
+  126). New `jail_exec_report_refused` and `JAIL_EXEC_DISPATCHING` in
+  `governed_process_jail::egress_forwarder`. (A pre-release stderr-marker
+  scheme could be forged by a command after real side effects, turning them
+  into "not dispatched".) The ceiling's machinery allowance is per mode (bubblewrap's
   init, plus the forwarder when brokered); the watchdog allows the same plus
   the launcher on Linux, and nothing on macOS. A helper whose device, inode,
   size or times changed since the jail was built is refused at launch.
@@ -80,8 +90,11 @@ _Current development version: `0.1.78`._
   pin exact revisions.
 - **Watchdog CPU (Linux)** also counts reaped children (`cutime`,
   `cstime`) of jail members; a malformed `/proc` sample fails the observation
-  only for a jail member. Directory birth time is compared only when both
-  samples have one, and `fuse-overlayfs` is treated like overlayfs.
+  only for a jail member. Whether directory birth time applies is decided
+  once, when the identity is taken (not on overlayfs, `fuse-overlayfs`, or
+  when mountinfo is unreadable); where it was recorded, revalidation reads
+  the current birth time directly and a missing or different one is a
+  changed directory (fail closed, as before this release).
 - **Known limit.** The helper is re-checked by path metadata before launch,
   not bound by descriptor (`bwrap --ro-bind-fd`).
 - **Watchdog escape (Linux).** The watchdog found jail members by process
