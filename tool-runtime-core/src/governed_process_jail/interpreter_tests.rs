@@ -1135,8 +1135,12 @@ mod linux {
     }
 
     /// Threads count against the task ceiling. With a user namespace of the
-    /// jail's own, the kernel stops thread creation at the ceiling; without
-    /// one, the watchdog ends the run.
+    /// jail's own, the kernel stops thread creation at the ceiling (`EAGAIN`,
+    /// told apart from memory exhaustion by a `fork` probe at the limit);
+    /// without one, the watchdog ends the run while the threads are held.
+    /// Small stacks and one malloc arena keep the address-space ceiling out
+    /// of the picture: with glibc's defaults, memory ran out after 11-14
+    /// threads, well before the ceiling.
     #[test]
     fn a_thread_bomb_is_bounded() {
         let _budget = JAIL_PROCESS_BUDGET
@@ -1151,32 +1155,53 @@ mod linux {
         };
         let exact = jail.guarantees().process_ceiling;
         let script = Script::new(
-            "import json, threading, time\n\
-             stop = threading.Event()\n\
-             threads = []\n\
+            "import errno, json, os, sys, threading, time\n\
+             threading.stack_size(64 * 1024)\n\
+             hold = threading.Event()\n\
+             threads = 0\n\
              out = {}\n\
              try:\n\
-             \x20   while len(threads) < 200:\n\
-             \x20       thread = threading.Thread(target=stop.wait)\n\
-             \x20       thread.start()\n\
-             \x20       threads.append(thread)\n\
+             \x20   while threads < 200:\n\
+             \x20       threading.Thread(target=hold.wait, daemon=True).start()\n\
+             \x20       threads += 1\n\
              except RuntimeError as error:\n\
              \x20   out['error'] = str(error)\n\
-             out['threads'] = len(threads)\n\
-             time.sleep(2)\n\
-             stop.set()\n\
-             for thread in threads:\n\
-             \x20   thread.join()\n\
-             print(json.dumps(out))\n",
+             out['threads'] = threads\n\
+             try:\n\
+             \x20   pid = os.fork()\n\
+             \x20   if pid == 0:\n\
+             \x20       os._exit(0)\n\
+             \x20   os.waitpid(pid, 0)\n\
+             \x20   out['fork'] = 'ok'\n\
+             except OSError as error:\n\
+             \x20   out['fork'] = errno.errorcode.get(error.errno, str(error.errno))\n\
+             time.sleep(3)\n\
+             print(json.dumps(out))\n\
+             sys.stdout.flush()\n\
+             os._exit(0)\n",
         );
-        let run = script.run(jail, &[]);
+        // One malloc arena: glibc otherwise reserves 64 MiB of address space
+        // per thread's arena, which exhausted the address-space ceiling
+        // after 11-14 threads, before the task ceiling was reached.
+        let run = try_run_in_jail(
+            jail,
+            &script.search_path(),
+            SCRIPT_NAME,
+            &[],
+            &[("MALLOC_ARENA_MAX", "1")],
+            Some(script.digest),
+        )
+        .unwrap();
         if exact {
             let output = json(&run);
             // The namespace holds bubblewrap's init and the interpreter's main
             // thread beside the new threads.
+            // The namespace holds bubblewrap's init and the interpreter's main
+            // thread beside the new threads: max_tasks + 2 in all.
             let threads = output["threads"].as_u64().unwrap();
-            assert!(threads <= 32 && threads >= 16, "{output}");
+            assert!((28..=32).contains(&threads), "{output}");
             assert!(output["error"].as_str().is_some(), "{output}");
+            assert_eq!(output["fork"], "EAGAIN", "the task ceiling, not memory: {output}");
         } else {
             assert_eq!(run.terminal, GovernedExecutionTerminal::ProcessLimitExceeded, "stdout={}", run.stdout);
         }

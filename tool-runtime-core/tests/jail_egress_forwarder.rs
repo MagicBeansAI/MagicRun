@@ -530,7 +530,17 @@ fn the_exec_shim_refuses_a_ceiling_in_the_host_user_namespace() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_exec_shim_sets_the_task_ceiling_before_exec() {
-    let output = exec_shim(&["4242", "1", "--", "/bin/sh", "-c", "ulimit -u; ulimit -Hu"]);
+    // `/bin/cat` reads its own limits; dash (Ubuntu's /bin/sh) has no `ulimit -u`.
+    let output = exec_shim(&["4242", "1", "--", "/bin/cat", "/proc/self/limits"]);
     assert_eq!(output.status.code(), Some(0), "stderr={}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "4242\n4242\n");
+    let limits = String::from_utf8_lossy(&output.stdout);
+    let processes = limits
+        .lines()
+        .find(|line| line.starts_with("Max processes"))
+        .expect("a Max processes line")
+        .split_whitespace()
+        .skip(2)
+        .take(2)
+        .collect::<Vec<_>>();
+    assert_eq!(processes, ["4242", "4242"], "{limits}");
 }
