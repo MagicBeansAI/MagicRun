@@ -550,6 +550,31 @@ mod linux {
 
     use super::*;
 
+    /// A system tool (snapshotted `/usr/bin/jq`, dynamically linked) runs in
+    /// the strict jail on a file staged before launch: the base library
+    /// binds are enough and staging reaches the child's `/work`.
+    #[test]
+    fn a_system_tool_reads_a_staged_input_in_the_strict_jail() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !Path::new("/usr/bin/jq").exists() {
+            skip("no /usr/bin/jq on this host");
+            return;
+        }
+        let jail = match GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) {
+            Ok(jail) => jail,
+            Err(error) => {
+                skip(&format!("no Linux strict jail on this host: {error}"));
+                return;
+            },
+        };
+        let name = jail.stage_input_file("in-data.json", br#"{"items":[1,2,3]}"#).unwrap();
+        let run = run_in_jail(jail, "jq", &[".items | length", &name]);
+        assert_eq!(run.exit_code, Some(0), "stderr={}", run.stderr);
+        assert_eq!(run.stdout.trim(), "3");
+    }
+
     struct UnixBroker {
         _directory: tempfile::TempDir,
         path: PathBuf,
