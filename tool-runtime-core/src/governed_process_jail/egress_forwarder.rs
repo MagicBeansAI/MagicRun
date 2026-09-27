@@ -23,21 +23,28 @@
 //! the first program bubblewrap runs, after the jail's namespaces exist:
 //!
 //! ```text
-//! magicrun-jail-egress-forwarder --magicrun-jail-exec-v1 <tasks|-> <host-userns|-> -- <program> [args...]
+//! magicrun-jail-egress-forwarder --magicrun-jail-exec-v1 <tasks|-> <host-userns|-> <status-fd> -- <program> [args...]
 //! ```
 //!
 //! With a task ceiling it first proves it runs in a user namespace other than
 //! the host's (`/proc/self/ns/user` differs from `<host-userns>`) and that
 //! it does not run as root (whose tasks Linux never holds to `RLIMIT_NPROC`),
-//! then sets
-//! `RLIMIT_NPROC` (soft and hard) to `<tasks>` and execs `<program>`. Linux
-//! charges `RLIMIT_NPROC` to the (user namespace, UID) pair of the forking
-//! task, so inside the jail's own new user namespace it counts only the
-//! jail's tasks, threads included: an exact per-jail bound. Outside a new
-//! user namespace the same limit would count every task of the UID on the
-//! host, so the shim refuses (exit 126) rather than apply a meaningless or
-//! starving bound. With `-` it only execs. It never forks and never writes
-//! to stdio.
+//! then sets `RLIMIT_NPROC` (soft and hard) to `<tasks>` and execs
+//! `<program>`. Linux charges `RLIMIT_NPROC` to the (user namespace, UID)
+//! pair of the forking task, so inside the jail's own new user namespace it
+//! counts only the jail's tasks, threads included: an exact per-jail bound.
+//! Outside a new user namespace the same limit would count every task of the
+//! UID on the host, so the shim refuses rather than apply a meaningless or
+//! starving bound. With `- -` it only execs.
+//!
+//! `<status-fd>` is the inherited write end of the runner's exec-status pipe.
+//! On a refusal, or any failure before the program runs (`setrlimit`, exec),
+//! the shim writes [`JAIL_EXEC_REFUSED`] there and exits 126. Before a
+//! successful exec it marks the descriptor close-on-exec, so the program
+//! never holds it: nothing the program does can report a refusal. (bubblewrap
+//! closes inherited descriptors in its in-jail init; only the shim and the
+//! outer monitor, outside the jail's pid namespace, hold it.) It never forks
+//! and never writes to stdio.
 
 use std::{ffi::OsString, path::PathBuf};
 
@@ -45,14 +52,12 @@ use std::{ffi::OsString, path::PathBuf};
 pub const FORWARDER_EXIT_USAGE: i32 = 125;
 /// Exit status when the child cannot be started.
 pub const FORWARDER_EXIT_SPAWN: i32 = 127;
-/// Exec shim: a task ceiling was requested but the shim does not run in a
-/// user namespace of its own, so no per-jail bound is possible.
-pub const JAIL_EXEC_EXIT_NO_USER_NAMESPACE: i32 = 126;
-/// The exact stderr of an exec-shim refusal. The batch runner reports a jail
-/// whose ceiling was requested, that exits 126 with exactly this stderr and
-/// no stdout, as a jail failure rather than the command's exit.
-pub const JAIL_EXEC_REFUSAL_MARKER: &str =
-    "magicrun-jail-helper: refused: no per-jail task ceiling is possible here\n";
+/// Exec shim: exit status after a refusal or a failure before exec. Only the
+/// status pipe, never this code, tells the runner that nothing ran.
+pub const JAIL_EXEC_EXIT_REFUSED: i32 = 126;
+/// The byte the exec shim writes to the status pipe when the program never
+/// ran.
+pub const JAIL_EXEC_REFUSED: u8 = b'R';
 /// argv marker of the in-jail exec-shim protocol.
 pub const GOVERNED_JAIL_EXEC_PROTOCOL_V1: &str = "--magicrun-jail-exec-v1";
 /// Concurrent relayed connections; further connections wait in the listen
@@ -143,13 +148,15 @@ pub struct JailExecInvocation {
     /// `RLIMIT_NPROC` to apply, and the host user-namespace inode the shim
     /// must differ from; `None` for `- -` (exec only).
     pub task_ceiling: Option<(u64, u64)>,
+    /// Write end of the runner's exec-status pipe (at least 3).
+    pub status_fd: i32,
     pub program: OsString,
     pub arguments: Vec<OsString>,
 }
 
 /// Parse the exec-shim argument vector after argv[0]. Anything but the
 /// exact layout is refused: both values numeric (ceiling at least 1) or both
-/// `-`, then `--` and an absolute program.
+/// `-`, a status descriptor of at least 3, then `--` and an absolute program.
 pub fn parse_exec_arguments(
     arguments: impl IntoIterator<Item = OsString>,
 ) -> Option<JailExecInvocation> {
@@ -167,6 +174,7 @@ pub fn parse_exec_arguments(
             Some((tasks, namespace))
         },
     };
+    let status_fd = arguments.next()?.to_str()?.parse::<i32>().ok().filter(|fd| *fd >= 3)?;
     if arguments.next()? != "--" {
         return None;
     }
@@ -176,6 +184,7 @@ pub fn parse_exec_arguments(
     }
     Some(JailExecInvocation {
         task_ceiling,
+        status_fd,
         program,
         arguments: arguments.collect(),
     })
@@ -238,6 +247,19 @@ mod unix {
     pub(super) fn exec_shim(invocation: &super::JailExecInvocation) -> i32 {
         use std::os::unix::process::CommandExt;
 
+        let status = invocation.status_fd;
+        // Report on the status pipe that the program never ran.
+        let refuse = || {
+            let byte = [super::JAIL_EXEC_REFUSED];
+            // SAFETY: writes one byte from a live buffer to a descriptor
+            // number; a closed or foreign number fails harmlessly.
+            let _ = unsafe { libc::write(status, byte.as_ptr().cast(), 1) };
+            super::JAIL_EXEC_EXIT_REFUSED
+        };
+        // SAFETY: `F_GETFD` only queries the descriptor number.
+        if unsafe { libc::fcntl(status, libc::F_GETFD) } < 0 {
+            return FORWARDER_EXIT_USAGE;
+        }
         if let Some((tasks, host_namespace)) = invocation.task_ceiling {
             let own = std::fs::read_link("/proc/self/ns/user")
                 .ok()
@@ -250,16 +272,9 @@ mod unix {
             // SAFETY: `getuid` has no preconditions and cannot fail.
             let root = unsafe { libc::getuid() } == 0;
             if own.is_none() || own == Some(host_namespace) || root {
-                // One fixed line, so the runner can tell the refusal from the
-                // command's own exit; nothing else is ever written.
-                let _ = std::io::Write::write_all(
-                    &mut std::io::stderr(),
-                    super::JAIL_EXEC_REFUSAL_MARKER.as_bytes(),
-                );
-                return super::JAIL_EXEC_EXIT_NO_USER_NAMESPACE;
+                return refuse();
             }
-            // The parser bounds nothing, but a ceiling beyond `rlim_t` is
-            // no bound at all; `rlim_t` is 64-bit on every supported target.
+            // `rlim_t` is 64-bit on every supported target.
             let value = tasks as libc::rlim_t;
             let limit = libc::rlimit {
                 rlim_cur: value,
@@ -267,15 +282,21 @@ mod unix {
             };
             // SAFETY: `setrlimit` reads only the live `limit`.
             if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limit) } != 0 {
-                return FORWARDER_EXIT_USAGE;
+                return refuse();
             }
         }
-        // `exec` replaces this process and returns only on failure. No PATH
-        // search: the program is absolute.
+        // The program must never hold the status pipe.
+        // SAFETY: `F_SETFD` on the inherited descriptor checked above.
+        if unsafe { libc::fcntl(status, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return refuse();
+        }
+        // `exec` replaces this process and returns only on failure (the
+        // descriptor is then still open). No PATH search: the program is
+        // absolute.
         let _error = Command::new(&invocation.program)
             .args(&invocation.arguments)
             .exec();
-        FORWARDER_EXIT_SPAWN
+        refuse()
     }
 
     pub(super) fn run(invocation: &ForwarderInvocation) -> Result<ExitStatus, i32> {
@@ -815,25 +836,30 @@ mod tests {
             "--magicrun-jail-exec-v1",
             "258",
             "4026531837",
+            "9",
             "--",
             "/app/tool",
             "--flag",
         ]))
         .unwrap();
         assert_eq!(parsed.task_ceiling, Some((258, 4026531837)));
+        assert_eq!(parsed.status_fd, 9);
         assert_eq!(parsed.program, OsString::from("/app/tool"));
         assert_eq!(parsed.arguments, args(&["--flag"]));
         let exec_only =
-            parse_exec_arguments(args(&["--magicrun-jail-exec-v1", "-", "-", "--", "/app/tool"])).unwrap();
+            parse_exec_arguments(args(&["--magicrun-jail-exec-v1", "-", "-", "3", "--", "/app/tool"])).unwrap();
         assert_eq!(exec_only.task_ceiling, None);
         for refused in [
-            &["--magicrun-jail-exec-v1", "0", "1", "--", "/app/tool"][..],
-            &["--magicrun-jail-exec-v1", "8", "-", "--", "/app/tool"],
-            &["--magicrun-jail-exec-v1", "-", "1", "--", "/app/tool"],
-            &["--magicrun-jail-exec-v1", "8", "1", "/app/tool"],
-            &["--magicrun-jail-exec-v1", "8", "1", "--", "relative"],
-            &["--magicrun-jail-exec-v1", "8", "1", "--"],
-            &["--magicrun-jail-egress-forwarder-v1", "8", "1", "--", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "0", "1", "9", "--", "/app/tool"][..],
+            &["--magicrun-jail-exec-v1", "8", "-", "9", "--", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "-", "1", "9", "--", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "8", "1", "9", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "8", "1", "9", "--", "relative"],
+            &["--magicrun-jail-exec-v1", "8", "1", "9", "--"],
+            &["--magicrun-jail-exec-v1", "8", "1", "--", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "8", "1", "2", "--", "/app/tool"],
+            &["--magicrun-jail-exec-v1", "8", "1", "x", "--", "/app/tool"],
+            &["--magicrun-jail-egress-forwarder-v1", "8", "1", "9", "--", "/app/tool"],
         ] {
             assert_eq!(parse_exec_arguments(args(refused)), None, "{refused:?}");
         }

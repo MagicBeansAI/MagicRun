@@ -117,7 +117,7 @@ struct FileIdentity {
     length: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 struct DirectoryIdentity {
     #[cfg(unix)]
     device: u64,
@@ -136,6 +136,26 @@ struct DirectoryIdentity {
     #[cfg(target_os = "linux")]
     created: Option<std::time::SystemTime>,
 }
+
+impl PartialEq for DirectoryIdentity {
+    /// Birth time is compared only when both sides have one: a sample that
+    /// could not tell (unreadable mountinfo, a filesystem without it) is not
+    /// a changed directory.
+    fn eq(&self, other: &Self) -> bool {
+        #[cfg(unix)]
+        if (self.device, self.inode, self.owner) != (other.device, other.inode, other.owner) {
+            return false;
+        }
+        #[cfg(target_os = "linux")]
+        if let (Some(mine), Some(theirs)) = (self.created, other.created) {
+            return mine == theirs;
+        }
+        let _ = other;
+        true
+    }
+}
+
+impl Eq for DirectoryIdentity {}
 
 /// Trusted workspace or output-root authority. Opening a root accepts no relative path,
 /// alias, or symlink. It is move-only and non-serializable.
@@ -1079,7 +1099,7 @@ fn on_overlayfs(device: u64) -> bool {
 }
 
 /// The mount lines whose filesystem type (first field after ` - `) is
-/// `overlay`, matched on `major:minor`.
+/// `overlay` or `fuse.fuse-overlayfs`, matched on `major:minor`.
 #[cfg(any(target_os = "linux", test))]
 fn mountinfo_has_overlay_device(mountinfo: &str, major: u32, minor: u32) -> bool {
     let device = format!("{major}:{minor}");
@@ -1087,7 +1107,8 @@ fn mountinfo_has_overlay_device(mountinfo: &str, major: u32, minor: u32) -> bool
         let mut halves = line.splitn(2, " - ");
         let head = halves.next().unwrap_or_default();
         let fstype = halves.next().and_then(|tail| tail.split_whitespace().next());
-        fstype == Some("overlay") && head.split_whitespace().nth(2) == Some(device.as_str())
+        matches!(fstype, Some("overlay" | "fuse.fuse-overlayfs"))
+            && head.split_whitespace().nth(2) == Some(device.as_str())
     })
 }
 
@@ -1276,6 +1297,8 @@ mod tests {
         assert!(!super::mountinfo_has_overlay_device(mountinfo, 0, 53));
         assert!(!super::mountinfo_has_overlay_device(mountinfo, 259, 2));
         assert!(!super::mountinfo_has_overlay_device("", 0, 52));
+        let rootless = "40 22 0:61 / /home/u/.local/share/containers/storage/overlay/x/merged rw - fuse.fuse-overlayfs fuse-overlayfs rw\n";
+        assert!(super::mountinfo_has_overlay_device(rootless, 0, 61));
     }
 
     /// macOS moves a directory's APFS birth time when its modification time

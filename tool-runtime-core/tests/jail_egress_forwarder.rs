@@ -481,30 +481,75 @@ fn the_minimum_descriptor_budget_serves_concurrent_clients_in_turn() {
     assert!(cpu < Duration::from_millis(800), "used {cpu:?} of CPU");
 }
 
-fn exec_shim(arguments: &[&str]) -> Output {
-    Command::new(FORWARDER)
+/// Run the exec shim with a fresh status pipe as `<status-fd>`, like the
+/// batch runner: only the shim inherits the write end; the parent closes its
+/// copy after spawn and reads the pipe after exit.
+fn exec_shim(tasks: &str, namespace: &str, program: &[&str]) -> (Output, Vec<u8>, i32) {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::process::CommandExt,
+    };
+
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` writes two fresh descriptors into the live array.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: both descriptors are fresh and owned by nothing else.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for fd in fds {
+        // SAFETY: flags on descriptors this test owns.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    // SAFETY: as above.
+    unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+    let status_fd = write.as_raw_fd();
+    let mut command = Command::new(FORWARDER);
+    command
         .env_clear()
         .arg("--magicrun-jail-exec-v1")
-        .args(arguments)
-        .output()
-        .unwrap()
+        .args([tasks, namespace, &status_fd.to_string(), "--"])
+        .args(program)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // SAFETY: `fcntl` is async-signal-safe and touches only the child's copy.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(status_fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().unwrap();
+    drop(write);
+    let output = child.wait_with_output().unwrap();
+    let mut status = [0_u8; 8];
+    // SAFETY: reads into the live buffer from the non-blocking read end.
+    let read_bytes = unsafe { libc::read(read.as_raw_fd(), status.as_mut_ptr().cast(), status.len()) };
+    let status = status[..usize::try_from(read_bytes).unwrap_or(0)].to_vec();
+    (output, status, status_fd)
 }
 
-/// The exec shim without a ceiling only execs: same exit status, no output
-/// of its own.
+/// The exec shim without a ceiling only execs: same exit status and output,
+/// nothing on the status pipe, and the program does not hold the pipe.
 #[test]
 fn the_exec_shim_without_a_ceiling_only_execs() {
-    let output = exec_shim(&["-", "-", "--", "/bin/sh", "-c", "echo ran; exit 7"]);
+    let (output, status, _) = exec_shim("-", "-", &["/bin/sh", "-c", "echo ran; exit 7"]);
     assert_eq!(output.status.code(), Some(7));
     assert_eq!(String::from_utf8_lossy(&output.stdout), "ran\n");
     assert!(output.stderr.is_empty());
+    assert!(status.is_empty(), "{status:?}");
+    let (output, status, fd) = exec_shim("-", "-", &["/bin/ls", "/dev/fd/"]);
+    assert_eq!(output.status.code(), Some(0));
+    let open = String::from_utf8_lossy(&output.stdout);
+    assert!(!open.split_whitespace().any(|entry| entry == fd.to_string()), "fd {fd} leaked: {open}");
+    assert!(status.is_empty());
 }
 
 /// A requested ceiling outside a user namespace of the jail's own would
-/// count every task of the UID on the host: the shim refuses (126) and runs
-/// nothing.
+/// count every task of the UID on the host: the shim refuses, reports it on
+/// the status pipe, and runs nothing. So does a failed exec.
 #[test]
-fn the_exec_shim_refuses_a_ceiling_in_the_host_user_namespace() {
+fn the_exec_shim_reports_a_refusal_on_the_status_pipe() {
     let host = std::fs::read_link("/proc/self/ns/user")
         .ok()
         .and_then(|target| {
@@ -516,16 +561,24 @@ fn the_exec_shim_refuses_a_ceiling_in_the_host_user_namespace() {
         .to_string();
     let marker = tempfile::tempdir().unwrap();
     let path = marker.path().join("ran");
-    let output = exec_shim(&["64", &host, "--", "/usr/bin/touch", path.to_str().unwrap()]);
+    let refused = [tool_runtime_core::governed_process_jail::egress_forwarder::JAIL_EXEC_REFUSED];
+    let (output, status, _) = exec_shim("64", &host, &["/usr/bin/touch", path.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(126));
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        tool_runtime_core::governed_process_jail::egress_forwarder::JAIL_EXEC_REFUSAL_MARKER
-    );
-    assert!(output.stdout.is_empty());
+    assert_eq!(status, refused);
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
     assert!(!path.exists());
-    // Malformed: refused before anything runs.
-    let output = exec_shim(&["64", "-", "--", "/usr/bin/touch", path.to_str().unwrap()]);
+    let (output, status, _) = exec_shim("-", "-", &["/nonexistent/program"]);
+    assert_eq!(output.status.code(), Some(126));
+    assert_eq!(status, refused);
+    // A program that exits 126 by itself is not a refusal.
+    let (output, status, _) = exec_shim("-", "-", &["/bin/sh", "-c", "exit 126"]);
+    assert_eq!(output.status.code(), Some(126));
+    assert!(status.is_empty());
+    // Malformed (no status descriptor): refused before anything runs.
+    let output = Command::new(FORWARDER)
+        .args(["--magicrun-jail-exec-v1", "64", "-", "--", "/usr/bin/touch", path.to_str().unwrap()])
+        .output()
+        .unwrap();
     assert_eq!(output.status.code(), Some(125));
     assert!(!path.exists());
 }
@@ -535,9 +588,15 @@ fn the_exec_shim_refuses_a_ceiling_in_the_host_user_namespace() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_exec_shim_sets_the_task_ceiling_before_exec() {
+    // SAFETY: `getuid` has no preconditions and cannot fail.
+    if unsafe { libc::getuid() } == 0 {
+        eprintln!("SKIP: the shim refuses a task ceiling for root");
+        return;
+    }
     // `/bin/cat` reads its own limits; dash (Ubuntu's /bin/sh) has no `ulimit -u`.
-    let output = exec_shim(&["4242", "1", "--", "/bin/cat", "/proc/self/limits"]);
+    let (output, status, _) = exec_shim("4242", "1", &["/bin/cat", "/proc/self/limits"]);
     assert_eq!(output.status.code(), Some(0), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert!(status.is_empty());
     let limits = String::from_utf8_lossy(&output.stdout);
     let processes = limits
         .lines()

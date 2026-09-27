@@ -32,8 +32,9 @@ fn strings(args: &[OsString]) -> Vec<&str> {
 
 /// Golden: the reviewed profile identities consumers fold into lock digests.
 /// `0.1.78` deliberately rotated the Linux values: every Linux jail now binds
-/// the trusted helper and runs through its exec shim (strict was
-/// `blake3:1fc54240…cc61a0`, brokered `blake3:3c4fcba8…e142cc`). `0.1.77` deliberately
+/// the trusted helper and runs through its exec shim, which takes the
+/// runner's exec-status descriptor (strict was `blake3:1fc54240…cc61a0`,
+/// brokered `blake3:3c4fcba8…e142cc` in `0.1.77`). `0.1.77` deliberately
 /// rotated both macOS values by adding
 /// `(deny file-map-executable (subpath "<workdir>"))` to the strict profile:
 /// strict was `blake3:e783cb6b…020d31`, brokered `blake3:89b6c07b…2f09f6`.
@@ -44,8 +45,8 @@ fn profile_identities_match_the_reviewed_goldens() {
     for (platform, network, expected) in [
         (MacosSandboxExec, Denied, "blake3:8a06b6cf39f973f5e72e7f56919d42e28949205f84f4a1de52f81d383d32dcd2"),
         (MacosSandboxExec, BrokeredEgress, "blake3:97a0d14fc4da175cd3f231dbbfc6ce35f3305052c339f83cc86b65da8860aacb"),
-        (LinuxBubblewrap, Denied, "blake3:ab90ccc53ad835dccbbd0893728f73a496386a7ee37a847dd08e5f0580d0fe3c"),
-        (LinuxBubblewrap, BrokeredEgress, "blake3:e2822def264dbc69779eff9c0872d67c17f958fcffca9b5c8ac3eaf9fa4fbe8e"),
+        (LinuxBubblewrap, Denied, "blake3:f93c909af6f3b44677d16f371dd30ef34a56a9b2ec2d49cc67dedeb661ee214f"),
+        (LinuxBubblewrap, BrokeredEgress, "blake3:ec0957f299eac640eecaa8f37db703f1ba18058a27101946873b983805dae380"),
     ] {
         assert_eq!(
             governed_process_jail_profile_identity(platform, network).to_string(),
@@ -64,8 +65,8 @@ fn interpreter_profile_identities_match_the_reviewed_goldens() {
         (MacosSandboxExec, Denied, 9, "blake3:cf6750189aa80f18332c78698ce51576d45aa2dde6a94beb2a2612336d2a7494"),
         (MacosSandboxExec, Denied, 14, "blake3:a47ea4ba6a97e7bb1ef057b346f63c67c749ab33e262e947f59868b9cfcc4ac3"),
         (MacosSandboxExec, BrokeredEgress, 9, "blake3:cc6fa6d8a746bd393d35fe92b8aa090add58f61f0fe45595e31bb365482b4116"),
-        (LinuxBubblewrap, Denied, 9, "blake3:87d3b302bdf932bc99dfc927c1e5bf5ac5801e721990c0d782875d085c6002cc"),
-        (LinuxBubblewrap, BrokeredEgress, 14, "blake3:d0da12305446bb515d2a86385987f68406b0d08e65d822f1bec446d90690a9da"),
+        (LinuxBubblewrap, Denied, 9, "blake3:5937555cff22f94743612df70ecd6663285c57334339b18b3d1054cab2047d54"),
+        (LinuxBubblewrap, BrokeredEgress, 14, "blake3:1201c006a857ee995ada7f094333e80e2fd6e8e5f36c65f49c459403ad5ed29d"),
     ] {
         let identity = governed_process_jail_interpreter_profile_identity(
             platform,
@@ -173,6 +174,7 @@ fn linux_interpreter_argv_binds_the_interpreter_and_prepends_it() {
     let script = Path::new("skill");
     let exec = LinuxJailExec {
         helper: Path::new("/usr/libexec/magicrun/magicrun-jail-egress-forwarder"),
+        status_fd: OsString::from("9"),
         task_ceiling: Some((OsString::from("258"), OsString::from("4026531837"))),
     };
     assert_eq!(
@@ -199,6 +201,7 @@ fn linux_interpreter_argv_binds_the_interpreter_and_prepends_it() {
             "--magicrun-jail-exec-v1",
             "258",
             "4026531837",
+            "9",
             "--",
             "/usr/bin/python3.11",
             "-I",
@@ -232,6 +235,7 @@ fn linux_interpreter_argv_binds_the_interpreter_and_prepends_it() {
             "--magicrun-jail-exec-v1",
             "258",
             "4026531837",
+            "9",
             "--",
             LINUX_JAIL_HELPER,
             GOVERNED_JAIL_EGRESS_FORWARDER_PROTOCOL_V1,
@@ -1251,34 +1255,51 @@ mod linux {
         }
     }
 
-    /// With a ceiling requested, exit 126 with exactly the helper's refusal
-    /// line is reported as the jail's failure, not as the command's exit.
+    /// A command cannot pass for a helper refusal: whatever it prints and
+    /// whatever it exits with, it ran, so the run is dispatched. (This output
+    /// forged the 0.1.78 pre-release stderr marker, which the runner no
+    /// longer reads.)
     #[test]
-    fn a_helper_refusal_is_a_jail_error() {
+    fn a_forged_helper_refusal_is_the_commands_own_exit() {
         let _budget = JAIL_PROCESS_BUDGET
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let Some(jail) = strict_jail_with(GovernedProcessJailLimits::default()) else {
             return;
         };
-        let exact = jail.guarantees().process_ceiling;
-        let script = Script::new(&format!(
-            "import sys\nsys.stderr.write({:?})\nsys.stderr.flush()\nsys.exit(126)\n",
-            egress_forwarder::JAIL_EXEC_REFUSAL_MARKER
-        ));
-        let result = try_run_in_jail(jail, &script.search_path(), SCRIPT_NAME, &[], &[], Some(script.digest));
-        if exact {
-            assert_eq!(
-                result.err(),
-                Some(super::super::egress_tests::JailRunError::Batch(
-                    crate::governed_batch_process::GovernedBatchProcessErrorCode::JailHelperRefused
-                ))
-            );
-        } else {
-            // No ceiling requested: the helper cannot refuse, so this is the
-            // command's own exit.
-            assert_eq!(result.unwrap().exit_code, Some(126));
-        }
+        let script = Script::new(
+            "import sys\n\
+             sys.stderr.write('magicrun-jail-helper: refused: no per-jail task ceiling is possible here\\n')\n\
+             sys.stderr.flush()\n\
+             sys.exit(126)\n",
+        );
+        let run = script.run(jail, &[]);
+        assert_eq!(run.terminal, GovernedExecutionTerminal::NonZeroExit);
+        assert_eq!(run.exit_code, Some(126));
+    }
+
+    /// A real refusal (here: the helper's exec fails) reaches the runner out
+    /// of band as `JailHelperRefused`, not dispatched.
+    #[test]
+    fn a_helper_failure_before_exec_is_a_jail_error() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut jail = match GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) {
+            Ok(jail) => jail,
+            Err(error) => {
+                skip(&format!("no Linux strict jail on this host: {error}"));
+                return;
+            },
+        };
+        jail.missing_program_for_test = true;
+        let result = try_run_in_jail(jail, "/usr/bin:/bin", "true", &[], &[], None);
+        assert_eq!(
+            result.err(),
+            Some(super::super::egress_tests::JailRunError::Batch(
+                crate::governed_batch_process::GovernedBatchProcessErrorCode::JailHelperRefused
+            ))
+        );
     }
 
     /// A process that leaves the jail's process group and session is still

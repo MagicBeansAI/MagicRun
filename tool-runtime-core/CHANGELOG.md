@@ -15,8 +15,9 @@ _Current development version: `0.1.78`._
 - Add `GovernedProcessJail::stage_input_file(name, bytes)`: one fresh,
   owner-read-only file in the private workdir before launch, addressed by a
   plain single-component name, bounded by the jail's file ceilings; the host
-  path is never returned. New error code `InvalidInputFile`. Profiles,
-  identities and goldens are unchanged.
+  path is never returned. New error code `InvalidInputFile` (an existing name
+  or a planted link); other I/O failures are `PrivateWorkdirUnavailable`.
+  Staging is serialized per jail so concurrent calls respect the quota.
 
 ### Linux fixes found by the first real Linux run (`0.1.78`)
 
@@ -41,19 +42,31 @@ _Current development version: `0.1.78`._
     `MAX_GOVERNED_JAIL_TASKS`, `GOVERNED_JAIL_HELPER_TASKS`, and
     `GovernedProcessJailAudit::linux_helper_digest`. The audit JSON gains
     `max_tasks` (all platforms) and, on Linux, `linux_helper_digest`; the
-    Linux strict argv golden and the Linux profile identities rotate: strict
-    `blake3:1fc54240…cc61a0` → `blake3:ab90ccc5…d0fe3c`, brokered
-    `blake3:3c4fcba8…e142cc` → `blake3:e2822def…4fbe8e`. macOS identities are
-    unchanged.
+    Linux strict argv golden and the Linux profile identities rotate (helper
+    bind, exec shim and its status descriptor), `0.1.77` → `0.1.78`:
+    - strict `blake3:1fc54240…cc61a0` → `blake3:f93c909a…ee214f`
+    - brokered `blake3:3c4fcba8…e142cc` → `blake3:ec0957f2…dae380`
+    - interpreter, denied, Python 3.9 `blake3:58e25e84…dcd57ae` →
+      `blake3:5937555c…2047d54`
+    - interpreter, brokered, Python 3.14 `blake3:d2b11523…1047852` →
+      `blake3:1201c006…5ed29d`
+
+    macOS identities are unchanged.
 - **Exact ceiling only where the kernel enforces it.** The in-jail ceiling
   also needs a kernel at least `MIN_GOVERNED_JAIL_TASK_CEILING_KERNEL` (5.17;
   older kernels count the UID's tasks host-wide inside a user namespace, and
   5.14-5.16 carry ucounts bugs) and a non-root real UID (never held to
   `RLIMIT_NPROC`); otherwise the shim only execs and `process_ceiling` is
-  `false`. The shim also refuses a ceiling when it runs as UID 0.
-  Its refusal (exit 126 with exactly `JAIL_EXEC_REFUSAL_MARKER` on stderr)
-  is reported as the new `GovernedBatchProcessErrorCode::JailHelperRefused`,
-  not dispatched. The ceiling's machinery allowance is per mode (bubblewrap's
+  `false`. The shim also refuses a ceiling when it runs as UID 0, and claims
+  none unless the inherited hard `RLIMIT_NPROC` admits it.
+- **Out-of-band refusal.** The shim reports a refusal, or any failure before
+  the command runs (`setrlimit`, exec), by writing one byte to an exec-status
+  pipe the runner passes as its third argument; it marks the pipe
+  close-on-exec before a successful exec, so the command never holds it. Only
+  that byte maps to the new `GovernedBatchProcessErrorCode::JailHelperRefused`
+  (not dispatched); the command's exit status and output are never
+  consulted. (A pre-release stderr-marker scheme could be forged by a command
+  after real side effects, turning them into "not dispatched".) The ceiling's machinery allowance is per mode (bubblewrap's
   init, plus the forwarder when brokered); the watchdog allows the same plus
   the launcher on Linux, and nothing on macOS. A helper whose device, inode,
   size or times changed since the jail was built is refused at launch.
@@ -65,6 +78,12 @@ _Current development version: `0.1.78`._
   exhaustive matches in consumers need updating, which a `0.1.x` patch bump
   does not signal under strict semver; this crate is pre-1.0 and consumers
   pin exact revisions.
+- **Watchdog CPU (Linux)** also counts reaped children (`cutime`,
+  `cstime`) of jail members; a malformed `/proc` sample fails the observation
+  only for a jail member. Directory birth time is compared only when both
+  samples have one, and `fuse-overlayfs` is treated like overlayfs.
+- **Known limit.** The helper is re-checked by path metadata before launch,
+  not bound by descriptor (`bwrap --ro-bind-fd`).
 - **Watchdog escape (Linux).** The watchdog found jail members by process
   group, so a jailed command that called `setsid()` escaped process, CPU and
   memory sampling. It now follows the launcher's descendants by parent link

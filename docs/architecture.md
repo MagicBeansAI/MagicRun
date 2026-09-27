@@ -281,8 +281,11 @@ exposing the workdir's host path.
 - **Name.** One plain component: `[A-Za-z0-9._-]`, not hidden, not starting
   with `-` (the name is passed as an argument, so never a flag or `-`), at most
   128 bytes. `..`, separators and non-ASCII are refused (`InvalidInputFile`).
-- **Failures.** A failed write removes the partial file; I/O failures report
+- **Failures.** A failed write removes the partial file. An existing name or
+  a planted link is `InvalidInputFile`; every other I/O failure reports
   `PrivateWorkdirUnavailable`.
+- **Concurrency.** Staging is serialized per jail, so concurrent calls cannot
+  all pass the quota check before any of them writes.
 - **Creation.** The file is always fresh (`create_new`, `O_NOFOLLOW`): an
   existing name or a planted link is refused, never overwritten or followed.
   It is written `0400` and synced.
@@ -320,13 +323,29 @@ flowchart LR
   for devpts), sets `RLIMIT_NPROC`
   soft and hard to `max_tasks` plus the machinery in the namespace
   (bubblewrap's init; plus the forwarder when brokered) and execs. In the
-  brokered mode it execs the forwarder role, which spawns the command. A
-  refusal is exit 126 with exactly `JAIL_EXEC_REFUSAL_MARKER` on stderr; the
-  batch runner reports that as `GovernedBatchProcessErrorCode::JailHelperRefused`
-  (not dispatched), not as the command's exit. A Linux jail without the helper
-  fails to build with `JailHelperUnavailable` (brokered:
-  `EgressForwarderUnavailable`); a helper whose device, inode, size or times
-  changed since the jail was built is refused at launch.
+  brokered mode it execs the forwarder role, which spawns the command.
+- **Out-of-band exec status.** The shim's third argument is the write end of
+  a pipe the batch runner creates (both ends close-on-exec; only the forked
+  bubblewrap clears it on its copy; the runner closes its write end after
+  spawn). bubblewrap's in-jail init closes inherited descriptors, so only the
+  shim and the outer monitor, outside the jail's pid namespace, hold it. The
+  shim writes one byte (`JAIL_EXEC_REFUSED`) only if the command never ran:
+  a refused ceiling, a failed `setrlimit` or a failed exec. Before a
+  successful exec it marks the descriptor close-on-exec, so the command never
+  holds it. After the launcher exits the runner reads the pipe: the byte
+  means `GovernedBatchProcessErrorCode::JailHelperRefused`, not dispatched;
+  no byte means the command ran, whatever it printed or exited with. Nothing
+  the command does can report a refusal (an earlier stderr-marker design
+  could be forged after real side effects and was never released).
+- **Build and launch checks.** A Linux jail without the helper fails to build
+  with `JailHelperUnavailable` (brokered: `EgressForwarderUnavailable`). An
+  exact ceiling is claimed only if the inherited hard `RLIMIT_NPROC` admits
+  it (the shim cannot raise it); if it fell by launch, the launch fails with
+  `JailHelperUnavailable`. A helper whose device, inode, size or times
+  changed since the jail was built is refused at launch. Known limit: the
+  helper is re-checked by path metadata, not bound by an open descriptor
+  (`bwrap --ro-bind-fd`), so a root-owned file replaced between the check and
+  bubblewrap's bind, keeping all of those, is not caught.
 - **What the kernel checks.**
   - *Unprivileged bubblewrap (userns):* the namespace is owned by the user.
     Level 0 counts the jail's tasks in its own namespace against the shim's
@@ -371,7 +390,8 @@ flowchart LR
   identity re-reads `/proc/self/mountinfo` on every check; neither is cached.
 - **Directory identity.** Birth time is part of a working directory's
   identity on Linux only (inode numbers are reused at once), and not on
-  overlayfs, where copy-up changes it. macOS leaves it out: `touch -t` to an
+  overlayfs (or `fuse-overlayfs`), where copy-up changes it; it is compared
+  only when both samples have it. macOS leaves it out: `touch -t` to an
   earlier time moves APFS birth time.
 
 ## Declared login prompts
