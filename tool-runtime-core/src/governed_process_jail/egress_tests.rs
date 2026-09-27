@@ -23,7 +23,7 @@ use crate::{
         GovernedExecutionContract, GovernedExecutionPolicy, GovernedExecutionRequest,
         GovernedExecutionTerminal,
     },
-    governed_execution_authority::GovernedExecutionAuthority,
+    governed_execution_authority::{GovernedExecutionAuthority, GovernedExpectedExecutableDigest},
     manifest::{
         AuthContract, CliInteraction, PolicyFloor, RuntimeLimits, RuntimeProtocol,
         RuntimeRequirements, SkillRuntimeContract, SkillRuntimeContractVersion, StdinContract,
@@ -33,22 +33,22 @@ use crate::{
 };
 
 /// Real jails spawn real processes; keep them serial like the batch tests.
-static JAIL_PROCESS_BUDGET: Mutex<()> = Mutex::new(());
+pub(super) static JAIL_PROCESS_BUDGET: Mutex<()> = Mutex::new(());
 
-const TUNNEL_BODY: &str = "tunnel-relayed-body";
+pub(super) const TUNNEL_BODY: &str = "tunnel-relayed-body";
 
 /// Minimal HTTP CONNECT test broker (loopback TCP, the macOS endpoint). It records every request line, tunnels
 /// `allowed.example:80` to a canned HTTP response and refuses anything else
 /// with 403, like the real broker's allowlist.
 #[cfg(target_os = "macos")]
-struct TestBroker {
-    port: u16,
+pub(super) struct TestBroker {
+    pub(super) port: u16,
     requests: Arc<Mutex<Vec<String>>>,
 }
 
 #[cfg(target_os = "macos")]
 impl TestBroker {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -63,7 +63,7 @@ impl TestBroker {
         Self { port, requests }
     }
 
-    fn requests(&self) -> Vec<String> {
+    pub(super) fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
 }
@@ -104,13 +104,13 @@ pub(super) fn serve_connect<S: Read + Write>(mut stream: S, recorded: &Mutex<Vec
 }
 
 /// A host listener that must never see a jailed connection.
-struct Tripwire {
-    port: u16,
-    hits: Arc<AtomicUsize>,
+pub(super) struct Tripwire {
+    pub(super) port: u16,
+    pub(super) hits: Arc<AtomicUsize>,
 }
 
 impl Tripwire {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -127,12 +127,12 @@ impl Tripwire {
     }
 }
 
-struct JailedRun {
+pub(super) struct JailedRun {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    terminal: GovernedExecutionTerminal,
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
+    pub(super) terminal: GovernedExecutionTerminal,
+    pub(super) exit_code: Option<i32>,
+    pub(super) stdout: String,
+    pub(super) stderr: String,
 }
 
 /// Run `bin` (resolved from `/usr/bin:/bin`) with `arguments` inside `jail`
@@ -150,6 +150,20 @@ fn run_in_jail_with_environment(
     arguments: &[&str],
     fixed: &[(&str, &str)],
 ) -> JailedRun {
+    try_run_in_jail(jail, "/usr/bin:/bin", bin, arguments, fixed, None).unwrap()
+}
+
+/// The governed batch path with a caller `PATH` for resolution and an
+/// optional install-review executable digest. Setup failures are returned as
+/// their value-free debug form.
+pub(super) fn try_run_in_jail(
+    jail: GovernedProcessJail,
+    search_path: &str,
+    bin: &str,
+    arguments: &[&str],
+    fixed: &[(&str, &str)],
+    expected_executable: Option<[u8; 32]>,
+) -> Result<JailedRun, String> {
     let authored = SkillRuntimeContract {
         schema_version: SkillRuntimeContractVersion::v1(),
         requires: RuntimeRequirements {
@@ -200,7 +214,7 @@ fn run_in_jail_with_environment(
     let baseline = ChildEnvironmentBaseline::path_only();
     let mut values = ChildEnvironmentValues::new(&baseline);
     values
-        .provide(ChildEnvironmentVariable::Path, b"/usr/bin:/bin".to_vec())
+        .provide(ChildEnvironmentVariable::Path, search_path.as_bytes().to_vec())
         .unwrap();
     for (name, value) in fixed {
         values
@@ -210,8 +224,17 @@ fn run_in_jail_with_environment(
     let root = jail
         .working_directory_root(WorkingDirectoryMode::Workspace)
         .unwrap();
-    let authority =
-        GovernedExecutionAuthority::bind(intent, &baseline, values, Some(root)).unwrap();
+    let authority = match expected_executable {
+        None => GovernedExecutionAuthority::bind(intent, &baseline, values, Some(root)),
+        Some(digest) => GovernedExecutionAuthority::bind_expected_executable(
+            intent,
+            &baseline,
+            values,
+            Some(root),
+            GovernedExpectedExecutableDigest::from_blake3(digest),
+        ),
+    }
+    .map_err(|error| format!("{error:?}"))?;
     let parts = authority.into_parts();
     let mut environment = parts
         .environment
@@ -219,19 +242,19 @@ fn run_in_jail_with_environment(
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<Vec<_>>();
     environment.sort_by(|left, right| left.0.cmp(&right.0));
-    let process =
-        GovernedBatchProcess::from_authorized_parts_in_jail(parts, environment, jail).unwrap();
-    let result =
-        GovernedBatchExecutor::execute(process, &GovernedBatchCancellation::new()).unwrap();
+    let process = GovernedBatchProcess::from_authorized_parts_in_jail(parts, environment, jail)
+        .map_err(|error| format!("{error:?}"))?;
+    let result = GovernedBatchExecutor::execute(process, &GovernedBatchCancellation::new())
+        .map_err(|error| format!("{error:?}"))?;
     let terminal = result.terminal().terminal();
     let exit_code = result.exit_code();
     let parts = result.into_parts();
-    JailedRun {
+    Ok(JailedRun {
         terminal,
         exit_code,
         stdout: String::from_utf8_lossy(&parts.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&parts.stderr).into_owned(),
-    }
+    })
 }
 
 #[cfg(target_os = "macos")]

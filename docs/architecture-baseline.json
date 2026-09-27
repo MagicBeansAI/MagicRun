@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
   "project": "MagicRun",
-  "architecture_version": "0.1.76",
+  "architecture_version": "0.1.77",
   "document": "docs/architecture.md",
-  "document_sha256": "0bd3a8e2d2f7c1e975d447c02dc5332517a425e73efdb63b30da39792ae6a400",
+  "document_sha256": "9915ddedecb2946835c5a5e5918ea8dab5a695ec736ac146c145594230a12e93",
   "component_versions": {
-    "tool-runtime-core": "0.1.76"
+    "tool-runtime-core": "0.1.77"
   },
   "source_sha256": {
     "Cargo.toml": "42097db7277fb53f8c0536875c35f007c8e88083e6b1062b78f6f6599f6a2bb0",
-    "tool-runtime-core/Cargo.toml": "07c1b40d697d2e88ba2751906c96fbe884bdbac3b16c03089772d6b2e4f490ec",
+    "tool-runtime-core/Cargo.toml": "8183dbb82b23731da5cac43c9f086e56abd92ef008ead6b7d811bd8a54a0332f",
     "tool-runtime-core/src/action_overrides.rs": "14dfb943e95be143acef5db15af4be31e4621dad9f78346f5c23421904c526e1",
     "tool-runtime-core/src/bin/magicrun-jail-egress-forwarder.rs": "0001802efdac75b367b3d98145870b2b1dce990cc65e60b468af31c3f06df311",
     "tool-runtime-core/src/bin/tool-runtime-classification.rs": "0e8d63cb63deea58890f7b30b61b1e9f6229598146dee00c1b4db9266083d858",
@@ -38,9 +38,10 @@
     "tool-runtime-core/src/governed_execution_authority.rs": "e1aae9ccc6ec43be09b97a3e869ce2a1a69615b23dd40447b59d2fd02d85b307",
     "tool-runtime-core/src/governed_execution_coordinator.rs": "bf9b7445f55f4e524a8f7cd5b265fb3cdcc5c05eda1d67b0259412072da9c368",
     "tool-runtime-core/src/governed_execution_result.rs": "6119c0825f7d897bf911de1b3b419e40c9b285310a60c01cdca6d744aef508bf",
-    "tool-runtime-core/src/governed_process_jail.rs": "003afeb4e38a022a7002b729fd4368e402d6bfcd7140f73e9013fd018f3ce510",
+    "tool-runtime-core/src/governed_process_jail.rs": "b67ea2cfd512fec0ae811bb3544b76c53bd18cf9ddbd6241cd1d0c9b9f3ce109",
     "tool-runtime-core/src/governed_process_jail/egress_forwarder.rs": "534fa25cd2e466bdf964e177c54691e4d12a62e5b8d4997a50f459095a0c7c4a",
-    "tool-runtime-core/src/governed_process_jail/egress_tests.rs": "f755a4160027586401111f57fb78e10c4d34adf6f9e166f5691e3cbba951f082",
+    "tool-runtime-core/src/governed_process_jail/egress_tests.rs": "02fc25098667242c888b7b1085568d7d69199d5901457db74d6f5ed92aa4f103",
+    "tool-runtime-core/src/governed_process_jail/interpreter_tests.rs": "79a7450ce019dad90eacdc0f589b75f974727e0c56f228ec86926d80717a1cfe",
     "tool-runtime-core/src/governed_pty_process.rs": "5be0567c50cb74e15c4dcc84df4e1a5d9a619bd1bef358b59a608be875a38fff",
     "tool-runtime-core/src/inventory.rs": "6de35bebad840060369faebe7046c7b19db10d86d0ba432ce3fe2186d1b1b054",
     "tool-runtime-core/src/lib.rs": "bd8fa12a9813ababd0aa7d2baada4ea680478d83fc5ab982439039e48b61245e",

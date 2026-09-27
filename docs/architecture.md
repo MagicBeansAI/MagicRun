@@ -1,6 +1,6 @@
 # MagicRun architecture
 
-Architecture version: `0.1.76`
+Architecture version: `0.1.77`
 
 Original immutable baseline tag: `architecture/v0.1.73`. The current reviewed
 source/document fingerprints are in [architecture-baseline.json](architecture-baseline.json).
@@ -152,6 +152,65 @@ flowchart LR
 - Secrets need no new surface: a reviewed `auth.injections` secret with an
   environment target already reaches a jailed child through
   `CredentialPreparationPlan` and the host's `CredentialMaterialResolver`.
+
+## Interpreter mode
+
+`0.1.77` adds `GovernedProcessJail::with_interpreter`, an opt-in that lets the
+strict or brokered jail run a reviewed script under a pinned interpreter
+without widening the jail for anything else. The governed pipeline is
+unchanged: the script is resolved through the contract's `PATH`, hashed
+(`with_expected_executable_digest` binds the script bytes) and privately
+snapshotted as today. Only the jail's command template changes, inside
+`GovernedProcessJail::command`; the batch runner still calls
+`jail.command(&executable)` and appends the admitted arguments.
+
+```mermaid
+flowchart LR
+    discovery["python3_for_host (fixed candidates)"] -->|"trust checks + digest"| interpreter["GovernedJailInterpreter"]
+    interpreter -->|"with_interpreter: recheck"| jail["GovernedProcessJail"]
+    snapshot["Script snapshot (digest-bound)"] --> jail
+    jail -->|"recheck digest before launch"| argv["interpreter -I -S -B script args"]
+```
+
+- **Pinned interpreter.** `GovernedJailInterpreter` has no caller-path
+  constructor; `python3_for_host()` walks fixed candidates. The candidate
+  spelling must be root-owned end to end, its canonical `python3.N` binary
+  must pass the trusted-launcher checks, and the derived executable, pinned
+  images and library roots must too (library trees are walked entry by entry).
+  Its digest is a domain-separated BLAKE3 over the executable and images. It
+  is rechecked when a jail takes it and immediately before every launch. Only
+  root can change root-owned bytes in non-writable directories between that
+  recheck and exec.
+- **macOS.** Candidates in order: python.org, Xcode.app, CommandLineTools
+  `…/Versions/Current/bin/python3`. The jail execs the framework's
+  `Resources/Python.app/Contents/MacOS/Python` directly (the `bin` binary is a
+  stub that would re-exec it) and pins the framework library. The profile is
+  the strict profile rendered with the interpreter as the sole `process-exec`
+  literal, plus a read-only literal of the script snapshot, read-only literals
+  of the pinned images, a read-only `Versions/X.Y/lib` subpath and a final
+  deny of `lib/pythonX.Y/site-packages`. That is exactly what
+  `import json, urllib.request, ssl, xml.etree.ElementTree` needs under
+  `-I -S -B`; it needs no ancestor metadata. `process-fork` stays denied and
+  the script is never exec-allowed. `/usr/bin/python3` is an `xcrun` shim and
+  is never used. A python.org framework left `root:admin` 0775 (as on the
+  development host, where admin users had written into it) fails the trust
+  check; the CommandLineTools framework (`root:wheel` 0755) passes.
+- **Linux.** Canonical `/usr/bin/python3` with `/usr/lib/python3.N` (and
+  `/usr/lib64/python3.N`) read-only bound at their own paths; argv becomes
+  `<interpreter> -I -S -B /app/<script>`, under the forwarder when brokered.
+  `site-packages` is off `sys.path` (`-S`) but not hidden. This path is
+  compile-checked only.
+- **Identity.** `profile_identity()` in interpreter mode equals
+  `governed_process_jail_interpreter_profile_identity(platform, network, kind,
+  version)`: the placeholder-rendered template plus interpreter kind,
+  `major.minor` and flags, with no host path. `GovernedProcessJailAudit::interpreter`
+  records kind, version, digest and flags. Existing profiles, argv, identities
+  and audit JSON are unchanged and pinned by golden tests.
+- **Limits.** The flags are hygiene; the sandbox is the boundary. A script
+  can `exec()` Python it builds, re-exec the interpreter literal without
+  flags, or load `ctypes` libraries from readable system paths, all still
+  inside the same profile. Single-file stdlib-only scripts are the supported
+  shape: `-I` puts neither the script directory nor the cwd on `sys.path`.
 
 ## Declared login prompts
 
@@ -314,7 +373,7 @@ fail-fast qualification evidence.
 ### Baseline review
 
 [architecture-baseline.json](architecture-baseline.json) binds this document to
-package `tool-runtime-core 0.1.74`, workspace/package manifests and production
+package `tool-runtime-core 0.1.77`, workspace/package manifests and production
 `src/` fingerprints. The local, ignored Cargo lockfile is not a published
 library architecture input. Dependency declarations still participate through
 the manifest fingerprints.
