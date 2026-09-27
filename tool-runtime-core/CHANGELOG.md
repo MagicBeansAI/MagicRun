@@ -50,7 +50,7 @@ _Current development version: `0.1.78`._
   older kernels count the UID's tasks host-wide inside a user namespace, and
   5.14-5.16 carry ucounts bugs) and a non-root real UID (never held to
   `RLIMIT_NPROC`); otherwise the shim only execs and `process_ceiling` is
-  `false`. The shim also refuses a ceiling when its UID maps to host root.
+  `false`. The shim also refuses a ceiling when it runs as UID 0.
   Its refusal (exit 126 with exactly `JAIL_EXEC_REFUSAL_MARKER` on stderr)
   is reported as the new `GovernedBatchProcessErrorCode::JailHelperRefused`,
   not dispatched. The ceiling's machinery allowance is per mode (bubblewrap's

@@ -1752,7 +1752,7 @@ impl TaskCeilingHost {
     ///   `user.max_user_namespaces` is 0.
     ///
     /// A misprediction fails closed: the shim refuses a requested ceiling
-    /// outside a new namespace or for a UID that maps to host root.
+    /// outside a new namespace or when it runs as UID 0.
     fn exact(&self) -> bool {
         !self.root_uid
             && self

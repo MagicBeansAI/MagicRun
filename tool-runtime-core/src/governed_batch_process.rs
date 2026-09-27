@@ -150,8 +150,8 @@ pub enum GovernedBatchProcessErrorCode {
     /// bytes; nothing was dispatched.
     InterpreterUnavailable,
     /// Linux: the in-jail helper refused to apply the task ceiling (no user
-    /// namespace of the jail's own, or a UID mapped to host root); the
-    /// command never ran.
+    /// namespace of the jail's own, or running as root); the command never
+    /// ran.
     JailHelperRefused,
     StreamUnavailable,
     StreamWriteFailed,

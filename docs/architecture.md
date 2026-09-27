@@ -314,8 +314,10 @@ flowchart LR
   BLAKE3 in `GovernedProcessJailAudit::linux_helper_digest`) read-only at
   `/run/magicrun/jail-helper` and runs it first:
   `--magicrun-jail-exec-v1 <tasks> <host-userns> -- <program…>`. It checks
-  that `/proc/self/ns/user` differs from the host's namespace and that its
-  UID does not map to host root (`/proc/self/uid_map`), sets `RLIMIT_NPROC`
+  that `/proc/self/ns/user` differs from the host's namespace and that it
+  does not run as UID 0 (bubblewrap keeps the caller's UID; `uid_map` cannot
+  serve, as unprivileged bubblewrap nests a namespace mapping the caller to 0
+  for devpts), sets `RLIMIT_NPROC`
   soft and hard to `max_tasks` plus the machinery in the namespace
   (bubblewrap's init; plus the forwarder when brokered) and execs. In the
   brokered mode it execs the forwarder role, which spawns the command. A
@@ -351,8 +353,7 @@ flowchart LR
     `uname`; an unparsable release fails closed), the real UID, and the way
     bubblewrap decides on a namespace (setuid bit, `/proc/self/ns/user`, RHEL
     parameter, `max_user_namespaces`). A wrong prediction fails closed: the
-    shim refuses a requested ceiling outside a new namespace or for a UID
-    mapped to host root.
+    shim refuses a requested ceiling outside a new namespace or as UID 0.
 - **Tasks and processes.** `GovernedProcessJailLimits::max_tasks` (default
   256, at most 1024, at least `max_processes`) is the thread budget; Node,
   Go and threaded Python run many threads per process. `max_processes` stays
