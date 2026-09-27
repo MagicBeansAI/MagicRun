@@ -719,24 +719,37 @@ mod macos {
     /// from the child environment, whatever put them there.
     #[test]
     fn the_child_environment_drops_loader_injection() {
-        let Some(jail) = host_interpreter().and_then(strict_jail) else {
+        // Only `harden_environment` is under test; no interpreter is needed.
+        let Ok(jail) = GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) else {
             return;
         };
         let mut command = Command::new("/usr/bin/true");
         command
             .env("DYLD_INSERT_LIBRARIES", "/private/tmp/x.dylib")
             .env("dyld_library_path", "/private/tmp")
+            .env("LD_PRELOAD", "/tmp/x.so")
+            .env("LD_AUDIT", "/tmp/x.so")
+            .env("GLIBC_TUNABLES", "glibc.malloc.check=3")
             .env("__PYVENV_LAUNCHER__", "/private/tmp/python")
-            .env("KEPT", "1");
+            .env("KEPT", "1")
+            .env("OLD_LD_FLAGS", "1");
         jail.harden_environment(&mut command);
         let environment = command
             .get_envs()
             .map(|(name, value)| (name.to_str().unwrap().to_owned(), value.is_some()))
             .collect::<std::collections::BTreeMap<_, _>>();
-        for removed in ["DYLD_INSERT_LIBRARIES", "dyld_library_path", "__PYVENV_LAUNCHER__"] {
+        for removed in [
+            "DYLD_INSERT_LIBRARIES",
+            "dyld_library_path",
+            "LD_PRELOAD",
+            "LD_AUDIT",
+            "GLIBC_TUNABLES",
+            "__PYVENV_LAUNCHER__",
+        ] {
             assert_eq!(environment.get(removed), Some(&false), "{removed}");
         }
         assert_eq!(environment.get("KEPT"), Some(&true));
+        assert_eq!(environment.get("OLD_LD_FLAGS"), Some(&true));
     }
 
     #[test]

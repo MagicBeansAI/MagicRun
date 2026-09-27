@@ -71,8 +71,14 @@ _Current development version: `0.1.77`._
 
 - **Strict profile change (macOS), identities rotate.** The strict SBPL
   profile ends with `(deny file-map-executable (subpath "<workdir>"))`, so
-  nothing written to the workdir can be mapped executable (`ctypes`/`dlopen`,
-  or `DYLD_INSERT_LIBRARIES` on a re-exec). This applies to every mode. The
+  files written to the workdir cannot be `dlopen`ed (`ctypes.CDLL` included),
+  mapped `PROT_EXEC`, or injected via `DYLD_INSERT_LIBRARIES` on a re-exec.
+  It is defense in depth, not a code-execution barrier: in-memory code via
+  `mprotect`/`ctypes` still runs, inside the same profile. Tools that unpack
+  a library into `TMPDIR` and load it (some JNA, sqlite-jdbc, .NET
+  single-file, packaged Node addons) stop working in the jail. The jail's
+  environment backstop now also strips `LD_*` and `GLIBC_TUNABLES`. This
+  applies to every mode. The
   macOS profile identities rotate: strict
   `blake3:e783cb6b…020d31` → `blake3:8a06b6cf…32dcd2`, brokered
   `blake3:89b6c07b…2f09f6` → `blake3:97a0d14f…60aacb`. Linux identities are

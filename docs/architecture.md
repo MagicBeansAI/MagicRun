@@ -214,9 +214,14 @@ flowchart LR
 - **No native code from the workdir (both modes, macOS).** The workdir is the
   only writable subtree, and `0.1.77` adds
   `(deny file-map-executable (subpath "<workdir>"))` to the strict profile, so
-  nothing written there can be mapped executable: not by `dlopen`/`ctypes`,
-  and not by `DYLD_INSERT_LIBRARIES` on a re-exec (dyld then refuses to
-  start). This deliberately changes the strict profile and rotates the macOS
+  files written there cannot be `dlopen`ed (including via `ctypes.CDLL`) or
+  mapped `PROT_EXEC`, and cannot be injected by `DYLD_INSERT_LIBRARIES` on a
+  re-exec (dyld then refuses to start). It does not stop native code created
+  in memory: mapping a file read-only and then `mprotect`ing it executable,
+  or `ctypes` over anonymous memory, still works, inside the same profile.
+  Tools that unpack a shared library into `TMPDIR` and load it (some JNA,
+  sqlite-jdbc, .NET single-file and packaged Node addons) no longer work in
+  the jail. This deliberately changes the strict profile and rotates the macOS
   strict and brokered identities. The jail also strips `DYLD_*` and
   `__PYVENV_LAUNCHER__` from the child environment; manifest validation
   already refuses `DYLD_*`.
@@ -234,9 +239,10 @@ flowchart LR
 - **Limits.** The flags are hygiene; the sandbox is the boundary. A script
   can re-exec the interpreter literal without `-I -S -B` (a test shows the
   re-exec still cannot read the host home or `~/.ssh`), `exec()` Python it
-  builds, or run native code from anonymous memory through `ctypes`. It
-  cannot load native code from files it writes (macOS). All of it stays
-  inside the same profile. Single-file stdlib-only scripts are the supported
+  builds, or run native code it creates in memory (`ctypes`, or a file mapped
+  read-only and then `mprotect`ed executable). It cannot `dlopen` or
+  `PROT_EXEC`-map files it writes (macOS). All of it stays inside the same
+  profile. Single-file stdlib-only scripts are the supported
   shape: `-I` puts neither the script directory nor the cwd on `sys.path`.
   Trust checks read ownership and mode bits only; ACLs are not inspected
   (as for the trusted launcher).

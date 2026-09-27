@@ -3,7 +3,7 @@
   "project": "MagicRun",
   "architecture_version": "0.1.77",
   "document": "docs/architecture.md",
-  "document_sha256": "d3542a228e5594fcc5e214f015e091b1c4de2439edb1aaece7d8fa82210c6456",
+  "document_sha256": "8e31dcb1977df346d011e4d842dad03880847a7873305ca8f88ec765a0f67915",
   "component_versions": {
     "tool-runtime-core": "0.1.77"
   },
@@ -38,10 +38,10 @@
     "tool-runtime-core/src/governed_execution_authority.rs": "e1aae9ccc6ec43be09b97a3e869ce2a1a69615b23dd40447b59d2fd02d85b307",
     "tool-runtime-core/src/governed_execution_coordinator.rs": "bf9b7445f55f4e524a8f7cd5b265fb3cdcc5c05eda1d67b0259412072da9c368",
     "tool-runtime-core/src/governed_execution_result.rs": "6119c0825f7d897bf911de1b3b419e40c9b285310a60c01cdca6d744aef508bf",
-    "tool-runtime-core/src/governed_process_jail.rs": "f70b73b698cf6a7bbd0635e2a020a3da4fa7e65e53e2f9e2a641e4f2f3508bcd",
+    "tool-runtime-core/src/governed_process_jail.rs": "0b263f9865b3bc17b50e42e600a512c5a91b13244650f0ed74b4422eeda1e31f",
     "tool-runtime-core/src/governed_process_jail/egress_forwarder.rs": "34d921ce2f8d079d706f4ed0bf46732553568e3ef248cfea73916a600e5b8c57",
     "tool-runtime-core/src/governed_process_jail/egress_tests.rs": "8b39e89cef080780d6281a15ba1e0651c098749503016f9434a35bbf20beca5d",
-    "tool-runtime-core/src/governed_process_jail/interpreter_tests.rs": "e8b8108831990612b579ec710e59da28eb018d0950bed95f6737053a99a4b409",
+    "tool-runtime-core/src/governed_process_jail/interpreter_tests.rs": "fbf91d1c3f77f1f9c89f6053c8437c780693ec5cfbc1ee69b948aa809ddd3f36",
     "tool-runtime-core/src/governed_pty_process.rs": "5be0567c50cb74e15c4dcc84df4e1a5d9a619bd1bef358b59a608be875a38fff",
     "tool-runtime-core/src/inventory.rs": "6de35bebad840060369faebe7046c7b19db10d86d0ba432ce3fe2186d1b1b054",
     "tool-runtime-core/src/lib.rs": "bd8fa12a9813ababd0aa7d2baada4ea680478d83fc5ab982439039e48b61245e",

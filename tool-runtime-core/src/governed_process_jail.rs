@@ -320,7 +320,8 @@ pub struct GovernedJailInterpreterAudit {
     /// site the script itself writes into that workdir.
     pub launch_user_site_disabled: bool,
     /// Enforced by the profile. macOS: only the interpreter literal may be
-    /// exec'd, and nothing in the workdir may be mapped executable. Linux:
+    /// exec'd, and workdir files cannot be `dlopen`ed or mapped `PROT_EXEC`
+    /// (in-process code via `mprotect`/`ctypes` is not prevented). Linux:
     /// `false`; bubblewrap has no exec control and `/work` is not `noexec`.
     pub script_exec_denied: bool,
     /// Enforced by the profile. macOS: the stdlib `site-packages` subtree is
@@ -826,15 +827,20 @@ impl GovernedProcessJail {
             .env("TMPDIR", &self.canonical_workdir)
             .env("TMP", &self.canonical_workdir)
             .env("TEMP", &self.canonical_workdir);
-        // Loader injection and the macOS framework launcher's executable
-        // override are never part of a jailed launch. Manifest validation
-        // already refuses `DYLD_*`; this is the jail's own backstop.
+        // Loader injection (dyld `DYLD_*`, glibc ld.so `LD_*` and
+        // `GLIBC_TUNABLES`) and the macOS framework launcher's executable
+        // override are never part of a jailed launch. On Linux the launcher
+        // (bwrap) runs on the host before any sandbox exists, so this matters
+        // there too. Manifest validation already refuses most of these; this
+        // is the jail's own backstop.
         let removed = command
             .get_envs()
             .map(|(name, _)| name.to_owned())
             .filter(|name| {
                 let name = name.as_encoded_bytes();
                 name.len() >= 5 && name[..5].eq_ignore_ascii_case(b"DYLD_")
+                    || name.starts_with(b"LD_")
+                    || name == b"GLIBC_TUNABLES"
                     || name == b"__PYVENV_LAUNCHER__"
             })
             .collect::<Vec<_>>();
@@ -1984,9 +1990,11 @@ fn macos_profile(
             sbpl_escape(root)?,
         ));
     }
-    // The workdir is the only writable subtree. Nothing written there may
-    // be mapped executable (`dlopen`, `ctypes`, `DYLD_INSERT_LIBRARIES` on a
-    // re-exec): native code comes only from read-only host paths.
+    // The workdir is the only writable subtree. Files written there cannot be
+    // `dlopen`ed or mapped `PROT_EXEC` (nor injected by
+    // `DYLD_INSERT_LIBRARIES` on a re-exec). This is defense in depth: a
+    // process can still create native code in memory (`mprotect`, `ctypes`),
+    // and that code stays inside this same profile.
     profile.push_str(&format!(
         "(allow file-read* (subpath \"{}\"))\n\
          (allow file-write* (subpath \"{}\"))\n\
