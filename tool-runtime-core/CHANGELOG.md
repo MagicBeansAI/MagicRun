@@ -22,8 +22,8 @@ _Current development version: `0.1.77`._
   are walked entry by entry (root-owned; non-symlinks not group/other-writable).
   No interpreter is run during discovery.
   - macOS tries `GOVERNED_JAIL_MACOS_PYTHON3_CANDIDATES` in order: python.org
-    `/Library/Frameworks/Python.framework`, then Xcode.app, then the
-    CommandLineTools `Python3.framework` (`Versions/Current/bin/python3`). The
+    `/Library/Frameworks/Python.framework`, then the CommandLineTools
+    `Python3.framework` (`Versions/Current/bin/python3`). The
     candidate spelling must be root-owned end to end. It resolves to
     `Versions/X.Y/bin/pythonX.Y`; the jail execs
     `Versions/X.Y/Resources/Python.app/Contents/MacOS/Python` directly (the
@@ -64,8 +64,43 @@ _Current development version: `0.1.77`._
   identity) records which interpreter ran and is omitted otherwise. The jail
   schema stays that of its network mode. New error code
   `InterpreterUnavailable`.
-- The strict and brokered profiles, the bubblewrap argv, the existing profile
-  identities (now pinned by a golden test) and the audit JSON are unchanged.
+- The bubblewrap argv and the audit JSON of existing jails are unchanged; the
+  Linux profile identities are unchanged and now pinned by golden tests.
+
+#### Review fixes (`0.1.77`)
+
+- **Strict profile change (macOS), identities rotate.** The strict SBPL
+  profile ends with `(deny file-map-executable (subpath "<workdir>"))`, so
+  nothing written to the workdir can be mapped executable (`ctypes`/`dlopen`,
+  or `DYLD_INSERT_LIBRARIES` on a re-exec). This applies to every mode. The
+  macOS profile identities rotate: strict
+  `blake3:e783cb6b…020d31` → `blake3:8a06b6cf…32dcd2`, brokered
+  `blake3:89b6c07b…2f09f6` → `blake3:97a0d14f…60aacb`. Linux identities are
+  unchanged. `harden_environment` strips `DYLD_*` and `__PYVENV_LAUNCHER__`.
+- **Audit wording.** `GovernedJailInterpreterAudit::flags` is now
+  `launch_flags` and `user_site_denied` is `launch_user_site_disabled`; both
+  are launch hygiene, since a script can re-exec the interpreter without them
+  (still inside the same profile). `script_exec_denied` is `false` on Linux,
+  where bubblewrap has no exec control and `/work` is not `noexec`.
+- **Linux discovery.** Shared-libpython builds pin `libpython3.N.so.*` from
+  the executable's ELF `DT_NEEDED` as an image (found as a regular file in the
+  canonical `/usr/lib64`, `/usr/lib/<multiarch>` or `/usr/lib`; otherwise
+  refused), and stdlib roots are canonicalized and deduplicated (`lib64 ->
+  lib`). Compile-checked only.
+- **macOS discovery.** The Xcode.app candidate is dropped (`/Applications`
+  is `root:admin` 0775 on stock macOS). The interpreter digest is streamed.
+- **macOS process watchdog.** The process-group sample no longer uses a
+  null-buffer sizing call that XNU answers with a system-wide estimate; any
+  jailed child sampled at least once was ending as `ProcessLimitExceeded`.
+- **Egress forwarder (Linux).** No poll spin after a peer hang-up, a paused
+  listener after `EMFILE`/`ENFILE`, non-blocking broker connects (a full
+  backlog closes the client; 2 s bound), up to 1 s of outbound delivery after
+  the child exits, relays clamped to what `RLIMIT_NOFILE` leaves after the
+  descriptors open at start, and a brokered Linux
+  jail refuses `max_open_files` below `MIN_GOVERNED_JAIL_BROKERED_OPEN_FILES`
+  (8). An unreadable forwarder candidate falls through to the next one.
+- **Errors.** `GovernedBatchProcessErrorCode::InterpreterUnavailable` reports
+  a pinned interpreter that changed before launch.
 
 ### Brokered-egress process jail (`0.1.76`)
 

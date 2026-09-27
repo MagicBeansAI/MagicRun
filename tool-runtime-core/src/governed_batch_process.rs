@@ -45,8 +45,8 @@ use crate::{
         GovernedExecutionAuthorityParts,
     },
     governed_process_jail::{
-        GovernedProcessJail, GovernedProcessJailLimits, GovernedProcessJailWatch,
-        MAX_GOVERNED_JAIL_PROCESSES,
+        GovernedProcessJail, GovernedProcessJailErrorCode, GovernedProcessJailLimits,
+        GovernedProcessJailWatch, MAX_GOVERNED_JAIL_PROCESSES,
     },
     manifest::CliInteraction,
 };
@@ -146,6 +146,9 @@ pub enum GovernedBatchProcessErrorCode {
     SpawnFailed,
     UnenforceableMemoryLimit,
     JailUnavailable,
+    /// The jail's pinned interpreter is no longer trusted or changed its
+    /// bytes; nothing was dispatched.
+    InterpreterUnavailable,
     StreamUnavailable,
     StreamWriteFailed,
     StreamReadFailed,
@@ -499,7 +502,10 @@ fn execute_spawned(
     #[cfg(not(target_os = "macos"))]
     let standard_launch = true;
     let mut command = match process.jail.as_ref() {
-        Some(jail) => jail.command(&executable).map_err(|_| jail_unavailable())?,
+        Some(jail) => jail.command(&executable).map_err(|error| match error.code {
+            GovernedProcessJailErrorCode::InterpreterUnavailable => interpreter_unavailable(),
+            _ => jail_unavailable(),
+        })?,
         None => Command::new(executable.as_path()),
     };
     if standard_launch {
@@ -1633,21 +1639,12 @@ fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
 
     let leader = pid.and_then(|value| i32::try_from(value).ok())?;
     let group = u32::try_from(leader).ok()?;
-    // SAFETY: a null buffer and zero size is the documented sizing query.
-    let needed = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, group, std::ptr::null_mut(), 0) };
-    if needed <= 0 {
-        return None;
-    }
-    let reported = usize::try_from(needed).ok()? / PID_BYTES;
-    if reported > MAX_OBSERVED_GROUP_MEMBERS {
-        return Some(OwnedGroupUsage {
-            processes: reported as u64,
-            cpu_micros: 0,
-            memory_bytes: 0,
-        });
-    }
-    let capacity = reported.saturating_add(GROWTH_HEADROOM);
-    let mut members = vec![0 as libc::pid_t; capacity];
+    // Do not size the query with a null buffer: XNU answers that with a
+    // system-wide estimate (every process plus headroom), not the group's
+    // size, which read as a process-ceiling breach for any jailed child that
+    // lived long enough to be sampled. A fixed buffer larger than the ceiling
+    // is exact instead: a full buffer means more members than allowed.
+    let mut members = vec![0 as libc::pid_t; MAX_OBSERVED_GROUP_MEMBERS + GROWTH_HEADROOM];
     let buffer_bytes = libc::c_int::try_from(members.len().checked_mul(PID_BYTES)?).ok()?;
     // SAFETY: `members` is a live writable pid buffer sized in bytes.
     let written = unsafe {
@@ -1662,6 +1659,13 @@ fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
         return None;
     }
     let live = (usize::try_from(written).ok()? / PID_BYTES).min(members.len());
+    if live >= members.len() {
+        return Some(OwnedGroupUsage {
+            processes: live as u64,
+            cpu_micros: 0,
+            memory_bytes: 0,
+        });
+    }
     let mut processes = 0_u64;
     let mut cpu_nanos = 0_u64;
     let mut memory_bytes = 0_u64;
@@ -1873,6 +1877,15 @@ const fn jail_unavailable() -> GovernedBatchProcessError {
         GovernedBatchProcessErrorCode::JailUnavailable,
         "jail",
         "the strict process jail could not build a safe host command",
+        GovernedExecutionDispatch::NotDispatched,
+    )
+}
+
+const fn interpreter_unavailable() -> GovernedBatchProcessError {
+    GovernedBatchProcessError::new(
+        GovernedBatchProcessErrorCode::InterpreterUnavailable,
+        "jail.interpreter",
+        "the jail's pinned interpreter is untrusted or changed",
         GovernedExecutionDispatch::NotDispatched,
     )
 }

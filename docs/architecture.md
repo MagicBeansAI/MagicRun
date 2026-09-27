@@ -181,36 +181,88 @@ flowchart LR
   is rechecked when a jail takes it and immediately before every launch. Only
   root can change root-owned bytes in non-writable directories between that
   recheck and exec.
-- **macOS.** Candidates in order: python.org, Xcode.app, CommandLineTools
-  `…/Versions/Current/bin/python3`. The jail execs the framework's
-  `Resources/Python.app/Contents/MacOS/Python` directly (the `bin` binary is a
-  stub that would re-exec it) and pins the framework library. The profile is
-  the strict profile rendered with the interpreter as the sole `process-exec`
-  literal, plus a read-only literal of the script snapshot, read-only literals
-  of the pinned images, a read-only `Versions/X.Y/lib` subpath and a final
-  deny of `lib/pythonX.Y/site-packages`. That is exactly what
-  `import json, urllib.request, ssl, xml.etree.ElementTree` needs under
-  `-I -S -B`; it needs no ancestor metadata. `process-fork` stays denied and
-  the script is never exec-allowed. `/usr/bin/python3` is an `xcrun` shim and
-  is never used. A python.org framework left `root:admin` 0775 (as on the
-  development host, where admin users had written into it) fails the trust
-  check; the CommandLineTools framework (`root:wheel` 0755) passes.
-- **Linux.** Canonical `/usr/bin/python3` with `/usr/lib/python3.N` (and
-  `/usr/lib64/python3.N`) read-only bound at their own paths; argv becomes
-  `<interpreter> -I -S -B /app/<script>`, under the forwarder when brokered.
-  `site-packages` is off `sys.path` (`-S`) but not hidden. This path is
-  compile-checked only.
+- **macOS.** Candidates in order: python.org, then CommandLineTools
+  `…/Versions/Current/bin/python3`. Xcode.app is not a candidate:
+  `/Applications` is `root:admin` 0775 on stock macOS, so it can never pass.
+  The jail execs the framework's `Resources/Python.app/Contents/MacOS/Python`
+  directly (the `bin` binary is a stub that would re-exec it) and pins the
+  framework library. The profile is the strict profile rendered with the
+  interpreter as the sole `process-exec` literal, plus a read-only literal of
+  the script snapshot, read-only literals of the pinned images, a read-only
+  `Versions/X.Y/lib` subpath and a final deny of `lib/pythonX.Y/site-packages`.
+  That is exactly what `import json, urllib.request, ssl, xml.etree.ElementTree`
+  needs under `-I -S -B`; it needs no ancestor metadata. `process-fork` stays
+  denied and the script is never exec-allowed. `/usr/bin/python3` is an `xcrun`
+  shim and is never used. The python.org installer leaves its framework
+  `root:admin` 0775 (on the development host admin users had written into it),
+  so it fails the trust check until it is made root-owned and
+  `chmod -R go-w`; the CommandLineTools framework (`root:wheel` 0755) passes.
+- **Linux.** Canonical `/usr/bin/python3` (`python3.N`). Candidate stdlib
+  roots `/usr/lib/python3.N` and `/usr/lib64/python3.N` are canonicalized and
+  deduplicated (Arch links `lib64` to `lib`). A shared-libpython build
+  (Fedora, RHEL, Arch) keeps the interpreter in `libpython3.N.so.*`: its
+  `DT_NEEDED` entry is read from the executable's ELF64 dynamic section and
+  the library, found as a regular file in the canonical `/usr/lib64`,
+  `/usr/lib/<multiarch>` or `/usr/lib`, is pinned as an image; a needed
+  libpython that is missing, a symlink or of another version refuses. The
+  interpreter, images and roots are read-only bound at their own paths; argv
+  becomes `<interpreter> -I -S -B /app/<script>`, under the forwarder when
+  brokered. Bubblewrap has no exec control (`/work` is not `noexec` and there
+  is no seccomp filter), so the audit reports `script_exec_denied: false`
+  there, and `site-packages` is off `sys.path` (`-S`) but readable
+  (`site_packages_read_denied: false`). This path is compile-checked only.
+- **No native code from the workdir (both modes, macOS).** The workdir is the
+  only writable subtree, and `0.1.77` adds
+  `(deny file-map-executable (subpath "<workdir>"))` to the strict profile, so
+  nothing written there can be mapped executable: not by `dlopen`/`ctypes`,
+  and not by `DYLD_INSERT_LIBRARIES` on a re-exec (dyld then refuses to
+  start). This deliberately changes the strict profile and rotates the macOS
+  strict and brokered identities. The jail also strips `DYLD_*` and
+  `__PYVENV_LAUNCHER__` from the child environment; manifest validation
+  already refuses `DYLD_*`.
 - **Identity.** `profile_identity()` in interpreter mode equals
   `governed_process_jail_interpreter_profile_identity(platform, network, kind,
   version)`: the placeholder-rendered template plus interpreter kind,
-  `major.minor` and flags, with no host path. `GovernedProcessJailAudit::interpreter`
-  records kind, version, digest and flags. Existing profiles, argv, identities
-  and audit JSON are unchanged and pinned by golden tests.
+  `major.minor` and flags, with no host path. It binds `major.minor` only, on
+  purpose: a patch update of the pinned interpreter changes the audited
+  digest, not the lock identity. `GovernedProcessJailAudit::interpreter`
+  records kind, version and digest. `launch_flags` and
+  `launch_user_site_disabled` are launch hygiene; `script_exec_denied` and
+  `site_packages_read_denied` are profile guarantees and are `false` where the
+  platform cannot enforce them. Golden tests pin every profile, argv and
+  identity.
 - **Limits.** The flags are hygiene; the sandbox is the boundary. A script
-  can `exec()` Python it builds, re-exec the interpreter literal without
-  flags, or load `ctypes` libraries from readable system paths, all still
+  can re-exec the interpreter literal without `-I -S -B` (a test shows the
+  re-exec still cannot read the host home or `~/.ssh`), `exec()` Python it
+  builds, or run native code from anonymous memory through `ctypes`. It
+  cannot load native code from files it writes (macOS). All of it stays
   inside the same profile. Single-file stdlib-only scripts are the supported
   shape: `-I` puts neither the script directory nor the cwd on `sys.path`.
+  Trust checks read ownership and mode bits only; ACLs are not inspected
+  (as for the trusted launcher).
+
+### Also in `0.1.77`
+
+- **macOS process watchdog.** It sized its process-group query with a null
+  buffer, which XNU answers with a system-wide estimate, so every jailed
+  child that lived long enough to be sampled ended as `ProcessLimitExceeded`.
+  It now queries into a fixed buffer larger than the ceiling; a full buffer
+  is a breach.
+- **Linux egress forwarder.** A broker or client that hangs up is marked gone
+  once and leaves the poll set when nothing is left to read from it, so a
+  broker hang-up with a reply still buffered for a slow client no longer
+  spins until `RLIMIT_CPU`. Accept failures such as `EMFILE` pause the
+  listener for 250 ms or until a relay closes. Broker connects are
+  non-blocking (a full backlog closes that client instead of stalling every
+  relay; an in-progress connect is bounded to 2 s). When the child exits,
+  bytes it already sent are still delivered to the broker for up to 1 s. The
+  forwarder clamps its relays to what its `RLIMIT_NOFILE` leaves after the
+  descriptors open at start (inherited ones included), and a Linux brokered
+  jail refuses `max_open_files` below `MIN_GOVERNED_JAIL_BROKERED_OPEN_FILES`
+  (8). A forwarder candidate that cannot be sized or read is skipped.
+- **Launch errors.** A pinned interpreter that changed before launch is
+  reported as `GovernedBatchProcessErrorCode::InterpreterUnavailable`, not
+  `JailUnavailable`.
 
 ## Declared login prompts
 

@@ -18,12 +18,16 @@ use crate::{
     credential_materialization::ChildEnvironmentValues,
     governed_batch_process::{
         GovernedBatchCancellation, GovernedBatchExecutor, GovernedBatchProcess,
+        GovernedBatchProcessErrorCode,
     },
     governed_execution::{
         GovernedExecutionContract, GovernedExecutionPolicy, GovernedExecutionRequest,
         GovernedExecutionTerminal,
     },
-    governed_execution_authority::{GovernedExecutionAuthority, GovernedExpectedExecutableDigest},
+    governed_execution_authority::{
+        GovernedExecutionAuthority, GovernedExecutionAuthorityErrorCode,
+        GovernedExpectedExecutableDigest,
+    },
     manifest::{
         AuthContract, CliInteraction, PolicyFloor, RuntimeLimits, RuntimeProtocol,
         RuntimeRequirements, SkillRuntimeContract, SkillRuntimeContractVersion, StdinContract,
@@ -135,6 +139,23 @@ pub(super) struct JailedRun {
     pub(super) stderr: String,
 }
 
+/// A skipped real-jail test says so on stderr. On a Linux host that sets
+/// `MAGICRUN_REQUIRE_LINUX_JAIL=1` (CI with `bwrap`, the forwarder and a
+/// trusted python3 installed) a skip is a failure instead.
+pub(super) fn skip(reason: &str) {
+    if cfg!(target_os = "linux") && std::env::var_os("MAGICRUN_REQUIRE_LINUX_JAIL").is_some_and(|value| value == "1") {
+        panic!("MAGICRUN_REQUIRE_LINUX_JAIL=1 but the real-jail test would skip: {reason}");
+    }
+    eprintln!("SKIP: {reason}");
+}
+
+/// Why a governed jailed run was refused before or at dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JailRunError {
+    Authority(GovernedExecutionAuthorityErrorCode),
+    Batch(GovernedBatchProcessErrorCode),
+}
+
 /// Run `bin` (resolved from `/usr/bin:/bin`) with `arguments` inside `jail`
 /// through the same governed batch path Magician uses.
 fn run_in_jail(jail: GovernedProcessJail, bin: &str, arguments: &[&str]) -> JailedRun {
@@ -154,8 +175,7 @@ fn run_in_jail_with_environment(
 }
 
 /// The governed batch path with a caller `PATH` for resolution and an
-/// optional install-review executable digest. Setup failures are returned as
-/// their value-free debug form.
+/// optional install-review executable digest. Refusals keep their code.
 pub(super) fn try_run_in_jail(
     jail: GovernedProcessJail,
     search_path: &str,
@@ -163,7 +183,7 @@ pub(super) fn try_run_in_jail(
     arguments: &[&str],
     fixed: &[(&str, &str)],
     expected_executable: Option<[u8; 32]>,
-) -> Result<JailedRun, String> {
+) -> Result<JailedRun, JailRunError> {
     let authored = SkillRuntimeContract {
         schema_version: SkillRuntimeContractVersion::v1(),
         requires: RuntimeRequirements {
@@ -234,7 +254,7 @@ pub(super) fn try_run_in_jail(
             GovernedExpectedExecutableDigest::from_blake3(digest),
         ),
     }
-    .map_err(|error| format!("{error:?}"))?;
+    .map_err(|error| JailRunError::Authority(error.code))?;
     let parts = authority.into_parts();
     let mut environment = parts
         .environment
@@ -243,9 +263,9 @@ pub(super) fn try_run_in_jail(
         .collect::<Vec<_>>();
     environment.sort_by(|left, right| left.0.cmp(&right.0));
     let process = GovernedBatchProcess::from_authorized_parts_in_jail(parts, environment, jail)
-        .map_err(|error| format!("{error:?}"))?;
+        .map_err(|error| JailRunError::Batch(error.code))?;
     let result = GovernedBatchExecutor::execute(process, &GovernedBatchCancellation::new())
-        .map_err(|error| format!("{error:?}"))?;
+        .map_err(|error| JailRunError::Batch(error.code))?;
     let terminal = result.terminal().terminal();
     let exit_code = result.exit_code();
     let parts = result.into_parts();
@@ -560,6 +580,7 @@ mod linux {
                         | GovernedProcessJailErrorCode::EgressForwarderUnavailable
                 ) =>
             {
+                skip(&format!("no Linux brokered jail on this host: {error}"));
                 None
             }
             Err(error) => panic!("unexpected brokered jail setup failure: {error}"),

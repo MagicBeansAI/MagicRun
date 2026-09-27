@@ -26,13 +26,48 @@ pub const FORWARDER_EXIT_USAGE: i32 = 125;
 /// Exit status when the child cannot be started.
 pub const FORWARDER_EXIT_SPAWN: i32 = 127;
 /// Concurrent relayed connections; further connections wait in the listen
-/// backlog. Two descriptors each plus stdio and the listener stay well under
-/// the jail's `RLIMIT_NOFILE` ceiling (`MAX_GOVERNED_JAIL_OPEN_FILES`).
+/// backlog. The forwarder clamps this to what its `RLIMIT_NOFILE` allows (see
+/// [`connection_capacity_for`]).
 pub const MAX_FORWARDER_CONNECTIONS: usize = 16;
+/// Descriptors the forwarder needs besides its relays: stdio (3), the
+/// listener (1) and the child spawn's error pipe (2).
+const FORWARDER_FIXED_DESCRIPTORS: u64 = 6;
+/// The smallest `RLIMIT_NOFILE` that fits the fixed descriptors plus one
+/// relay (client and broker sockets). A brokered Linux jail refuses a lower
+/// `max_open_files`.
+pub const FORWARDER_MIN_OPEN_FILES: u64 = FORWARDER_FIXED_DESCRIPTORS + 2;
 #[cfg(unix)]
 const RELAY_BUFFER_BYTES: usize = 16 * 1024;
 #[cfg(unix)]
 const POLL_INTERVAL_MS: i32 = 50;
+/// Bound on a non-blocking broker connect that is still in progress.
+#[cfg(unix)]
+const CONNECT_TIMEOUT_MS: u64 = 2_000;
+/// After the child exits, bytes it already sent are still delivered to the
+/// broker for at most this long.
+#[cfg(unix)]
+const EXIT_DRAIN_MS: u64 = 1_000;
+/// After an accept failure the next poll would repeat (descriptor
+/// exhaustion), the listener is left out of the poll set for this long or
+/// until a relay closes.
+#[cfg(unix)]
+const ACCEPT_PAUSE_MS: u64 = 250;
+/// Read/write rounds per direction per wake-up, so one busy relay cannot
+/// starve the others or the child's exit check.
+#[cfg(unix)]
+const PUMP_ROUNDS: usize = 16;
+
+/// Concurrent relays that fit a soft `RLIMIT_NOFILE` of `soft` when `open`
+/// descriptors (stdio, the listener, anything inherited) are already in use:
+/// two each after those and the spawn pipe, at least one and at most
+/// [`MAX_FORWARDER_CONNECTIONS`].
+pub fn connection_capacity_for(soft: u64, open: u64) -> usize {
+    let reserved = open.max(FORWARDER_FIXED_DESCRIPTORS - 2).saturating_add(2);
+    let relays = soft.saturating_sub(reserved) / 2;
+    usize::try_from(relays)
+        .unwrap_or(usize::MAX)
+        .clamp(1, MAX_FORWARDER_CONNECTIONS)
+}
 
 /// A parsed forwarder invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,16 +127,18 @@ mod unix {
         io::{self, ErrorKind, Read, Write},
         net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream},
         os::{
-            fd::AsRawFd,
-            unix::{net::UnixStream, process::ExitStatusExt},
+            fd::{AsRawFd, FromRawFd, RawFd},
+            unix::{ffi::OsStrExt, net::UnixStream, process::ExitStatusExt},
         },
         path::Path,
         process::{Command, ExitStatus},
+        time::{Duration, Instant},
     };
 
     use super::{
-        ForwarderInvocation, FORWARDER_EXIT_SPAWN, FORWARDER_EXIT_USAGE, MAX_FORWARDER_CONNECTIONS,
-        POLL_INTERVAL_MS, RELAY_BUFFER_BYTES,
+        connection_capacity_for, ForwarderInvocation, ACCEPT_PAUSE_MS, CONNECT_TIMEOUT_MS,
+        EXIT_DRAIN_MS, FORWARDER_EXIT_SPAWN, FORWARDER_EXIT_USAGE, POLL_INTERVAL_MS, PUMP_ROUNDS,
+        RELAY_BUFFER_BYTES,
     };
 
     pub(super) fn run(invocation: &ForwarderInvocation) -> Result<ExitStatus, i32> {
@@ -112,6 +149,7 @@ mod unix {
         listener
             .set_nonblocking(true)
             .map_err(|_| FORWARDER_EXIT_USAGE)?;
+        let capacity = connection_capacity(&listener);
         let mut command = Command::new(&invocation.program);
         command.args(&invocation.arguments);
         #[cfg(target_os = "linux")]
@@ -130,90 +168,240 @@ mod unix {
         }
         let mut child = command.spawn().map_err(|_| FORWARDER_EXIT_SPAWN)?;
         let mut connections: Vec<Connection> = Vec::new();
+        let mut accept_paused_until: Option<Instant> = None;
         loop {
-            let mut descriptors = Vec::with_capacity(1 + connections.len() * 2);
-            let listening = connections.len() < MAX_FORWARDER_CONNECTIONS;
-            if listening {
-                descriptors.push(libc::pollfd {
-                    fd: listener.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                });
+            if accept_paused_until.is_some_and(|until| Instant::now() >= until) {
+                accept_paused_until = None;
             }
-            for connection in &connections {
-                let (client, upstream) = connection.interest();
-                descriptors.push(libc::pollfd {
-                    fd: connection.client.as_raw_fd(),
-                    events: client,
-                    revents: 0,
-                });
-                descriptors.push(libc::pollfd {
-                    fd: connection.upstream.as_raw_fd(),
-                    events: upstream,
-                    revents: 0,
-                });
-            }
-            // SAFETY: `descriptors` is a live, initialized pollfd slice for
-            // the duration of the call and its length is passed exactly.
-            let ready = unsafe {
-                libc::poll(
-                    descriptors.as_mut_ptr(),
-                    descriptors.len() as libc::nfds_t,
-                    POLL_INTERVAL_MS,
-                )
-            };
-            if ready < 0 && io::Error::last_os_error().kind() != ErrorKind::Interrupted {
+            let listening = connections.len() < capacity && accept_paused_until.is_none();
+            if !poll_round(listening.then_some(&listener), &mut connections, false, POLL_INTERVAL_MS) {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(FORWARDER_EXIT_USAGE);
             }
             if let Some(status) = child.try_wait().map_err(|_| FORWARDER_EXIT_USAGE)? {
+                drain_outbound(&mut connections);
                 return Ok(status);
             }
-            // `poll` reports hang-up and error even on a descriptor with no
-            // registered interest; without looking, a dead peer would make
-            // every poll return at once and spin the relay.
-            if ready > 0 {
-                let offset = usize::from(listening);
-                for (connection, pair) in connections
-                    .iter_mut()
-                    .zip(descriptors[offset..].chunks_exact(2))
-                {
-                    connection.observe(pair[0].revents, pair[1].revents);
-                }
+            if listening
+                && accept_pending(&listener, &invocation.socket, &mut connections, capacity).is_err()
+            {
+                accept_paused_until = Some(Instant::now() + Duration::from_millis(ACCEPT_PAUSE_MS));
             }
-            accept_pending(&listener, &invocation.socket, &mut connections);
             for connection in &mut connections {
                 connection.pump();
             }
+            let open = connections.len();
             connections.retain(|connection| !connection.finished());
+            if connections.len() < open {
+                accept_paused_until = None;
+            }
         }
     }
 
-    fn accept_pending(listener: &TcpListener, socket: &Path, connections: &mut Vec<Connection>) {
-        while connections.len() < MAX_FORWARDER_CONNECTIONS {
+    /// Relays that fit this process's descriptor limit, counting the
+    /// descriptors actually open now (the listener included), so inherited
+    /// descriptors cannot push a relay into `EMFILE`.
+    fn connection_capacity(listener: &TcpListener) -> usize {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes only the provided, live `rlimit`.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+            return 1;
+        }
+        let soft = u64::from(limit.rlim_cur);
+        let highest = soft.min(4096).max(listener.as_raw_fd() as u64 + 1);
+        let open = (0..highest)
+            // SAFETY: `F_GETFD` only queries a descriptor number; an unused
+            // number fails with `EBADF`.
+            .filter(|fd| unsafe { libc::fcntl(*fd as RawFd, libc::F_GETFD) } != -1)
+            .count() as u64;
+        connection_capacity_for(soft, open)
+    }
+
+    /// Poll the listener (when given) and every relay, then hand each relay
+    /// its events. A descriptor whose peer is gone and that has nothing left
+    /// to transfer is left out: `poll` reports hang-up even with no requested
+    /// events, and keeping it would wake every round and spin. `false` on a
+    /// poll failure other than an interruption.
+    fn poll_round(
+        listener: Option<&TcpListener>,
+        connections: &mut [Connection],
+        outbound_only: bool,
+        timeout_ms: i32,
+    ) -> bool {
+        let mut descriptors = Vec::with_capacity(1 + connections.len() * 2);
+        if let Some(listener) = listener {
+            descriptors.push(libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        for connection in connections.iter() {
+            let (client, upstream) = connection.interest(outbound_only);
+            let client_fd = if connection.client_gone && client == 0 {
+                -1
+            } else {
+                connection.client.as_raw_fd()
+            };
+            let upstream_fd = if connection.upstream_gone && upstream == 0 {
+                -1
+            } else {
+                connection.upstream.as_raw_fd()
+            };
+            descriptors.push(libc::pollfd {
+                fd: client_fd,
+                events: client,
+                revents: 0,
+            });
+            descriptors.push(libc::pollfd {
+                fd: upstream_fd,
+                events: upstream,
+                revents: 0,
+            });
+        }
+        // SAFETY: `descriptors` is a live, initialized pollfd slice for the
+        // duration of the call and its length is passed exactly. Negative
+        // descriptors are ignored by `poll` and get no events.
+        let ready = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
+        if ready < 0 {
+            return io::Error::last_os_error().kind() == ErrorKind::Interrupted;
+        }
+        if ready > 0 {
+            let offset = usize::from(listener.is_some());
+            for (connection, pair) in connections
+                .iter_mut()
+                .zip(descriptors[offset..].chunks_exact(2))
+            {
+                connection.observe(pair[0].revents, pair[1].revents);
+            }
+        }
+        true
+    }
+
+    /// The child has exited: deliver what it already sent to the broker, for
+    /// at most `EXIT_DRAIN_MS`, so a fire-and-forget upload is not cut short.
+    fn drain_outbound(connections: &mut Vec<Connection>) {
+        let deadline = Instant::now() + Duration::from_millis(EXIT_DRAIN_MS);
+        loop {
+            for connection in connections.iter_mut() {
+                connection.pump_outbound();
+            }
+            connections.retain(|connection| !connection.outbound_settled());
+            let now = Instant::now();
+            if connections.is_empty() || now >= deadline {
+                return;
+            }
+            let remaining = (deadline - now).as_millis().clamp(1, POLL_INTERVAL_MS as u128) as i32;
+            if !poll_round(None, connections, true, remaining) {
+                return;
+            }
+        }
+    }
+
+    /// Accept until the listen queue is empty or `capacity` is reached. A
+    /// client whose broker connection cannot start at once is closed rather
+    /// than stalling every other relay. `Err` when accepting failed in a way
+    /// the next poll would repeat (descriptor exhaustion and the like).
+    fn accept_pending(
+        listener: &TcpListener,
+        socket: &Path,
+        connections: &mut Vec<Connection>,
+        capacity: usize,
+    ) -> Result<(), ()> {
+        while connections.len() < capacity {
             let client = match listener.accept() {
                 Ok((client, _)) => client,
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => return,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(error)
+                    if error.kind() == ErrorKind::Interrupted
+                        || error.raw_os_error() == Some(libc::ECONNABORTED) =>
+                {
+                    continue
+                },
+                Err(_) => return Err(()),
             };
-            let Ok(upstream) = UnixStream::connect(socket) else {
-                continue;
-            };
-            if client.set_nonblocking(true).is_err()
-                || upstream.set_nonblocking(true).is_err()
-                || client.set_nodelay(true).is_err()
-            {
+            if client.set_nonblocking(true).is_err() || client.set_nodelay(true).is_err() {
                 continue;
             }
+            let Ok((upstream, connected)) = connect_nonblocking(socket) else {
+                continue;
+            };
             connections.push(Connection {
                 client,
                 upstream,
                 outbound: Pipe::new(),
                 inbound: Pipe::new(),
+                connecting: (!connected)
+                    .then(|| Instant::now() + Duration::from_millis(CONNECT_TIMEOUT_MS)),
+                client_gone: false,
+                upstream_gone: false,
                 failed: false,
             });
         }
+        Ok(())
+    }
+
+    /// Start a non-blocking connection to the broker socket: `(stream, true)`
+    /// when connected, `(stream, false)` while in progress. A full broker
+    /// backlog (`EAGAIN`) or a refusal is an error; nothing blocks.
+    fn connect_nonblocking(path: &Path) -> io::Result<(UnixStream, bool)> {
+        let bytes = path.as_os_str().as_bytes();
+        // SAFETY: an all-zero `sockaddr_un` is a valid (empty) address.
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
+            return Err(ErrorKind::InvalidInput.into());
+        }
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+            *slot = *byte as libc::c_char;
+        }
+        let length = std::mem::size_of::<libc::sockaddr_un>();
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        {
+            address.sun_len = length as u8;
+        }
+        // SAFETY: plain socket creation; the descriptor is owned below.
+        let fd: RawFd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a fresh socket owned by nothing else; the stream
+        // closes it on every path from here.
+        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        // The child was spawned before any relay exists, so this cannot race
+        // an exec; close-on-exec keeps the invariant explicit anyway.
+        // SAFETY: `fcntl(F_SETFD)` on a descriptor this function owns.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        stream.set_nonblocking(true)?;
+        // SAFETY: `address` is a live, initialized `sockaddr_un` of `length`
+        // bytes whose path is NUL-terminated by the zeroed tail.
+        let result = unsafe {
+            libc::connect(
+                fd,
+                (&address as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                length as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            return Ok((stream, true));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EINPROGRESS) {
+            return Ok((stream, false));
+        }
+        Err(error)
     }
 
     struct Pipe {
@@ -247,32 +435,46 @@ mod unix {
             self.source_closed && !self.has_data() && self.sink_shut
         }
 
-        /// Move what is available without blocking. `Err` ends the connection.
+        /// Move what is available without blocking, for a bounded number of
+        /// rounds. A read error ends the source like EOF (bytes already read
+        /// are still delivered). `Err` means the sink can take no more.
         fn pump(
             &mut self,
             source: &mut impl Read,
             sink: &mut impl Write,
             shut_sink: impl FnOnce() -> io::Result<()>,
-        ) -> io::Result<()> {
-            if self.wants_read() {
-                match source.read(&mut self.buffer[self.end..]) {
-                    Ok(0) => self.source_closed = true,
-                    Ok(read) => self.end += read,
-                    Err(error) if would_block(&error) => {}
-                    Err(error) => return Err(error),
+        ) -> Result<(), ()> {
+            for _ in 0..PUMP_ROUNDS {
+                let mut progressed = false;
+                if self.wants_read() {
+                    match source.read(&mut self.buffer[self.end..]) {
+                        Ok(0) => self.source_closed = true,
+                        Ok(read) => {
+                            self.end += read;
+                            progressed = true;
+                        },
+                        Err(error) if would_block(&error) => {},
+                        Err(_) => self.source_closed = true,
+                    }
                 }
-            }
-            while self.has_data() {
-                match sink.write(&self.buffer[self.start..self.end]) {
-                    Ok(0) => return Err(ErrorKind::WriteZero.into()),
-                    Ok(written) => self.start += written,
-                    Err(error) if would_block(&error) => break,
-                    Err(error) => return Err(error),
+                while self.has_data() {
+                    match sink.write(&self.buffer[self.start..self.end]) {
+                        Ok(0) => return Err(()),
+                        Ok(written) => {
+                            self.start += written;
+                            progressed = true;
+                        },
+                        Err(error) if would_block(&error) => break,
+                        Err(_) => return Err(()),
+                    }
                 }
-            }
-            if !self.has_data() {
-                self.start = 0;
-                self.end = 0;
+                if !self.has_data() {
+                    self.start = 0;
+                    self.end = 0;
+                }
+                if !progressed {
+                    break;
+                }
             }
             if self.source_closed && !self.has_data() && !self.sink_shut {
                 self.sink_shut = true;
@@ -294,67 +496,125 @@ mod unix {
         outbound: Pipe,
         /// broker -> client
         inbound: Pipe,
+        /// Deadline of a broker connect still in progress.
+        connecting: Option<Instant>,
+        /// The client hung up or errored: nothing more can be delivered to
+        /// it, but what it already sent is still read and relayed.
+        client_gone: bool,
+        /// The broker hung up, errored or refused a write: nothing more can
+        /// be sent to it, but what it already sent is still delivered.
+        upstream_gone: bool,
         failed: bool,
     }
 
     impl Connection {
-        fn interest(&self) -> (libc::c_short, libc::c_short) {
+        fn interest(&self, outbound_only: bool) -> (libc::c_short, libc::c_short) {
+            if self.connecting.is_some() {
+                return (0, libc::POLLOUT);
+            }
             let mut client = 0;
             let mut upstream = 0;
-            if self.outbound.wants_read() {
-                client |= libc::POLLIN;
+            if !self.upstream_gone {
+                if self.outbound.wants_read() {
+                    client |= libc::POLLIN;
+                }
+                if self.outbound.has_data() {
+                    upstream |= libc::POLLOUT;
+                }
             }
-            if self.inbound.has_data() {
-                client |= libc::POLLOUT;
-            }
-            if self.inbound.wants_read() {
-                upstream |= libc::POLLIN;
-            }
-            if self.outbound.has_data() {
-                upstream |= libc::POLLOUT;
+            if !self.client_gone && !outbound_only {
+                if self.inbound.has_data() {
+                    client |= libc::POLLOUT;
+                }
+                if self.inbound.wants_read() {
+                    upstream |= libc::POLLIN;
+                }
             }
             (client, upstream)
         }
 
-        /// Fail a connection whose descriptors can no longer make progress:
-        /// a client that hung up or errored cannot receive the rest of a
-        /// reply, and a broker that hung up after everything it sent was
-        /// delivered cannot take more of the request.
+        /// Record hang-ups and errors once per peer. Linux reports `POLLHUP`
+        /// for a closed AF_UNIX peer on every poll, requested or not; the
+        /// peer is then marked gone and its descriptor leaves the poll set
+        /// as soon as nothing is left to read from it.
         fn observe(&mut self, client: libc::c_short, upstream: libc::c_short) {
-            let dead = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-            if client & dead != 0
-                || upstream & (libc::POLLERR | libc::POLLNVAL) != 0
-                || (upstream & libc::POLLHUP != 0
-                    && self.inbound.source_closed
-                    && !self.inbound.has_data())
-            {
+            if (client | upstream) & libc::POLLNVAL != 0 {
                 self.failed = true;
+                return;
+            }
+            if self.connecting.is_some() {
+                if client & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    self.failed = true;
+                } else if upstream & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0 {
+                    match self.upstream.take_error() {
+                        Ok(None) => self.connecting = None,
+                        _ => self.failed = true,
+                    }
+                }
+                return;
+            }
+            if upstream & (libc::POLLHUP | libc::POLLERR) != 0 {
+                self.upstream_gone = true;
+            }
+            if client & (libc::POLLHUP | libc::POLLERR) != 0 {
+                self.client_gone = true;
+            }
+        }
+
+        /// `true` while the connection may move bytes.
+        fn ready(&mut self) -> bool {
+            if self.failed {
+                return false;
+            }
+            if let Some(deadline) = self.connecting {
+                if Instant::now() >= deadline {
+                    self.failed = true;
+                }
+                return false;
+            }
+            true
+        }
+
+        fn pump_outbound(&mut self) {
+            if !self.ready() || self.upstream_gone {
+                return;
+            }
+            let upstream = &self.upstream;
+            if self
+                .outbound
+                .pump(&mut &self.client, &mut &self.upstream, || {
+                    upstream.shutdown(Shutdown::Write)
+                })
+                .is_err()
+            {
+                self.upstream_gone = true;
             }
         }
 
         fn pump(&mut self) {
-            if self.failed {
+            self.pump_outbound();
+            if !self.ready() || self.client_gone {
                 return;
             }
-            let upstream = &self.upstream;
             let client = &self.client;
-            let outbound = self
-                .outbound
-                .pump(&mut &self.client, &mut &self.upstream, || {
-                    upstream.shutdown(Shutdown::Write)
-                });
-            let inbound = self
+            if self
                 .inbound
                 .pump(&mut &self.upstream, &mut &self.client, || {
                     client.shutdown(Shutdown::Write)
-                });
-            if outbound.is_err() || inbound.is_err() {
-                self.failed = true;
+                })
+                .is_err()
+            {
+                self.client_gone = true;
             }
         }
 
+        fn outbound_settled(&self) -> bool {
+            self.failed || self.upstream_gone || self.outbound.drained()
+        }
+
         fn finished(&self) -> bool {
-            self.failed || (self.outbound.drained() && self.inbound.drained())
+            self.failed
+                || (self.outbound_settled() && (self.client_gone || self.inbound.drained()))
         }
     }
 
@@ -382,6 +642,23 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn capacity_fits_the_descriptor_limit() {
+        assert_eq!(FORWARDER_MIN_OPEN_FILES, 8);
+        // stdio and the listener open.
+        assert_eq!(connection_capacity_for(FORWARDER_MIN_OPEN_FILES, 4), 1);
+        assert_eq!(connection_capacity_for(0, 4), 1);
+        assert_eq!(connection_capacity_for(12, 4), 3);
+        assert_eq!(connection_capacity_for(38, 4), 16);
+        assert_eq!(connection_capacity_for(64, 4), MAX_FORWARDER_CONNECTIONS);
+        assert_eq!(connection_capacity_for(u64::MAX, 4), MAX_FORWARDER_CONNECTIONS);
+        // Inherited descriptors reduce the relays that fit.
+        assert_eq!(connection_capacity_for(12, 8), 1);
+        assert_eq!(connection_capacity_for(16, 6), 4);
+        // Never fewer reserved than stdio plus the listener.
+        assert_eq!(connection_capacity_for(12, 0), 3);
     }
 
     #[test]

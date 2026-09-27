@@ -4,7 +4,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use super::egress_tests::{try_run_in_jail, JailedRun, JAIL_PROCESS_BUDGET};
+use super::egress_tests::{skip, try_run_in_jail, JailedRun, JAIL_PROCESS_BUDGET};
 use super::*;
 use crate::governed_execution::GovernedExecutionTerminal;
 
@@ -30,15 +30,18 @@ fn strings(args: &[OsString]) -> Vec<&str> {
     args.iter().map(|argument| argument.to_str().unwrap()).collect()
 }
 
-/// Golden: the identities existing locks were computed against, captured
-/// from `main` before interpreter mode existed. They must not move.
+/// Golden: the reviewed profile identities consumers fold into lock digests.
+/// The Linux values are unchanged since `0.1.76`. `0.1.77` deliberately
+/// rotated both macOS values by adding
+/// `(deny file-map-executable (subpath "<workdir>"))` to the strict profile:
+/// strict was `blake3:e783cb6b…020d31`, brokered `blake3:89b6c07b…2f09f6`.
 #[test]
-fn existing_profile_identities_are_unchanged() {
+fn profile_identities_match_the_reviewed_goldens() {
     use GovernedProcessJailNetwork::{BrokeredEgress, Denied};
     use GovernedProcessJailPlatform::{LinuxBubblewrap, MacosSandboxExec};
     for (platform, network, expected) in [
-        (MacosSandboxExec, Denied, "blake3:e783cb6b395ae15b33a2c9ffeeac3a827feb912307c9553903cfa129ed020d31"),
-        (MacosSandboxExec, BrokeredEgress, "blake3:89b6c07beb34a2edccf304a5d77e534a08452be4575bac5e506599b8ea2f09f6"),
+        (MacosSandboxExec, Denied, "blake3:8a06b6cf39f973f5e72e7f56919d42e28949205f84f4a1de52f81d383d32dcd2"),
+        (MacosSandboxExec, BrokeredEgress, "blake3:97a0d14fc4da175cd3f231dbbfc6ce35f3305052c339f83cc86b65da8860aacb"),
         (LinuxBubblewrap, Denied, "blake3:1fc542409c879a757ff387254a29e17370f76b458e98367e4d08b45311cc61a0"),
         (LinuxBubblewrap, BrokeredEgress, "blake3:3c4fcba8aed50880e5899981acc4bb009fe43ec4325eddb62e5301b19ee142cc"),
     ] {
@@ -47,6 +50,28 @@ fn existing_profile_identities_are_unchanged() {
             expected,
             "{platform:?} {network:?}"
         );
+    }
+}
+
+/// Golden: interpreter-mode identities for Python 3.9 and 3.14.
+#[test]
+fn interpreter_profile_identities_match_the_reviewed_goldens() {
+    use GovernedProcessJailNetwork::{BrokeredEgress, Denied};
+    use GovernedProcessJailPlatform::{LinuxBubblewrap, MacosSandboxExec};
+    for (platform, network, minor, expected) in [
+        (MacosSandboxExec, Denied, 9, "blake3:cf6750189aa80f18332c78698ce51576d45aa2dde6a94beb2a2612336d2a7494"),
+        (MacosSandboxExec, Denied, 14, "blake3:a47ea4ba6a97e7bb1ef057b346f63c67c749ab33e262e947f59868b9cfcc4ac3"),
+        (MacosSandboxExec, BrokeredEgress, 9, "blake3:cc6fa6d8a746bd393d35fe92b8aa090add58f61f0fe45595e31bb365482b4116"),
+        (LinuxBubblewrap, Denied, 9, "blake3:58e25e84baf6c46db8c0473fdfa1f0023a1dc3e74b1ae33e0fabf4038dcd57ae"),
+        (LinuxBubblewrap, BrokeredEgress, 14, "blake3:d2b1152346f41b29a61b777239e8a533800df75753c1136a1044ad1d51047852"),
+    ] {
+        let identity = governed_process_jail_interpreter_profile_identity(
+            platform,
+            network,
+            GovernedJailInterpreterKind::Python3,
+            GovernedJailInterpreterVersion { major: 3, minor },
+        );
+        assert_eq!(identity.to_string(), expected, "{platform:?} {network:?} 3.{minor}");
     }
 }
 
@@ -114,6 +139,7 @@ fn macos_interpreter_profile_execs_only_the_interpreter() {
          (allow file-read* (subpath \"/private/tmp/governed-bundle\"))\n\
          (allow file-read* (subpath \"/private/tmp/private-work\"))\n\
          (allow file-write* (subpath \"/private/tmp/private-work\"))\n\
+         (deny file-map-executable (subpath \"/private/tmp/private-work\"))\n\
          (allow file-read* (literal \"/private/tmp/governed-bundle/skill\"))\n\
          (allow file-read* (literal \"/Library/Py.framework/Versions/3.9/Py\"))\n\
          (allow file-read* (subpath \"/Library/Py.framework/Versions/3.9/lib\"))\n\
@@ -244,16 +270,155 @@ fn user_owned_or_symlinked_candidates_are_refused() {
     }
 }
 
-/// A library tree with a user-owned entry anywhere under it is refused.
+/// The library-tree walk applies its predicate to every entry at any depth,
+/// checks but does not descend into denied subtrees, and is bounded. The
+/// real predicate refuses user-owned entries and accepts root-owned ones.
 #[test]
-fn library_tree_with_a_user_owned_entry_is_refused() {
-    let root = tempfile::tempdir().unwrap();
-    let root_path = fs::canonicalize(root.path()).unwrap();
-    fs::create_dir_all(root_path.join("python3.9")).unwrap();
+fn library_tree_walk_checks_every_entry_prunes_denied_subtrees_and_is_bounded() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(directory.path()).unwrap();
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    fs::write(root.join("a/b/file"), b"").unwrap();
+    fs::create_dir_all(root.join("denied/inner")).unwrap();
+    fs::write(root.join("denied/inner/bad"), b"").unwrap();
+    let named = |name: &'static str| {
+        move |path: &Path, _: &fs::Metadata| path.file_name() != Some(std::ffi::OsStr::new(name))
+    };
+    let code = |result: Result<(), GovernedProcessJailError>| result.unwrap_err().code;
+    // A refused entry three levels deep is found.
     assert_eq!(
-        validate_trusted_tree(&root_path, &[]).unwrap_err().code,
+        code(walk_tree(&root, &[], 100, named("file"))),
         GovernedProcessJailErrorCode::InterpreterUnavailable
     );
+    assert_eq!(
+        code(walk_tree(&root, &[], 100, named("bad"))),
+        GovernedProcessJailErrorCode::InterpreterUnavailable
+    );
+    // Under a denied subtree it is never visited, yet the denied entry
+    // itself is still checked.
+    let denied = [root.join("denied")];
+    assert!(walk_tree(&root, &denied, 100, named("bad")).is_ok());
+    assert!(walk_tree(&root, &denied, 100, named("inner")).is_ok());
+    assert!(walk_tree(&root, &denied, 100, named("denied")).is_err());
+    // Six entries: a, a/b, a/b/file, denied, denied/inner, denied/inner/bad.
+    assert!(walk_tree(&root, &[], 6, |_, _| true).is_ok());
+    assert_eq!(
+        code(walk_tree(&root, &[], 5, |_, _| true)),
+        GovernedProcessJailErrorCode::InterpreterUnavailable
+    );
+    // The real predicate.
+    assert!(!trusted_tree_entry(&fs::symlink_metadata(root.join("a/b/file")).unwrap()));
+    assert!(trusted_tree_entry(&fs::symlink_metadata("/usr/lib").unwrap()));
+    assert_eq!(
+        code(validate_trusted_tree(&root, &[])),
+        GovernedProcessJailErrorCode::InterpreterUnavailable
+    );
+}
+
+/// Linux (pure; runs on every host): a synthetic little-endian ELF64 with a
+/// dynamic section, as a shared-libpython launcher would have.
+fn elf_with_needed(machine: u16, needed: &[&str]) -> Vec<u8> {
+    const BASE: u64 = 0x40_0000;
+    let dynamic_offset = 64 + 2 * 56;
+    let dynamic_size = (needed.len() + 2) * 16;
+    let strings_offset = dynamic_offset + dynamic_size;
+    let mut strings = vec![0_u8];
+    let mut name_offsets = Vec::new();
+    for name in needed {
+        name_offsets.push(strings.len() as u64);
+        strings.extend_from_slice(name.as_bytes());
+        strings.push(0);
+    }
+    let total = strings_offset + strings.len();
+    let mut bytes = vec![0_u8; 64];
+    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    bytes[0x12..0x14].copy_from_slice(&machine.to_le_bytes());
+    bytes[0x20..0x28].copy_from_slice(&64_u64.to_le_bytes());
+    bytes[0x36..0x38].copy_from_slice(&56_u16.to_le_bytes());
+    bytes[0x38..0x3a].copy_from_slice(&2_u16.to_le_bytes());
+    for (kind, offset, size) in [(1_u32, 0_u64, total as u64), (2, dynamic_offset as u64, dynamic_size as u64)] {
+        let mut header = vec![0_u8; 56];
+        header[..4].copy_from_slice(&kind.to_le_bytes());
+        header[8..16].copy_from_slice(&offset.to_le_bytes());
+        header[16..24].copy_from_slice(&(BASE + offset).to_le_bytes());
+        header[32..40].copy_from_slice(&size.to_le_bytes());
+        bytes.extend(header);
+    }
+    for (tag, value) in name_offsets
+        .iter()
+        .map(|offset| (1_u64, *offset))
+        .chain([(5, BASE + strings_offset as u64), (0, 0)])
+    {
+        bytes.extend(tag.to_le_bytes());
+        bytes.extend(value.to_le_bytes());
+    }
+    bytes.extend(strings);
+    bytes
+}
+
+#[test]
+fn elf_dynamic_section_yields_needed_libraries() {
+    let bytes = elf_with_needed(62, &["libc.so.6", "libpython3.12.so.1.0"]);
+    assert_eq!(
+        elf64_needed(&bytes).unwrap(),
+        ["libc.so.6".to_owned(), "libpython3.12.so.1.0".to_owned()]
+    );
+    assert_eq!(elf64_multiarch(&bytes), Some("x86_64-linux-gnu"));
+    assert_eq!(elf64_multiarch(&elf_with_needed(183, &[])), Some("aarch64-linux-gnu"));
+    assert_eq!(elf64_needed(&elf_with_needed(62, &[])).unwrap(), Vec::<String>::new());
+    // Not ELF64 little-endian, or truncated: refused.
+    assert_eq!(elf64_needed(b"#!/bin/sh\n"), None);
+    let mut big_endian = bytes.clone();
+    big_endian[5] = 2;
+    assert_eq!(elf64_needed(&big_endian), None);
+    assert_eq!(elf64_needed(&bytes[..bytes.len() - 8]), None);
+    assert_eq!(elf64_needed(&bytes[..100]), None);
+}
+
+/// Arch links `/usr/lib64` to `lib`: the layout keeps one canonical stdlib
+/// root and finds a shared libpython there; other libpython names, or one
+/// that is missing, refuse.
+#[test]
+fn linux_layout_dedupes_a_symlinked_lib64_and_pins_a_shared_libpython() {
+    let directory = tempfile::tempdir().unwrap();
+    let prefix = fs::canonicalize(directory.path()).unwrap();
+    fs::create_dir_all(prefix.join("bin")).unwrap();
+    fs::create_dir_all(prefix.join("lib/python3.12")).unwrap();
+    fs::write(prefix.join("lib/python3.12/os.py"), b"").unwrap();
+    std::os::unix::fs::symlink("lib", prefix.join("lib64")).unwrap();
+    let version = GovernedJailInterpreterVersion { major: 3, minor: 12 };
+    let python = prefix.join("bin/python3.12");
+
+    fs::write(&python, elf_with_needed(62, &["libc.so.6"])).unwrap();
+    let layout = linux_python3_layout(&python, version).unwrap();
+    assert_eq!(layout.library_roots, [prefix.join("lib/python3.12")]);
+    assert!(layout.images.is_empty());
+    assert_eq!(
+        canonical_unique_directories([
+            prefix.join("lib64/python3.12"),
+            prefix.join("lib/python3.12"),
+            prefix.join("absent"),
+        ]),
+        [prefix.join("lib/python3.12")]
+    );
+
+    fs::write(&python, elf_with_needed(62, &["libpython3.12.so.1.0", "libc.so.6"])).unwrap();
+    assert!(linux_python3_layout(&python, version).is_none(), "missing libpython refuses");
+    fs::write(prefix.join("lib/libpython3.12.so.1.0"), b"image").unwrap();
+    let layout = linux_python3_layout(&python, version).unwrap();
+    assert_eq!(layout.images, [prefix.join("lib/libpython3.12.so.1.0")]);
+
+    fs::write(&python, elf_with_needed(62, &["libpython3.11.so.1.0"])).unwrap();
+    assert!(linux_python3_layout(&python, version).is_none(), "another version refuses");
+    fs::write(&python, b"not an elf").unwrap();
+    assert!(linux_python3_layout(&python, version).is_none(), "unparseable refuses");
+
+    // A needed libpython that is only a symlink is not a trusted image.
+    let directories = [prefix.join("lib")];
+    fs::remove_file(prefix.join("lib/libpython3.12.so.1.0")).unwrap();
+    fs::write(prefix.join("lib/real.so"), b"image").unwrap();
+    std::os::unix::fs::symlink("real.so", prefix.join("lib/libpython3.12.so.1.0")).unwrap();
+    assert!(linux_libpython_images(&["libpython3.12.so.1.0".to_owned()], version, &directories).is_none());
 }
 
 /// A python.org framework left admin-group-writable is not trusted: any
@@ -346,21 +511,23 @@ fn host_interpreter() -> Option<GovernedJailInterpreter> {
     match GovernedJailInterpreter::python3_for_host() {
         Ok(interpreter) => Some(interpreter),
         Err(error) if candidates.iter().all(|candidate| !Path::new(candidate).exists()) => {
-            eprintln!("skipping: no python3 candidate installed ({error})");
+            skip(&format!("no python3 candidate installed: {error}"));
             None
         },
-        Err(error) if cfg!(target_os = "linux") => {
-            eprintln!("skipping: host python3 is not trusted ({error})");
+        Err(error) => {
+            skip(&format!("no trusted python3 on this host: {error}"));
             None
         },
-        Err(error) => panic!("no trusted python3 on a host that has candidates: {error}"),
     }
 }
 
 fn strict_jail(interpreter: GovernedJailInterpreter) -> Option<GovernedProcessJail> {
     match GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) {
         Ok(jail) => Some(jail.with_interpreter(interpreter).unwrap()),
-        Err(error) if error.code == GovernedProcessJailErrorCode::LauncherUnavailable => None,
+        Err(error) if error.code == GovernedProcessJailErrorCode::LauncherUnavailable => {
+            skip(&format!("no jail launcher on this host: {error}"));
+            None
+        },
         Err(error) => panic!("unexpected strict jail setup failure: {error}"),
     }
 }
@@ -382,8 +549,12 @@ fn json(run: &JailedRun) -> serde_json::Value {
 mod macos {
     use std::{sync::atomic::Ordering, thread, time::Duration};
 
-    use super::super::egress_tests::{TestBroker, Tripwire, TUNNEL_BODY};
+    use super::super::egress_tests::{JailRunError, TestBroker, Tripwire, TUNNEL_BODY};
     use super::*;
+    use crate::{
+        governed_batch_process::GovernedBatchProcessErrorCode,
+        governed_execution_authority::GovernedExecutionAuthorityErrorCode,
+    };
 
     #[test]
     fn host_discovery_pins_a_trusted_framework_python() {
@@ -428,7 +599,8 @@ mod macos {
         let evidence = audit.interpreter.unwrap();
         assert_eq!(evidence.schema_version, GOVERNED_JAIL_INTERPRETER_V1);
         assert_eq!((evidence.version, evidence.digest), (version, digest));
-        assert!(evidence.script_exec_denied && evidence.user_site_denied && evidence.site_packages_read_denied);
+        assert!(evidence.script_exec_denied && evidence.launch_user_site_disabled);
+        assert!(evidence.site_packages_read_denied);
         assert_eq!(
             evidence.profile_identity,
             governed_process_jail_interpreter_profile_identity(
@@ -442,7 +614,7 @@ mod macos {
         let audit_json = serde_json::to_value(audit).unwrap();
         assert_eq!(audit_json["interpreter"]["kind"], "python3");
         assert_eq!(audit_json["interpreter"]["version"], version.to_string());
-        assert_eq!(audit_json["interpreter"]["flags"], serde_json::json!(["-I", "-S", "-B"]));
+        assert_eq!(audit_json["interpreter"]["launch_flags"], serde_json::json!(["-I", "-S", "-B"]));
         assert!(audit_json.get("egress").is_none());
         let rendered = audit_json.to_string();
         assert!(!rendered.contains("/Library") && !rendered.contains("/usr/"), "{rendered}");
@@ -468,7 +640,103 @@ mod macos {
             return;
         };
         let refused = try_run_in_jail(jail, &script.search_path(), SCRIPT_NAME, &[], &[], Some([7; 32]));
-        assert!(refused.is_err());
+        assert_eq!(
+            refused.err(),
+            Some(JailRunError::Authority(GovernedExecutionAuthorityErrorCode::ExecutableChanged))
+        );
+    }
+
+    /// Nothing written to the workdir can be mapped executable: a native
+    /// extension copied there cannot be loaded with `ctypes`, while the same
+    /// module loads from the read-only stdlib.
+    #[test]
+    fn native_code_written_to_the_workdir_cannot_be_loaded() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(jail) = host_interpreter().and_then(strict_jail) else {
+            return;
+        };
+        let script = Script::new(
+            "import ctypes, glob, json, os, shutil\n\
+             dynload = os.path.join(os.path.dirname(os.__file__), 'lib-dynload')\n\
+             source = sorted(glob.glob(os.path.join(dynload, '_json*.so')) or glob.glob(os.path.join(dynload, '*.so')))[0]\n\
+             copy = os.path.join(os.getcwd(), 'planted.so')\n\
+             shutil.copyfile(source, copy)\n\
+             out = {'copied': os.path.getsize(copy) == os.path.getsize(source)}\n\
+             def load(name, path):\n\
+             \x20   try:\n\
+             \x20       ctypes.CDLL(path)\n\
+             \x20       out[name] = 'loaded'\n\
+             \x20   except OSError as error:\n\
+             \x20       out[name] = str(error)\n\
+             load('stdlib', source)\n\
+             load('workdir', copy)\n\
+             print(json.dumps(out))\n",
+        );
+        let output = json(&script.run(jail, &[]));
+        assert_eq!(output["copied"], true, "{output}");
+        assert_eq!(output["stdlib"], "loaded", "{output}");
+        let workdir = output["workdir"].as_str().unwrap();
+        assert!(workdir != "loaded" && workdir.contains("sandbox"), "{output}");
+    }
+
+    /// The launch flags are hygiene: a script can re-exec the interpreter
+    /// without `-I -S -B`, but the re-exec'd interpreter is still inside the
+    /// same profile and cannot read the host home or `~/.ssh`.
+    #[test]
+    fn a_reexec_without_the_launch_flags_stays_inside_the_profile() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(jail) = host_interpreter().and_then(strict_jail) else {
+            return;
+        };
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let script = Script::new(
+            "import json, os, sys\n\
+             if sys.argv[2:] == ['child']:\n\
+             \x20   out = {'isolated': sys.flags.isolated, 'no_site': sys.flags.no_site}\n\
+             \x20   for name, path in [('ssh', os.path.join(sys.argv[1], '.ssh')), ('home', sys.argv[1])]:\n\
+             \x20       try:\n\
+             \x20           os.listdir(path)\n\
+             \x20           out[name] = 'ok'\n\
+             \x20       except BaseException as error:\n\
+             \x20           out[name] = type(error).__name__\n\
+             \x20   print(json.dumps(out))\n\
+             \x20   sys.exit(0)\n\
+             sys.stdout.flush()\n\
+             os.execv(sys.executable, [sys.executable, sys.argv[0], sys.argv[1], 'child'])\n",
+        );
+        let output = json(&script.run(jail, &[home.to_str().unwrap()]));
+        assert_eq!(output["isolated"], 0, "the re-exec dropped -I: {output}");
+        assert_eq!(output["no_site"], 0, "the re-exec dropped -S: {output}");
+        assert_eq!(output["home"], "PermissionError", "{output}");
+        assert_ne!(output["ssh"], "ok", "{output}");
+    }
+
+    /// The jail strips loader injection and the framework launcher override
+    /// from the child environment, whatever put them there.
+    #[test]
+    fn the_child_environment_drops_loader_injection() {
+        let Some(jail) = host_interpreter().and_then(strict_jail) else {
+            return;
+        };
+        let mut command = Command::new("/usr/bin/true");
+        command
+            .env("DYLD_INSERT_LIBRARIES", "/private/tmp/x.dylib")
+            .env("dyld_library_path", "/private/tmp")
+            .env("__PYVENV_LAUNCHER__", "/private/tmp/python")
+            .env("KEPT", "1");
+        jail.harden_environment(&mut command);
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| (name.to_str().unwrap().to_owned(), value.is_some()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for removed in ["DYLD_INSERT_LIBRARIES", "dyld_library_path", "__PYVENV_LAUNCHER__"] {
+            assert_eq!(environment.get(removed), Some(&false), "{removed}");
+        }
+        assert_eq!(environment.get("KEPT"), Some(&true));
     }
 
     #[test]
@@ -724,7 +992,10 @@ mod macos {
         jail.interpreter.as_mut().unwrap().digest = GovernedProcessJailDigest([0; 32]);
         let script = Script::new("print('must not run')\n");
         let refused = try_run_in_jail(jail, &script.search_path(), SCRIPT_NAME, &[], &[], None);
-        assert!(refused.is_err());
+        assert_eq!(
+            refused.err(),
+            Some(JailRunError::Batch(GovernedBatchProcessErrorCode::InterpreterUnavailable))
+        );
 
         // A swapped, user-owned executable is refused too.
         let Some(mut interpreter) = host_interpreter() else {
@@ -739,6 +1010,28 @@ mod macos {
             jail.with_interpreter(interpreter).err().unwrap().code,
             GovernedProcessJailErrorCode::InterpreterUnavailable
         );
+    }
+
+    /// Regression: the macOS process watchdog sized its group query with a
+    /// null buffer, which XNU answers with a system-wide estimate, so any
+    /// jailed child that lived long enough to be sampled ended as
+    /// `ProcessLimitExceeded`. A child running past several samples, in
+    /// strict and interpreter mode, now completes.
+    #[test]
+    fn a_long_running_jailed_child_is_not_mistaken_for_a_process_breach() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Ok(jail) = GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let run = try_run_in_jail(jail, "/usr/bin:/bin", "sleep", &["1.5"], &[], None).unwrap();
+        assert_eq!(run.terminal, GovernedExecutionTerminal::Success, "stderr={}", run.stderr);
+        let Some(jail) = host_interpreter().and_then(strict_jail) else {
+            return;
+        };
+        let script = Script::new("import json, time\ntime.sleep(1.5)\nprint(json.dumps({'ok': True}))\n");
+        assert_eq!(json(&script.run(jail, &[]))["ok"], true);
     }
 
     #[test]
