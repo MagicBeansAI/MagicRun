@@ -24,8 +24,12 @@ _Current development version: `0.1.78`._
   across every process of the real UID on Linux, and was set to the jail's
   ceiling (16). Any user already running that many processes (a CI runner, a
   service container) saw bubblewrap fail its namespace clone with `EAGAIN`.
-  The parent now counts the UID's processes just before spawn and allows the
-  jail `max_processes` more on top.
+  The parent now counts the UID's tasks (threads, which is what Linux
+  counts) just before spawn and allows the jail `max_processes` more on top.
+- **Egress forwarder: sends lost at child exit on Linux.** A connection the
+  child completed just before exiting could still be in the listen queue, and
+  the post-exit drain never accepted it, so a fire-and-forget upload
+  delivered nothing. The drain now accepts the queue too.
 - **A recreated working directory could pass revalidation on Linux.** Linux
   filesystems reuse a freed inode number immediately, so a directory removed
   and recreated under the same name matched on device and inode alone.

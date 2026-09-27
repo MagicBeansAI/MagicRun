@@ -1629,8 +1629,10 @@ fn apply_jail_rlimits(
     Ok(())
 }
 
-/// Processes owned by this real UID, from `/proc/<pid>/status` (`Uid:` real
-/// field). Bounded; `None` if `/proc` cannot be read.
+/// Tasks owned by this real UID: what Linux's `RLIMIT_NPROC` counts, which
+/// is threads, not processes. Sums `Threads:` over `/proc/<pid>/status`
+/// entries whose real `Uid:` matches. Bounded; `None` if `/proc` cannot be
+/// read.
 #[cfg(target_os = "linux")]
 fn current_uid_process_count() -> Option<u64> {
     const MAX_PROC_ENTRIES: usize = 1 << 20;
@@ -1655,7 +1657,12 @@ fn current_uid_process_count() -> Option<u64> {
             .find_map(|line| line.strip_prefix("Uid:"))
             .and_then(|fields| fields.split_whitespace().next());
         if real == Some(uid.as_str()) {
-            count = count.saturating_add(1);
+            let threads = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Threads:"))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(1);
+            count = count.saturating_add(threads);
         }
     }
     Some(count)

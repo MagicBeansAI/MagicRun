@@ -180,7 +180,7 @@ mod unix {
                 return Err(FORWARDER_EXIT_USAGE);
             }
             if let Some(status) = child.try_wait().map_err(|_| FORWARDER_EXIT_USAGE)? {
-                drain_outbound(&mut connections);
+                drain_outbound(&listener, &invocation.socket, &mut connections, capacity);
                 return Ok(status);
             }
             if listening
@@ -290,9 +290,19 @@ mod unix {
 
     /// The child has exited: deliver what it already sent to the broker, for
     /// at most `EXIT_DRAIN_MS`, so a fire-and-forget upload is not cut short.
-    fn drain_outbound(connections: &mut Vec<Connection>) {
+    /// After the child exits, deliver what it already sent. A connection the
+    /// child completed just before exiting may still sit in the listen queue
+    /// (Linux reports a fully closed client only once its peer closes), so
+    /// the queue is accepted too while under capacity.
+    fn drain_outbound(
+        listener: &TcpListener,
+        socket: &Path,
+        connections: &mut Vec<Connection>,
+        capacity: usize,
+    ) {
         let deadline = Instant::now() + Duration::from_millis(EXIT_DRAIN_MS);
         loop {
+            let _ = accept_pending(listener, socket, connections, capacity);
             for connection in connections.iter_mut() {
                 connection.pump_outbound();
             }
