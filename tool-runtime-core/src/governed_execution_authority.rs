@@ -125,6 +125,13 @@ struct DirectoryIdentity {
     inode: u64,
     #[cfg(unix)]
     owner: u32,
+    /// Birth time where the filesystem records it (`statx` on Linux, APFS on
+    /// macOS). Linux filesystems reuse a freed inode number at once, so a
+    /// directory removed and recreated under the same name can match on
+    /// device and inode alone; its birth time still differs. Change time
+    /// cannot serve here: it moves whenever an entry is created inside.
+    #[cfg(unix)]
+    created: Option<std::time::SystemTime>,
 }
 
 /// Trusted workspace or output-root authority. Opening a root accepts no relative path,
@@ -1047,6 +1054,7 @@ fn directory_identity(
         device: metadata.dev(),
         inode: metadata.ino(),
         owner: metadata.uid(),
+        created: metadata.created().ok(),
     })
 }
 

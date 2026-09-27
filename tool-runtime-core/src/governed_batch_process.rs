@@ -550,6 +550,22 @@ fn execute_spawned(
         command.process_group(0);
         let directory_fd = cwd.as_ref().map(|cwd| cwd.raw_fd());
         let jail_limits = process.jail.as_ref().map(GovernedProcessJail::limits);
+        // Linux counts RLIMIT_NPROC across every process of the real UID, not
+        // just the jail's. Setting it to the ceiling alone made bubblewrap's
+        // own namespace clone fail with EAGAIN for any user already running
+        // that many processes (a CI runner, a service container). Count the
+        // UID's processes here in the parent (the pre-exec child must not
+        // allocate) and allow the jail `max_processes` more on top.
+        #[cfg(target_os = "linux")]
+        let process_ceiling = jail_limits
+            .map(|limits| {
+                current_uid_process_count()
+                    .map(|existing| existing.saturating_add(limits.max_processes))
+                    .ok_or_else(jail_unavailable)
+            })
+            .transpose()?;
+        #[cfg(not(target_os = "linux"))]
+        let process_ceiling: Option<u64> = None;
         #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
         let child_launch_probe = launch_probe.clone(); // parent-only Arc clone
                                                        // SAFETY: `setrlimit` and `fchdir` are async-signal-safe. The optional
@@ -577,7 +593,7 @@ fn execute_spawned(
                     }
                 }
                 if let Some(limits) = jail_limits {
-                    apply_jail_rlimits(limits)?;
+                    apply_jail_rlimits(limits, process_ceiling)?;
                 }
                 if let Some(directory_fd) = directory_fd {
                     if libc::fchdir(directory_fd) == 0 {
@@ -1574,7 +1590,10 @@ fn validate_environment(
 }
 
 #[cfg(unix)]
-fn apply_jail_rlimits(limits: GovernedProcessJailLimits) -> std::io::Result<()> {
+fn apply_jail_rlimits(
+    limits: GovernedProcessJailLimits,
+    process_ceiling: Option<u64>,
+) -> std::io::Result<()> {
     macro_rules! apply {
         ($resource:expr, $value:expr) => {{
             let value = libc::rlim_t::try_from($value)
@@ -1594,13 +1613,52 @@ fn apply_jail_rlimits(limits: GovernedProcessJailLimits) -> std::io::Result<()> 
     apply!(libc::RLIMIT_CPU, limits.cpu_seconds);
     apply!(libc::RLIMIT_NOFILE, limits.max_open_files);
     apply!(libc::RLIMIT_FSIZE, limits.max_file_bytes);
-    // Linux enforces this against the real UID. Existing same-UID processes
-    // can only make the bound stricter (new forks fail sooner), never allow the
-    // jailed group to exceed it. macOS denies process-fork in SBPL instead;
-    // its RLIMIT_NPROC is also user-wide and adds no useful precision there.
+    // Linux enforces this against the real UID across all its processes, so
+    // the value is the UID's existing process count (taken by the parent just
+    // before spawn) plus the jail's ceiling: the jail may create at most
+    // `max_processes` more. Other same-UID processes forking meanwhile only
+    // make it stricter; the sampled watchdog still counts the jail's own group.
+    // macOS denies process-fork in SBPL instead; its RLIMIT_NPROC is also
+    // user-wide and adds no useful precision there.
     #[cfg(target_os = "linux")]
-    apply!(libc::RLIMIT_NPROC, limits.max_processes);
+    if let Some(ceiling) = process_ceiling {
+        apply!(libc::RLIMIT_NPROC, ceiling);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = process_ceiling;
     Ok(())
+}
+
+/// Processes owned by this real UID, from `/proc/<pid>/status` (`Uid:` real
+/// field). Bounded; `None` if `/proc` cannot be read.
+#[cfg(target_os = "linux")]
+fn current_uid_process_count() -> Option<u64> {
+    const MAX_PROC_ENTRIES: usize = 1 << 20;
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() }.to_string();
+    let mut count = 0_u64;
+    for (index, entry) in std::fs::read_dir("/proc").ok()?.enumerate() {
+        if index >= MAX_PROC_ENTRIES {
+            return None;
+        }
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        if !name.to_string_lossy().bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        // A process can exit between listing and reading; that is not an error.
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let real = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|fields| fields.split_whitespace().next());
+        if real == Some(uid.as_str()) {
+            count = count.saturating_add(1);
+        }
+    }
+    Some(count)
 }
 
 fn observe_jail_limits(

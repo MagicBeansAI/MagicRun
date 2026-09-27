@@ -18,6 +18,23 @@ _Current development version: `0.1.78`._
   path is never returned. New error code `InvalidInputFile`. Profiles,
   identities and goldens are unchanged.
 
+### Linux fixes found by the first real Linux run (`0.1.78`)
+
+- **The jail could not start for a busy user.** `RLIMIT_NPROC` is counted
+  across every process of the real UID on Linux, and was set to the jail's
+  ceiling (16). Any user already running that many processes (a CI runner, a
+  service container) saw bubblewrap fail its namespace clone with `EAGAIN`.
+  The parent now counts the UID's processes just before spawn and allows the
+  jail `max_processes` more on top.
+- **A recreated working directory could pass revalidation on Linux.** Linux
+  filesystems reuse a freed inode number immediately, so a directory removed
+  and recreated under the same name matched on device and inode alone.
+  Directory identity now includes birth time where the filesystem records it
+  (`statx` on Linux, APFS on macOS).
+- **CI.** The manual workflow gains a `linux-jail` job (Ubuntu 24.04,
+  unprivileged user namespaces and setuid bubblewrap) with the forwarder
+  installed and `MAGICRUN_REQUIRE_LINUX_JAIL=1`.
+
 ### Interpreter mode for the governed process jail (`0.1.77`)
 
 - Add `GovernedJailInterpreter`, a validated, pinned interpreter produced
