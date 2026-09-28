@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Current development version: `0.1.78`._
 
+### Exec-status channel regression tests (test-only)
+
+- Real-jail Linux tests assert that the exec-status channel's write end is
+  never among the jailed command's descriptors, in strict, interpreter and
+  brokered mode (the brokered child is spawned by the forwarder), and that
+  a brokered command forging a helper refusal is recorded as its own
+  non-zero exit. No runtime or API change.
+
 ### Staged input files (`0.1.78`)
 
 - Add `GovernedProcessJail::stage_input_file(name, bytes)`: one fresh,

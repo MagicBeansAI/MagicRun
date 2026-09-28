@@ -1321,6 +1321,147 @@ mod linux {
         assert_eq!(run.stdout.trim(), "forged");
     }
 
+    /// Python that lists its own descriptors: `FDS()` maps each entry of
+    /// `/proc/self/fd` to its `readlink` target. The directory descriptor
+    /// `os.listdir` used is closed before the links are read, so it drops
+    /// out of the map.
+    const LIST_FDS: &str = "import json, os, socket, sys\n\
+                            def FDS():\n\
+                            \x20   seen = {}\n\
+                            \x20   for name in os.listdir('/proc/self/fd'):\n\
+                            \x20       try:\n\
+                            \x20           seen[int(name)] = os.readlink('/proc/self/fd/' + name)\n\
+                            \x20       except OSError:\n\
+                            \x20           pass\n\
+                            \x20   return seen\n";
+
+    /// A script's descriptors as its `FDS()` reported them: stdio only
+    /// (`/dev/null` and two pipes), no socket and nothing above 2. Without
+    /// the helper marking the status channel close-on-exec, the write end
+    /// (`socket:[inode]`, numbered >= 3 by the runner) would be here.
+    fn assert_stdio_only(fds: &serde_json::Value, output: &serde_json::Value) {
+        let fds = fds.as_object().unwrap_or_else(|| panic!("{output}"));
+        let mut numbers = fds.keys().map(|fd| fd.parse::<u32>().unwrap()).collect::<Vec<_>>();
+        numbers.sort_unstable();
+        assert_eq!(numbers, [0, 1, 2], "only stdio is inherited: {output}");
+        for target in fds.values() {
+            assert!(!target.as_str().unwrap().starts_with("socket:"), "{output}");
+        }
+    }
+
+    /// Interpreter mode: the script sees stdio alone, so the status channel
+    /// is not inherited. A socket pair the script then opens shows up as
+    /// `socket:[...]`: the listing does see an inherited socket if there
+    /// were one.
+    #[test]
+    fn the_status_channel_is_absent_from_a_jailed_script() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(jail) = strict_jail_with(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let script = Script::new(&format!(
+            "{LIST_FDS}\
+             before = FDS()\n\
+             pair = socket.socketpair()\n\
+             control = [target for fd, target in FDS().items() if fd not in before]\n\
+             print(json.dumps({{'fds': before, 'control': control}}))\n"
+        ));
+        let output = json(&script.run(jail, &[]));
+        assert_stdio_only(&output["fds"], &output);
+        let control = output["control"].as_array().unwrap();
+        assert_eq!(control.len(), 2, "{output}");
+        assert!(
+            control.iter().all(|target| target.as_str().unwrap().starts_with("socket:[")),
+            "{output}"
+        );
+    }
+
+    /// Brokered mode, where the helper execs the forwarder and the forwarder
+    /// spawns the command: the command still cannot forge a refusal. It
+    /// reads the status descriptor's number from the jail init's command
+    /// line, finds it closed in itself, writes refusal bytes to it, to every
+    /// low descriptor number and through `/proc/1` and its parent (the
+    /// forwarder), prints the old stderr marker and exits 126. The run is
+    /// its own non-zero exit, never `JailHelperRefused`.
+    #[test]
+    fn a_forged_refusal_in_the_brokered_jail_is_the_commands_own_exit() {
+        use super::super::egress_tests::linux::{brokered, UnixBroker};
+
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(interpreter) = host_interpreter() else {
+            return;
+        };
+        let broker = UnixBroker::start();
+        let Some(jail) = brokered(&broker) else {
+            return;
+        };
+        let jail = jail.with_interpreter(interpreter).unwrap();
+        let script = Script::new(&format!(
+            "{LIST_FDS}\
+             out = {{'fds': FDS()}}\n\
+             try:\n\
+             \x20   with open('/proc/1/cmdline', 'rb') as init:\n\
+             \x20       argv = init.read().split(b'\\0')\n\
+             \x20   status = int(argv[argv.index(b'--magicrun-jail-exec-v1') + 3])\n\
+             \x20   out['status_fd'] = status\n\
+             except (OSError, ValueError, IndexError) as error:\n\
+             \x20   status = None\n\
+             \x20   out['status_fd'] = type(error).__name__\n\
+             out['status_fd_open'] = status is not None and status in FDS()\n\
+             forged = []\n\
+             for fd in sorted(set(range(3, 64)) | ({{status}} if status else set())):\n\
+             \x20   try:\n\
+             \x20       os.write(fd, b'R' * 64)\n\
+             \x20       forged.append(fd)\n\
+             \x20   except OSError:\n\
+             \x20       pass\n\
+             out['forged'] = forged\n\
+             for pid in ('1', str(os.getppid())):\n\
+             \x20   try:\n\
+             \x20       held = os.listdir('/proc/' + pid + '/fd')\n\
+             \x20   except OSError:\n\
+             \x20       continue\n\
+             \x20   for fd in held:\n\
+             \x20       try:\n\
+             \x20           f = os.open('/proc/' + pid + '/fd/' + fd, os.O_WRONLY | os.O_NONBLOCK)\n\
+             \x20       except OSError:\n\
+             \x20           continue\n\
+             \x20       try:\n\
+             \x20           os.write(f, b'R' * 64)\n\
+             \x20       except OSError:\n\
+             \x20           pass\n\
+             \x20       finally:\n\
+             \x20           os.close(f)\n\
+             print(json.dumps(out))\n\
+             sys.stdout.flush()\n\
+             sys.stderr.write('magicrun-jail-helper: refused: no per-jail task ceiling is possible here\\n')\n\
+             sys.stderr.flush()\n\
+             sys.exit(126)\n"
+        ));
+        let run = script.run(jail, &[]);
+        assert_eq!(
+            run.terminal,
+            GovernedExecutionTerminal::NonZeroExit,
+            "stdout={} stderr={}",
+            run.stdout,
+            run.stderr
+        );
+        assert_eq!(run.exit_code, Some(126));
+        let output: serde_json::Value = serde_json::from_str(run.stdout.trim())
+            .unwrap_or_else(|error| panic!("{error}: stdout={} stderr={}", run.stdout, run.stderr));
+        assert_stdio_only(&output["fds"], &output);
+        let status = output["status_fd"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("the jail init's argv names the status fd: {output}"));
+        assert!(status >= 3, "{output}");
+        assert_eq!(output["status_fd_open"], false, "{output}");
+        assert_eq!(output["forged"], serde_json::json!([]), "{output}");
+    }
+
     /// The helper's exec fails after it wrote the dispatching byte: its
     /// later refusal byte does not count, so the run is conservatively
     /// dispatched (a non-zero exit), never `JailHelperRefused`. Refusals
