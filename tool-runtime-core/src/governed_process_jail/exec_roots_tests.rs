@@ -6,7 +6,9 @@ use std::{collections::BTreeSet, os::unix::fs::PermissionsExt};
 
 use super::egress_tests::{skip, try_run_in_jail, JailRunError, JailedRun, JAIL_PROCESS_BUDGET};
 use super::*;
-use crate::governed_execution::GovernedExecutionTerminal;
+use crate::{
+    governed_batch_process::GovernedBatchProcessErrorCode, governed_execution::GovernedExecutionTerminal,
+};
 
 fn strings(args: &[OsString]) -> Vec<&str> {
     args.iter().map(|argument| argument.to_str().unwrap()).collect()
@@ -17,11 +19,11 @@ fn declared_roots() -> GovernedJailExecRoots {
     GovernedJailExecRoots::declared(
         vec![
             GovernedJailExecRoot::new("/opt/skills/yt-dlp").excluding("config"),
-            GovernedJailExecRoot::new("/opt/homebrew"),
+            GovernedJailExecRoot::new("/opt/homebrew/Cellar/node/24.1.0"),
         ],
         vec![
             PathBuf::from("/opt/skills/yt-dlp/bin"),
-            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/opt/homebrew/Cellar/node/24.1.0/bin"),
         ],
     )
     .unwrap()
@@ -36,21 +38,21 @@ fn exec_roots_profile_identities_match_the_reviewed_goldens() {
     let python = |minor| Some((GovernedJailInterpreterKind::Python3, GovernedJailInterpreterVersion { major: 3, minor }));
     let roots = declared_roots();
     for (platform, network, interpreter, expected) in [
-        (MacosSandboxExec, Denied, None, "blake3:882dea3f9ad68d30a34b252ecac88df8f3d520d38d4025a41c70837ac6f17758"),
-        (MacosSandboxExec, BrokeredEgress, None, "blake3:d24d5fbd8ce3da3bdfabb9f14c34157468e9c42d8141ddcbd8e1c4bd87e33ab3"),
-        (MacosSandboxExec, Denied, python(9), "blake3:f9adb289b487c90c1e24641f64d710a49b861fc20e62b66a614e1fcac0b8525a"),
-        (MacosSandboxExec, BrokeredEgress, python(9), "blake3:5cad5cae7dddcd3758fee9501fe327bc0f3db18fd00cbd37cf5968d9461263e4"),
-        (LinuxBubblewrap, Denied, None, "blake3:d2a6631a44b50757bafa7c8cb2560f0ea76ca695b5175719f24972b236ab9368"),
-        (LinuxBubblewrap, BrokeredEgress, None, "blake3:a49b01f659919ac44d421a8b18d46a41ac6c9c2482f97bb96df3d62f96ba1f96"),
-        (LinuxBubblewrap, Denied, python(12), "blake3:92c3ee150ccf806b75bc8b4b4ca648293182a5cfc4b47bd4f8fe82520b679465"),
-        (LinuxBubblewrap, BrokeredEgress, python(12), "blake3:9ad41a994a396fcb307f94bc27be95c9f2d4425d0facde7c810e382a70fc3cce"),
+        (MacosSandboxExec, Denied, None, "blake3:2f54bcf8e3a11be7f5b1e0a6400868aa0eb8a232f77b488befaa4000e9d54a91"),
+        (MacosSandboxExec, BrokeredEgress, None, "blake3:ab20ab27096be74d37f98f1ffc1fb27078f965cbbaea70c68448abf83df63af1"),
+        (MacosSandboxExec, Denied, python(9), "blake3:5675e991b882e662f6257eefde51e64f46b8f8f15473a6a2aab543dd22fe0787"),
+        (MacosSandboxExec, BrokeredEgress, python(9), "blake3:22bf9c6a638b59607fb4eb92883bd110b7c950d34495d367b69e9d275d3fc9bf"),
+        (LinuxBubblewrap, Denied, None, "blake3:a1102fbfa45d1c6d6103186a55d8cdad6de15a9659bf9cc573a0231a2341c5cd"),
+        (LinuxBubblewrap, BrokeredEgress, None, "blake3:2d4d426c362ffe4983d08b7dbf9513798d33760b60a9fab550add74c87b092f7"),
+        (LinuxBubblewrap, Denied, python(12), "blake3:1f6be66afd82de6e3fe39350d07ba5065d091870f080695c19dbba531e3bc6da"),
+        (LinuxBubblewrap, BrokeredEgress, python(12), "blake3:776ee9e7734662d8c4819b0d13229d11814f779bd08ef0fa0619e64ca460f35a"),
     ] {
         let identity = governed_process_jail_exec_roots_profile_identity(platform, network, interpreter, &roots);
         assert_eq!(identity.to_string(), expected, "{platform:?} {network:?} {interpreter:?}");
     }
     assert_eq!(
         roots.declaration_digest().to_string(),
-        "blake3:eb962b95498e8da018bc6ff9816dc19bdc3829f199d171e88a3627277f6a72bb"
+        "blake3:551fb8e1acd926e02afb1e2f4a654d0e5489d367f6e458aa1bf30907d6208e01"
     );
 }
 
@@ -82,29 +84,29 @@ fn exec_roots_identity_is_distinct_and_binds_the_declaration() {
     }
     let variants = [
         GovernedJailExecRoots::declared(
-            vec![GovernedJailExecRoot::new("/opt/skills/yt-dlp"), GovernedJailExecRoot::new("/opt/homebrew")],
-            vec![PathBuf::from("/opt/skills/yt-dlp/bin"), PathBuf::from("/opt/homebrew/bin")],
+            vec![GovernedJailExecRoot::new("/opt/skills/yt-dlp"), GovernedJailExecRoot::new("/opt/homebrew/Cellar/node/24.1.0")],
+            vec![PathBuf::from("/opt/skills/yt-dlp/bin"), PathBuf::from("/opt/homebrew/Cellar/node/24.1.0/bin")],
         ),
         GovernedJailExecRoots::declared(
             vec![
                 GovernedJailExecRoot::new("/opt/skills/yt-dlp").excluding("config"),
-                GovernedJailExecRoot::new("/opt/homebrew"),
+                GovernedJailExecRoot::new("/opt/homebrew/Cellar/node/24.1.0"),
             ],
-            vec![PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/opt/skills/yt-dlp/bin")],
+            vec![PathBuf::from("/opt/homebrew/Cellar/node/24.1.0/bin"), PathBuf::from("/opt/skills/yt-dlp/bin")],
         ),
         GovernedJailExecRoots::declared(
             vec![
                 GovernedJailExecRoot::new("/opt/skills/yt-dlp").excluding("config"),
-                GovernedJailExecRoot::new("/opt/homebrew"),
+                GovernedJailExecRoot::new("/opt/homebrew/Cellar/node/24.1.0"),
             ],
             vec![PathBuf::from("/opt/skills/yt-dlp/bin")],
         ),
         GovernedJailExecRoots::declared(
             vec![
                 GovernedJailExecRoot::new("/opt/skills/yt-dlp").excluding("config/.env"),
-                GovernedJailExecRoot::new("/opt/homebrew"),
+                GovernedJailExecRoot::new("/opt/homebrew/Cellar/node/24.1.0"),
             ],
-            vec![PathBuf::from("/opt/skills/yt-dlp/bin"), PathBuf::from("/opt/homebrew/bin")],
+            vec![PathBuf::from("/opt/skills/yt-dlp/bin"), PathBuf::from("/opt/homebrew/Cellar/node/24.1.0/bin")],
         ),
     ];
     for platform in [MacosSandboxExec, LinuxBubblewrap] {
@@ -129,6 +131,7 @@ fn macos_exec_roots_profile_is_byte_identical_to_the_reviewed_golden() {
         None,
         &declared_roots(),
         Path::new("/private/tmp/private-work"),
+        Path::new("/private/tmp/member-sentinel"),
         None,
     )
     .unwrap();
@@ -144,12 +147,16 @@ fn macos_exec_roots_profile_is_byte_identical_to_the_reviewed_golden() {
         "(allow process-fork)\n\
          (allow signal (target same-sandbox))\n\
          (allow file-write-data (literal \"/dev/null\"))\n\
+         (allow file-read-data (literal \"/private/tmp/member-sentinel\"))\n\
          (allow file-read* process-exec (subpath \"/bin\"))\n\
          (allow file-read* process-exec (subpath \"/usr/bin\"))\n\
          (allow file-read* process-exec file-map-executable (subpath \"/opt/skills/yt-dlp\"))\n\
-         (allow file-read* process-exec file-map-executable (subpath \"/opt/homebrew\"))\n\
+         (allow file-read* process-exec file-map-executable (subpath \"/opt/homebrew/Cellar/node/24.1.0\"))\n\
          (allow file-read-metadata (literal \"/\"))\n\
          (allow file-read-metadata (literal \"/opt\"))\n\
+         (allow file-read-metadata (literal \"/opt/homebrew\"))\n\
+         (allow file-read-metadata (literal \"/opt/homebrew/Cellar\"))\n\
+         (allow file-read-metadata (literal \"/opt/homebrew/Cellar/node\"))\n\
          (allow file-read-metadata (literal \"/opt/skills\"))\n\
          (allow file-read-metadata (literal \"/private\"))\n\
          (allow file-read-metadata (literal \"/private/tmp\"))\n\
@@ -175,6 +182,7 @@ fn macos_exec_roots_profile_with_interpreter_and_egress() {
         Some(&grants),
         &declared_roots(),
         Path::new("/private/tmp/private-work"),
+        Path::new("/private/tmp/member-sentinel"),
         Some(("43127", true)),
     )
     .unwrap();
@@ -199,9 +207,10 @@ fn exec_roots_are_escaped_or_refused() {
         vec![],
     )
     .unwrap();
-    let rules = roots.macos_allow_rules(Path::new("/private/tmp/w")).unwrap()
+    let rules = roots.macos_allow_rules(Path::new("/private/tmp/w"), Path::new("/private/tmp/s\"x")).unwrap()
         + &roots.macos_deny_rules().unwrap();
     assert!(rules.contains("(subpath \"/opt/a\\\"b) (allow default)/ünï\")"), "{rules}");
+    assert!(rules.contains("(literal \"/private/tmp/s\\\"x\")"), "{rules}");
     assert!(rules.contains("(subpath \"/opt/a\\\"b) (allow default)/ünï/c\\\\d\")"), "{rules}");
     for bad in ["/opt/a\nb", "/opt/a\rb", "/opt/a\0b"] {
         assert!(GovernedJailExecRoots::declared(vec![GovernedJailExecRoot::new(bad)], vec![]).is_err(), "{bad:?}");
@@ -215,10 +224,7 @@ fn exec_roots_are_escaped_or_refused() {
 #[test]
 fn linux_exec_roots_argv_is_identical_to_the_reviewed_golden() {
     let roots = declared_roots();
-    let masks = vec![
-        (PathBuf::from("/opt/skills/yt-dlp/config"), LinuxMask::Directory),
-        (PathBuf::from("/opt/skills/yt-dlp/.env"), LinuxMask::File),
-    ];
+    let masks = roots.masks();
     let mounts = LinuxExecRootMounts {
         system: vec![Path::new("/bin"), Path::new("/usr/bin"), Path::new("/usr/lib")],
         roots: &roots,
@@ -248,14 +254,13 @@ fn linux_exec_roots_argv_is_identical_to_the_reviewed_golden() {
             "/proc", "--dev", "/dev", "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
             "--ro-bind", "/bin", "/bin", "--ro-bind", "/usr/bin", "/usr/bin", "--ro-bind",
             "/usr/lib", "/usr/lib", "--ro-bind", "/opt/skills/yt-dlp", "/opt/skills/yt-dlp",
-            "--ro-bind", "/opt/homebrew", "/opt/homebrew", "--tmpfs", "/opt/skills/yt-dlp/config",
-            "--remount-ro", "/opt/skills/yt-dlp/config", "--ro-bind", "/dev/null",
-            "/opt/skills/yt-dlp/.env", "--bind", "/tmp/private-work", "/work", "--ro-bind",
+            "--ro-bind", "/opt/homebrew/Cellar/node/24.1.0", "/opt/homebrew/Cellar/node/24.1.0", "--tmpfs", "/opt/skills/yt-dlp/config",
+            "--remount-ro", "/opt/skills/yt-dlp/config", "--bind", "/tmp/private-work", "/work", "--ro-bind",
             "/usr/libexec/magicrun/magicrun-jail-egress-forwarder", "/run/magicrun/jail-helper",
             "--remount-ro", "/", "--remount-ro", "/proc", "--remount-ro", "/dev", "--chdir",
             "/work", "--setenv", "HOME", "/work", "--setenv", "TMPDIR", "/work", "--setenv", "TMP",
             "/work", "--setenv", "TEMP", "/work", "--setenv", "PATH",
-            "/opt/skills/yt-dlp/bin:/opt/homebrew/bin:/usr/bin:/bin", "--setenv",
+            "/opt/skills/yt-dlp/bin:/opt/homebrew/Cellar/node/24.1.0/bin:/usr/bin:/bin", "--setenv",
             "PYTHONNOUSERSITE", "1", "--setenv", "PYTHONDONTWRITEBYTECODE", "1", "--",
             "/run/magicrun/jail-helper", "--magicrun-jail-exec-v1", "257", "4026531837", "5", "--",
             "/opt/skills/yt-dlp/bin/yt",
@@ -363,7 +368,10 @@ fn host_declarations_refuse_unsafe_roots() {
         assert_eq!(result.err().map(|error| error.code), Some(GovernedProcessJailErrorCode::InvalidExecRoots));
     };
     invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new("/")], []));
-    if let Some(home) = std::env::var_os("HOME").and_then(|home| fs::canonicalize(home).ok()) {
+    // Both `$HOME` and the password database's home directory.
+    let homes = super::exec_roots::home_directories_for_test();
+    assert!(!homes.is_empty());
+    for home in homes {
         invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(&home)], []));
         invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(home.parent().unwrap())], []));
     }
@@ -393,6 +401,40 @@ fn host_declarations_refuse_unsafe_roots() {
     std::os::unix::fs::symlink(&outside, child.join("config")).unwrap();
     invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(&child).excluding("config")], []));
     invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(&child).excluding("config/.env")], []));
+    // Exclusions must exist as real directories whose files have one link.
+    let (_skill_directory, skill) = root_directory();
+    fs::create_dir(skill.join("config")).unwrap();
+    fs::write(skill.join("config/.env"), "API_KEY=x\n").unwrap();
+    fs::write(skill.join("tool"), "x").unwrap();
+    GovernedJailExecRoots::new([GovernedJailExecRoot::new(&skill).excluding("config")], []).unwrap();
+    invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(&skill).excluding("absent")], []));
+    invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(&skill).excluding("config/.env")], []));
+    invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(&skill).excluding("tool")], []));
+    // A hard link inside an exclusion would reach the secret around it.
+    fs::hard_link(skill.join("config/.env"), skill.join("env-link")).unwrap();
+    invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(&skill).excluding("config")], []));
+    fs::remove_file(skill.join("env-link")).unwrap();
+    let declared =
+        GovernedJailExecRoots::new([GovernedJailExecRoot::new(&skill).excluding("config")], []).unwrap();
+    // An exclusion removed or replaced after validation fails the recheck
+    // (Linux would otherwise launch without its mask).
+    fs::rename(skill.join("config"), skill.join("config.old")).unwrap();
+    assert!(declared.revalidate().is_err());
+    fs::write(skill.join("config"), "API_KEY=late\n").unwrap();
+    assert!(declared.revalidate().is_err());
+    fs::remove_file(skill.join("config")).unwrap();
+    fs::rename(skill.join("config.old"), skill.join("config")).unwrap();
+    declared.revalidate().unwrap();
+    // Consumer-forbidden paths: a root may not equal, contain or sit inside
+    // one; one that does not exist is compared as given.
+    let forbid = |forbidden: PathBuf| {
+        GovernedJailExecRoots::new_with_forbidden([GovernedJailExecRoot::new(&skill)], [], [forbidden])
+    };
+    invalid(forbid(skill.clone()));
+    invalid(forbid(skill.join("config")));
+    invalid(forbid(skill.parent().unwrap().to_path_buf()));
+    invalid(forbid(PathBuf::from("relative")));
+    forbid(skill.parent().unwrap().join("elsewhere-absent")).unwrap();
     // A missing root or PATH entry.
     invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(path.join("absent"))], []));
     invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(&path)], [path.join("absent")]));
@@ -430,6 +472,8 @@ fn unlaunched_jail() -> GovernedProcessJail {
         egress: None,
         interpreter: None,
         exec_roots: None,
+        #[cfg(target_os = "macos")]
+        macos_members: None,
         linux_helper: None,
         staging: std::sync::Mutex::new(()),
         missing_program_for_test: false,
@@ -449,6 +493,7 @@ fn unlaunched_jail_at(workdir: &Path) -> GovernedProcessJail {
 fn exec_roots_audit_is_value_free() {
     let (_directory, path) = root_directory();
     fs::create_dir(path.join("bin")).unwrap();
+    fs::create_dir(path.join("config")).unwrap();
     let roots = GovernedJailExecRoots::new(
         [GovernedJailExecRoot::new(&path).excluding("config")],
         [path.join("bin")],
@@ -554,11 +599,16 @@ fn write_executable(path: &Path, contents: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// The trusted host interpreter, or a skip.
+/// The trusted host interpreter, or a skip. With
+/// `MAGICRUN_REQUIRE_EXEC_ROOTS_PYTHON=1` (CI) a missing one fails instead.
 fn host_interpreter() -> Option<GovernedJailInterpreter> {
     match GovernedJailInterpreter::python3_for_host() {
         Ok(interpreter) => Some(interpreter),
         Err(error) => {
+            assert!(
+                std::env::var_os("MAGICRUN_REQUIRE_EXEC_ROOTS_PYTHON").is_none_or(|value| value != "1"),
+                "MAGICRUN_REQUIRE_EXEC_ROOTS_PYTHON=1 but no trusted python3: {error}"
+            );
             skip(&format!("no trusted python3 on this host: {error}"));
             None
         },
@@ -600,6 +650,7 @@ import pkg\n\
 out = {'pkg': pkg.VALUE, 'flags': [sys.flags.isolated, sys.flags.no_site, sys.flags.no_user_site, sys.flags.dont_write_bytecode]}\n\
 here = os.path.dirname(os.path.abspath(sys.argv[0]))\n\
 secret, evil, home = sys.argv[1:4]\n\
+out['cwd_entries'] = sorted(os.listdir('.'))\n\
 def attempt(name, action):\n\
 \x20   try:\n\
 \x20       out[name] = action()\n\
@@ -608,6 +659,9 @@ def attempt(name, action):\n\
 attempt('helper', lambda: subprocess.run(['helper', 'x'], capture_output=True, text=True, timeout=10).stdout.strip())\n\
 attempt('env', lambda: open(os.path.join(here, 'config', '.env')).read())\n\
 attempt('config', lambda: os.listdir(os.path.join(here, 'config')))\n\
+attempt('config_case', lambda: open(os.path.join(here, 'CONFIG', '.env')).read())\n\
+attempt('link_out', lambda: open(os.path.join(here, 'link-out')).read())\n\
+attempt('staged', lambda: open(sys.argv[4]).read())\n\
 attempt('root_write', lambda: open(os.path.join(here, 'planted'), 'w').write('x'))\n\
 attempt('secret', lambda: open(secret).read())\n\
 attempt('evil', lambda: subprocess.run([evil], capture_output=True, text=True, timeout=10).stdout)\n\
@@ -634,8 +688,13 @@ fn a_script_in_a_root_imports_runs_a_helper_and_writes_only_the_workdir() {
         return;
     };
     let skill = Skill::new(&format!("#!/usr/bin/env python3\n{PYTHON_PROBE}"));
+    // A symlink inside a root that points out of the roots.
+    std::os::unix::fs::symlink(skill.outside.join("secret.txt"), skill.skill.join("link-out")).unwrap();
     let roots = skill.roots();
     let jail = jail.with_interpreter(interpreter).unwrap().with_exec_roots(roots.clone()).unwrap();
+    // Inputs are staged under `in/`, off the working directory itself.
+    let staged = jail.stage_input_file("input.txt", b"staged-ok").unwrap();
+    assert_eq!(staged, "in/input.txt");
     let identity = jail.profile_identity();
     let interpreter_audit = jail.audit().interpreter.unwrap();
     assert_eq!(interpreter_audit.launch_flags, GOVERNED_JAIL_PYTHON3_EXEC_ROOTS_FLAGS);
@@ -653,9 +712,11 @@ fn a_script_in_a_root_imports_runs_a_helper_and_writes_only_the_workdir() {
     let secret = skill.outside.join("secret.txt");
     let evil = skill.outside.join("evil");
     let run = skill
-        .run(jail, &[secret.to_str().unwrap(), evil.to_str().unwrap(), &home])
+        .run(jail, &[secret.to_str().unwrap(), evil.to_str().unwrap(), &home, &staged])
         .unwrap();
     let output = json(&run);
+    assert_eq!(output["staged"], "staged-ok", "{output}");
+    assert_eq!(output["cwd_entries"], serde_json::json!(["in"]), "{output}");
     assert_eq!(output["pkg"], "pkg-ok", "{output}");
     assert_eq!(output["flags"], serde_json::json!([0, 0, 1, 1]), "{output}");
     assert_eq!(output["helper"], "helper-ok x", "{output}");
@@ -666,14 +727,16 @@ fn a_script_in_a_root_imports_runs_a_helper_and_writes_only_the_workdir() {
         "{output}"
     );
     assert_eq!(output["usersite"], "1", "{output}");
-    for denied in ["env", "root_write", "secret", "evil", "home"] {
+    for denied in ["env", "config_case", "link_out", "root_write", "secret", "evil", "home"] {
         assert!(output[denied].is_string(), "{denied}: {output}");
     }
     assert!(!run.stdout.contains(SECRET) && !run.stdout.contains(HOST_SECRET), "{output}");
     assert!(!run.stdout.contains("escaped"), "{output}");
     assert!(!skill.skill.join("planted").exists());
     if cfg!(target_os = "macos") {
-        for denied in ["env", "config", "root_write", "secret", "evil", "home"] {
+        // APFS is case-insensitive: `CONFIG/.env` is the excluded file,
+        // and the deny rule still matches it.
+        for denied in ["env", "config", "config_case", "link_out", "root_write", "secret", "evil", "home"] {
             assert_eq!(output[denied], "PermissionError", "{denied}: {output}");
         }
     } else {
@@ -682,7 +745,7 @@ fn a_script_in_a_root_imports_runs_a_helper_and_writes_only_the_workdir() {
         assert_eq!(output["config"], serde_json::json!([]), "{output}");
         assert_eq!(output["env"], "FileNotFoundError", "{output}");
         assert_eq!(output["root_write"], "OSError", "{output}");
-        for absent in ["secret", "evil"] {
+        for absent in ["secret", "evil", "config_case", "link_out"] {
             assert_eq!(output[absent], "FileNotFoundError", "{absent}: {output}");
         }
     }
@@ -708,7 +771,7 @@ fn a_program_outside_the_roots_is_refused_before_dispatch() {
         let refused = try_run_in_jail(jail, search.to_str().unwrap(), program, &[], &[], None);
         assert_eq!(
             refused.err(),
-            Some(JailRunError::Batch(crate::governed_batch_process::GovernedBatchProcessErrorCode::JailUnavailable)),
+            Some(JailRunError::Batch(GovernedBatchProcessErrorCode::ExecRootsRefused)),
             "{program}"
         );
     }
@@ -719,6 +782,29 @@ fn a_program_outside_the_roots_is_refused_before_dispatch() {
     let run = skill.run(jail.with_exec_roots(skill.roots()).unwrap(), &[]).unwrap();
     assert_eq!(run.terminal, GovernedExecutionTerminal::Success, "{} {}", run.stdout, run.stderr);
     assert_eq!(run.stdout.trim(), "ran");
+    // An exclusion removed, or replaced by a file, after the jail took the
+    // declaration is refused at launch, on both platforms: a Linux mask
+    // needs the directory, and a file mask would not survive a rename.
+    for replace_with_file in [false, true] {
+        let Some(jail) = base_jail(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let jail = jail.with_exec_roots(skill.roots()).unwrap();
+        fs::rename(skill.skill.join("config"), skill.skill.join("config.moved")).unwrap();
+        if replace_with_file {
+            fs::write(skill.skill.join("config"), format!("API_KEY={SECRET}\n")).unwrap();
+        }
+        let refused = skill.run(jail, &[]);
+        if replace_with_file {
+            fs::remove_file(skill.skill.join("config")).unwrap();
+        }
+        fs::rename(skill.skill.join("config.moved"), skill.skill.join("config")).unwrap();
+        assert_eq!(
+            refused.err(),
+            Some(JailRunError::Batch(GovernedBatchProcessErrorCode::ExecRootsRefused)),
+            "replaced with a file: {replace_with_file}"
+        );
+    }
 }
 
 /// `node`, from its own install root, runs an installed JS CLI in place from
@@ -739,12 +825,12 @@ fn an_installed_node_cli_runs_in_place_from_its_root() {
     let Some(jail) = base_jail(limits) else {
         return;
     };
-    let Some((node_root, node_bin)) = node_install() else {
+    let Some(node) = node_install() else {
         assert!(!required, "MAGICRUN_REQUIRE_EXEC_ROOTS_NODE=1 but no usable node on PATH");
         eprintln!("SKIP: no node install usable as an exec root");
         return;
     };
-    eprintln!("node root {} bin {}", node_root.display(), node_bin.display());
+    eprintln!("node root {:?} bin {}", node.root, node.bin.display());
     let (_cli_directory, cli) = root_directory();
     fs::create_dir(cli.join("bin")).unwrap();
     fs::create_dir(cli.join("lib")).unwrap();
@@ -767,21 +853,28 @@ fn an_installed_node_cli_runs_in_place_from_its_root() {
     );
     let roots = match GovernedJailExecRoots::new(
         [
-            GovernedJailExecRoot::new(&node_root),
+            node.root.clone(),
             GovernedJailExecRoot::new(&cli).excluding("config"),
         ],
-        [node_bin.clone(), cli.join("bin")],
+        [node.bin.clone(), cli.join("bin")],
     ) {
         Ok(roots) => roots,
         Err(error) => {
-            assert!(!required, "node root {} refused: {error}", node_root.display());
-            eprintln!("SKIP: node root {} refused: {error}", node_root.display());
+            assert!(!required, "node root {:?} refused: {error}", node.root);
+            eprintln!("SKIP: node root {:?} refused: {error}", node.root);
             return;
         },
     };
     let jail = jail.with_exec_roots(roots).unwrap();
-    let run = try_run_in_jail(jail, cli.join("bin").to_str().unwrap(), "mmx", &["--flag", "value"], &[], None)
-        .unwrap();
+    let run = try_run_in_jail(
+        jail,
+        cli.join("bin").to_str().unwrap(),
+        "mmx",
+        &["--flag", "value"],
+        &node.environment,
+        None,
+    )
+    .unwrap();
     let output = json(&run);
     assert_eq!(output["util"], "util-ok", "{output}");
     assert_eq!(output["argv"], serde_json::json!(["--flag", "value"]), "{output}");
@@ -793,21 +886,50 @@ fn an_installed_node_cli_runs_in_place_from_its_root() {
     assert!(!cli.join("bin/planted").exists());
 }
 
-/// The install root of the first `node` on `PATH` and its canonical `bin`
-/// directory. A Homebrew keg resolves to the Homebrew prefix (its libraries
-/// live in other kegs); otherwise the parent of the binary's directory.
-fn node_install() -> Option<(PathBuf, PathBuf)> {
+/// The first `node` on `PATH` as an exec root: runtime directories only.
+struct NodeInstall {
+    root: GovernedJailExecRoot,
+    /// Canonical directory of the `node` binary.
+    bin: PathBuf,
+    environment: Vec<(&'static str, &'static str)>,
+}
+
+/// A standalone install (the official tarball, `/usr/local/bin` on CI)
+/// is self-contained: the binary's own directory is the root. A Homebrew
+/// keg is not: `node` links libraries from a dozen other kegs through the
+/// `opt/` symlinks, and `Cellar/` and `opt/` are `admin`-group-writable, so
+/// neither a keg nor they pass the root trust checks. The Homebrew prefix is
+/// then the root with its data (`var/`) and configuration (`etc/`) excluded;
+/// Homebrew's OpenSSL reads its configuration from `etc/`, so it is pointed
+/// at `/dev/null`.
+fn node_install() -> Option<NodeInstall> {
     let node = std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|directory| directory.join("node"))
         .find(|candidate| candidate.is_file())?;
     let node = fs::canonicalize(node).ok()?;
     let bin = node.parent()?.to_path_buf();
     let text = node.to_str()?;
-    let root = match text.find("/Cellar/") {
-        Some(index) => PathBuf::from(&text[..index]),
-        None => bin.parent()?.to_path_buf(),
-    };
-    Some((root, bin))
+    Some(match text.find("/Cellar/") {
+        Some(index) => {
+            let prefix = PathBuf::from(&text[..index]);
+            let mut root = GovernedJailExecRoot::new(&prefix);
+            for data in ["var", "etc"] {
+                if prefix.join(data).is_dir() {
+                    root = root.excluding(data);
+                }
+            }
+            NodeInstall {
+                root,
+                bin,
+                environment: vec![("OPENSSL_CONF", "/dev/null")],
+            }
+        },
+        None => NodeInstall {
+            root: GovernedJailExecRoot::new(&bin),
+            bin,
+            environment: Vec::new(),
+        },
+    })
 }
 
 /// Brokered egress composes with exec roots: the script in its root reaches
@@ -969,4 +1091,66 @@ fn a_setsid_escapee_is_counted_and_killed_on_macos() {
     let escapee = run.stdout.trim().parse::<libc::pid_t>().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(!alive(escapee), "the setsid escapee {escapee} outlived the run");
+}
+
+/// Live processes whose command line carries `marker`, from `ps`.
+fn processes_marked(marker: &str) -> Vec<libc::pid_t> {
+    let output = Command::new("/bin/ps").args(["-axo", "pid=,command="]).output().unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains(marker))
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect()
+}
+
+/// A fork-and-exit chain in its own session (one short-lived member alive
+/// at a time, as `perl -e 'while(1){fork and exit}'`) leaves no survivor:
+/// macOS teardown stops each member as it is found and kills it, until
+/// scans come back empty; Linux tears down the jail's pid namespace. A
+/// verification scan runs after the jail is gone.
+#[test]
+fn a_setsid_fork_exit_chain_leaves_no_survivors() {
+    let _budget = JAIL_PROCESS_BUDGET
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !Path::new("/usr/bin/perl").is_file() {
+        skip("no /usr/bin/perl on this host");
+        return;
+    }
+    let marker = format!(
+        "magicrun-chain-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let skill = Skill::new(&format!(
+        "#!/bin/sh\n\
+         /usr/bin/perl -e 'use POSIX; if (fork) {{ exit 0 }} POSIX::setsid(); \
+         open STDIN, \"</dev/null\"; open STDOUT, \">/dev/null\"; open STDERR, \">/dev/null\"; \
+         $0 = \"{marker}\"; open my $f, \">\", \"chain-up\"; print $f \"chain-up\"; close $f; \
+         while (1) {{ my $p = fork; exit 0 if $p; exit 1 unless defined $p; }}'\n\
+         sleep 1\n\
+         cat chain-up\n\
+         echo\n\
+         echo started\n"
+    ));
+    for round in 0..3 {
+        let Some(jail) = base_jail(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let jail = jail.with_exec_roots(skill.roots()).unwrap();
+        let run = skill.run(jail, &[]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let survivors = processes_marked(&marker);
+        for pid in &survivors {
+            // SAFETY: cleanup of a process this test started.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        assert!(survivors.is_empty(), "round {round}: survivors {survivors:?}");
+        let run = run.unwrap_or_else(|error| panic!("round {round}: {error:?}"));
+        assert_eq!(run.terminal, GovernedExecutionTerminal::Success, "{} {}", run.stdout, run.stderr);
+        assert_eq!(run.stdout.trim(), "chain-up\nstarted", "the chain must have run: {}", run.stderr);
+    }
 }

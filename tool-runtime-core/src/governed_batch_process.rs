@@ -149,6 +149,12 @@ pub enum GovernedBatchProcessErrorCode {
     /// The jail's pinned interpreter is no longer trusted or changed its
     /// bytes; nothing was dispatched.
     InterpreterUnavailable,
+    /// A declared exec root, exclusion or the program's place in the roots
+    /// was refused at launch; nothing was dispatched.
+    ExecRootsRefused,
+    /// macOS exec roots: teardown could not prove every process of the
+    /// jail's sandbox dead; the effect is uncertain.
+    JailTeardownIncomplete,
     /// Linux: the in-jail helper reported, as the first byte on its
     /// exec-status channel, that the command never ran (it refused the task
     /// ceiling, or failed before dispatching it).
@@ -542,6 +548,7 @@ fn execute_spawned(
     let mut command = match process.jail.as_ref() {
         Some(jail) => jail.command(&executable, status_fd).map_err(|error| match error.code {
             GovernedProcessJailErrorCode::InterpreterUnavailable => interpreter_unavailable(),
+            GovernedProcessJailErrorCode::InvalidExecRoots => exec_roots_refused(),
             _ => jail_unavailable(),
         })?,
         None => Command::new(executable.as_path()),
@@ -946,6 +953,11 @@ fn collect(
     if reader_result.is_err() {
         first_error.get_or_insert_with(reader_shutdown_failed);
     }
+    // A jail member that could not be proven dead keeps the jail's
+    // authority past the run: never report that run as finished.
+    if tree.jail_members_survived() {
+        first_error = Some(jail_teardown_incomplete());
+    }
     if let Some(error) = writer_error {
         first_error.get_or_insert(error);
     }
@@ -1213,6 +1225,8 @@ struct ProcessTreeGuard {
     /// macOS exec-roots jails: members that may have left the group.
     #[cfg(target_os = "macos")]
     jail_members: Option<std::sync::Arc<crate::governed_process_jail::MacosJailMembers>>,
+    /// A teardown could not prove every jail member dead.
+    members_survived: bool,
 }
 
 impl ProcessTreeGuard {
@@ -1225,16 +1239,26 @@ impl ProcessTreeGuard {
             pid,
             #[cfg(target_os = "macos")]
             jail_members: None,
+            members_survived: false,
         }
     }
 
     /// Kill every member of a macOS exec-roots jail that is still alive,
     /// wherever its process group or session is. No-op otherwise.
-    fn kill_jail_members(&self) {
+    fn kill_jail_members(&mut self) {
         #[cfg(target_os = "macos")]
         if let Some(members) = self.jail_members.as_ref() {
-            members.kill_all();
+            if !members.kill_all() {
+                self.members_survived = true;
+            }
         }
+    }
+
+    /// Final sweep once the run is over; `true` when a member may survive,
+    /// and the run must then fail closed.
+    fn jail_members_survived(&mut self) -> bool {
+        self.kill_jail_members();
+        self.members_survived
     }
 
     fn child_mut(&mut self) -> Result<&mut Child, GovernedBatchProcessError> {
@@ -1890,21 +1914,31 @@ fn owned_group_pids(pid: Option<u32>) -> Option<Result<Vec<libc::pid_t>, OwnedGr
 }
 
 /// macOS exec-roots jails: the owned group plus every process of the jail's
-/// sandbox that left it (`setsid`, `setpgid`), each counted once.
+/// sandbox that left it (`setsid`, `setpgid`), each counted once. CPU time
+/// accumulates per member identity, so members that exited since an earlier
+/// sample still count. A leader that is alive but not recognized as a
+/// member means membership detection failed: that is a lost observation.
 #[cfg(target_os = "macos")]
 fn jail_member_usage(
     pid: Option<u32>,
     members: &crate::governed_process_jail::MacosJailMembers,
 ) -> Option<OwnedGroupUsage> {
-    let mut pids = match owned_group_pids(pid) {
+    let leader = pid.and_then(|value| libc::pid_t::try_from(value).ok())?;
+    if members.recognizes_leader(leader) == Some(false) {
+        return None;
+    }
+    let group = match owned_group_pids(pid) {
         Some(Err(overflow)) => return Some(overflow),
         Some(Ok(pids)) => pids,
         None => Vec::new(),
     };
-    pids.extend(members.pids()?);
-    pids.sort_unstable();
-    pids.dedup();
-    macos_usage_of(&pids)
+    let usage = members.usage(Some(leader), &group)?;
+    Some(OwnedGroupUsage {
+        processes: usage.processes,
+        tasks: usage.tasks,
+        cpu_micros: usage.cpu_nanos / 1_000,
+        memory_bytes: usage.memory_bytes,
+    })
 }
 
 /// macOS: processes, threads, CPU and footprint of `members`. A member
@@ -2192,6 +2226,24 @@ const fn interpreter_unavailable() -> GovernedBatchProcessError {
         "jail.interpreter",
         "the jail's pinned interpreter is untrusted or changed",
         GovernedExecutionDispatch::NotDispatched,
+    )
+}
+
+const fn exec_roots_refused() -> GovernedBatchProcessError {
+    GovernedBatchProcessError::new(
+        GovernedBatchProcessErrorCode::ExecRootsRefused,
+        "jail.exec_roots",
+        "a declared exec root or the program's place in the roots was refused",
+        GovernedExecutionDispatch::NotDispatched,
+    )
+}
+
+const fn jail_teardown_incomplete() -> GovernedBatchProcessError {
+    GovernedBatchProcessError::new(
+        GovernedBatchProcessErrorCode::JailTeardownIncomplete,
+        "jail.teardown",
+        "a process of the jail could not be proven terminated",
+        GovernedExecutionDispatch::UnknownAfterDispatch,
     )
 }
 

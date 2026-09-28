@@ -22,8 +22,10 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     env:
-      # The exec-roots Node test must not skip where a jail and node exist.
+      # The exec-roots Node test must not skip where a jail and node exist,
+      # and the macOS exec-roots Python tests must find a trusted python3.
       MAGICRUN_REQUIRE_EXEC_ROOTS_NODE: "1"
+      MAGICRUN_REQUIRE_EXEC_ROOTS_PYTHON: ${{ matrix.os == 'macos-latest' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,8 +35,6 @@ jobs:
       - run: make check
       - run: make test
       # Show that the macOS exec-roots jail tests ran rather than skipped.
-      - if: runner.os == 'macOS'
-        run: which node python3 && ls -ld /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/Current/bin/python3 || true
       - if: runner.os == 'macOS'
         run: cargo test -p tool-runtime-core --lib exec_roots -- --nocapture
   # The Linux jail paths (bubblewrap, the in-jail helper and egress forwarder,
@@ -58,6 +58,7 @@ jobs:
     env:
       MAGICRUN_REQUIRE_LINUX_JAIL: "1"
       MAGICRUN_REQUIRE_EXEC_ROOTS_NODE: "1"
+      MAGICRUN_REQUIRE_EXEC_ROOTS_PYTHON: "1"
       MAGICRUN_EXPECT_PROCESS_CEILING: ${{ matrix.process_ceiling }}
     steps:
       - uses: actions/checkout@v4

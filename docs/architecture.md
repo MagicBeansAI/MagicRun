@@ -482,7 +482,21 @@ chooses the arguments. The jail confines the run's authority and data flow,
 not the program's code: it reads and execs only the declared roots (less
 their excluded subpaths) and the fixed system exec paths, writes only its
 private workdir, and reaches the network only through the broker of a
-brokered jail, or not at all.
+brokered jail, or not at all. Only the program's identity is pinned (the
+contract's digest and the file identity rechecked before spawn); the rest of
+each root's tree is trusted as installed and is not walked or hashed.
+
+**Roots are runtime and skill directories only.** A root is an installed
+runtime's own tree (a Node install, a venv, a keg) or the skill itself,
+never a prefix that also holds data or configuration: `/opt/homebrew`
+holds `var/` (user-owned Postgres, MySQL and Redis data) and `etc/`. The
+jail cannot know what a directory holds; the consumer must assert it, and
+should pass its data root and sensitive home directories to
+`GovernedJailExecRoots::new_with_forbidden`, which refuses a root equal to,
+containing or inside any of them. On a standard Homebrew install a keg is
+not usable alone (`node` links libraries from other kegs through `opt/`, and
+`Cellar/` and `opt/` are `admin`-group-writable, so they fail the trust
+checks); the prefix is then a root only with `var` and `etc` excluded.
 
 ```mermaid
 flowchart LR
@@ -498,14 +512,28 @@ flowchart LR
   existing directory owned by root or this user and not group/other-writable;
   every ancestor must be owned by root or this user and not
   group/other-writable, or be a root-owned sticky directory (`/tmp`). It may
-  not be `/`, the home directory or one of its ancestors, overlap another
-  root, or overlap `/app`, `/work`, `/proc`, `/dev` or `/run/magicrun` (the
-  jail's own paths). Exclusions are relative plain components; one that
-  exists may not be or sit below a symlink. `PATH` entries lie inside a root
-  outside its exclusions and contain no `:`. `with_exec_roots` refuses a
-  root that overlaps the jail's workdir. The tree under a root is not walked:
-  its contents are trusted as installed. Violations are
-  `GovernedProcessJailErrorCode::InvalidExecRoots`.
+  not be `/`, the home directory (`$HOME` and the password database's) or one
+  of its ancestors, overlap another root, or overlap `/app`, `/work`,
+  `/proc`, `/dev` or `/run/magicrun` (the jail's own paths). Exclusions are
+  relative plain components naming directories that must exist, as real
+  directories not below a symlink, at declaration and at every launch; a
+  file exclusion is refused. Every regular file below an exclusion must have
+  a single link (a bounded walk of at most 4096 entries), since a hard link
+  elsewhere in a root would reach the same bytes around the path rule.
+  `PATH` entries lie inside a root outside its exclusions and contain no
+  `:`. `with_exec_roots` refuses a root that overlaps the jail's workdir and
+  a workdir that already holds staged inputs. Violations are
+  `GovernedProcessJailErrorCode::InvalidExecRoots`; at launch they are
+  `GovernedBatchProcessErrorCode::ExecRootsRefused` (not dispatched).
+- **Why exclusions are directories.** Magician's `.env` writer replaces the
+  file with a temp-plus-rename. On Linux a file mask (`/dev/null` bound over
+  the file) would not survive that: since Linux 3.18 a rename over a mount
+  point in another mount namespace detaches the mount, so the jail would
+  read the new file. An exclusion absent at launch would get no mask at all.
+  A read-only tmpfs over the directory survives writes and renames inside
+  it; replacing the directory itself during a run is the consumer's to
+  avoid. macOS deny rules match paths, not mounts, but the same rule applies
+  on both platforms.
 - **Program.** The governed pipeline is unchanged: the contract `PATH`
   resolves the program, which is hashed and snapshotted as before. The jail
   then launches the snapshot's canonical installed path in place (a copy
@@ -528,7 +556,15 @@ flowchart LR
   directory, a venv interpreter inside a root, or a `sys.path` entry the
   (trusted) script adds. Nothing inside a root is writable, so `-B` is
   hygiene there. On macOS the pinned interpreter's own `site-packages` stays
-  denied.
+  denied. Without `-I`, a Python child started as `-c` or `-m` puts its cwd
+  (the workdir) first on `sys.path`, so `stage_input_file` stages into
+  `in/` in this mode and returns `in/<name>`; the program's own outputs still
+  land in the workdir. Manifest validation additionally refuses
+  `PYTHONSTARTUP`, `PYTHONINSPECT`, `PYTHONBREAKPOINT`, `PYTHONUSERBASE`,
+  `PYTHONWARNINGS`, `NODE_PATH`, `NPM_CONFIG_*`, `JAVA_TOOL_OPTIONS`,
+  `LUA_INIT*`, `RUBYLIB`, `PERLLIB`, `GIT_SSH_COMMAND` and `GIT_EXEC_PATH`
+  (with the existing `PYTHONPATH`, `NODE_OPTIONS`, `RUBYOPT`, `PERL5*`,
+  `BASH_ENV` and `ENV`) as fixed values and as injection targets.
 - **`PATH`.** The child's `PATH` is the declared entries followed by
   `/usr/bin:/bin` (`GOVERNED_JAIL_EXEC_ROOTS_SYSTEM_PATH`). It is set in the
   child environment only (and inside bubblewrap); lookups of bare names
@@ -538,6 +574,7 @@ flowchart LR
   `(allow process-fork)` (after the base `(deny process-fork)`; the later rule
   wins), `(allow signal (target same-sandbox))`,
   `(allow file-write-data (literal "/dev/null"))`,
+  `(allow file-read-data (literal "<member sentinel>"))` (see below),
   `(allow file-read* process-exec (subpath "/bin"))` and the same for
   `/usr/bin`, then per root
   `(allow file-read* process-exec file-map-executable (subpath "<root>"))`,
@@ -551,9 +588,8 @@ flowchart LR
 - **Linux (bubblewrap).** No `/app` is mounted. On top of `/lib` and
   `/lib64`, `/bin`, `/usr/bin`, `/usr/lib` and `/usr/lib64` (those that
   exist) and every root are bound read-only at their own paths. Each
-  exclusion that exists at launch is masked: a directory by an empty tmpfs
-  remounted read-only (`--tmpfs P --remount-ro P`), a file by `/dev/null`
-  bound read-only; an absent one is skipped (the jail cannot create it).
+  excluded directory is masked by an empty tmpfs remounted read-only
+  (`--tmpfs P --remount-ro P`). Landlock was not added as a second layer.
   `PATH` and the overlay are set with `--setenv`; the program still runs
   through the trusted helper, whose `RLIMIT_NPROC` task ceiling every
   descendant inherits. Bubblewrap has no exec control: anything mounted
@@ -566,20 +602,43 @@ flowchart LR
   a process can leave with `setsid`/`setpgid`. For exec-roots jails the
   macOS watchdog and teardown also find members by their sandbox
   (`MacosJailMembers`, private `sandbox_check` from `libsystem_sandbox`): a
-  process of this user that is sandboxed, may read the jail's unique workdir
-  and may not read the workdir's parent (no jail grants that) belongs to this
-  jail. Members outside the group are counted against the ceilings, and
-  every member is SIGKILLed when the leader exits or the run is torn down
-  (bounded rounds, so a member forking meanwhile is caught).
+  process of this user that is sandboxed, may read the jail's own member
+  sentinel (an empty directory granted by a literal in this profile only)
+  and may not read the sentinel's parent (no jail grants that) belongs to
+  this jail. The sentinel lives until teardown has proven every member dead,
+  and is kept on disk otherwise.
+  - *Watchdog.* Members outside the group are counted against the process,
+    task and memory ceilings. CPU time accumulates per member identity (pid
+    and start time) across samples, so members that exited since still
+    count; it is sampled every 200 ms, so a member that lives between two
+    samples is missed (its own `RLIMIT_CPU` and the wall ceiling still
+    bound it). A leader that is alive but not recognized as a member means
+    `sandbox_check` stopped working: the watchdog then fails closed
+    (`JailUnavailable`, effect uncertain) instead of failing open.
+  - *Teardown* (when the leader exits, on every terminal path, and once more
+    after the run): scan all pids, examining unseen pids first right after
+    the listing and skipping known non-members by identity, and SIGSTOP each
+    member the moment it is found, so it can neither fork nor exit; then
+    recheck each stopped member's identity and membership and SIGKILL it.
+    Repeat until three consecutive scans find no member. A fork-and-exit
+    chain in its own session is caught this way (a test runs one). If that
+    does not happen within 3 s, or the process list cannot be read, the run
+    fails closed with `GovernedBatchProcessErrorCode::JailTeardownIncomplete`
+    (effect uncertain), never `Success`.
+  - *In-sandbox reaper, evaluated and not used.* A process inside the same
+    sandbox looping `kill(-1, SIGKILL)` would reach only same-sandbox
+    processes, but it has to be a member of the jail's own tree, and any
+    member may signal it (`(allow signal (target same-sandbox))`), so an
+    adversarial member can kill the reaper first. The host-side scan cannot
+    be signalled away.
 - **Unchanged.** Private workdir, limits, Linux watchdog, task ceiling,
-  descriptor marking, brokered egress, `stage_input_file` and the
-  exec-status channel.
+  descriptor marking, brokered egress and the exec-status channel.
 - **Identity and audit.** `profile_identity()` equals
   `governed_process_jail_exec_roots_profile_identity(platform, network,
   interpreter, &roots)`: the exec-roots profile/argv rendered with
   placeholder program, workdir and helper paths but the declaration's real
-  roots, exclusions and `PATH` (Linux renders every exclusion as a directory
-  mask), plus the exec-roots schema, the declaration digest, the overlay and
+  roots, exclusions and `PATH` (and a placeholder member sentinel), plus the
+  exec-roots schema, the declaration digest, the overlay and
   the interpreter flags. A consumer can lock it. `GovernedProcessJailAudit`
   gains `exec_roots` (counts, declaration digest, `program_in_place`,
   `process_fork_allowed`, `root_writes_denied`, `excluded_read_denied`,
@@ -590,9 +649,11 @@ flowchart LR
 - **Limits.** Everything a root contains is readable and executable,
   including a secret the consumer did not exclude. macOS reveals metadata
   (not contents or listings) of each root's ancestors. On Linux, `/usr/lib`
-  is readable and an excluded path created after launch is visible. Native
-  code the run writes to the workdir can be executed on Linux (as in the
-  other modes) but not mapped executable on macOS.
+  is readable, and replacing an excluded directory itself (not a file in
+  it) during a run detaches its mask. Native code the run writes to the
+  workdir can be executed on Linux (as in the other modes) but not mapped
+  executable on macOS. macOS teardown relies on a private API and a bounded
+  scan; it fails the run closed rather than report a survivor as success.
 
 ## Declared login prompts
 

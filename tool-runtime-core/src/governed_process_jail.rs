@@ -25,12 +25,13 @@ use tempfile::{Builder, TempDir};
 
 pub use exec_roots::{
     GovernedJailExecRoot, GovernedJailExecRoots, GOVERNED_JAIL_EXEC_ROOTS_ENVIRONMENT,
+    GOVERNED_JAIL_EXEC_ROOTS_INPUT_DIRECTORY,
     GOVERNED_JAIL_EXEC_ROOTS_SYSTEM_PATH, GOVERNED_JAIL_EXEC_ROOTS_V1,
     GOVERNED_JAIL_PYTHON3_EXEC_ROOTS_FLAGS, MAX_GOVERNED_JAIL_EXEC_ROOTS,
     MAX_GOVERNED_JAIL_EXEC_ROOT_EXCLUSIONS, MAX_GOVERNED_JAIL_EXEC_ROOT_PATH_BYTES,
     MAX_GOVERNED_JAIL_EXEC_SEARCH_PATH,
 };
-use exec_roots::{invalid_exec_roots, LinuxMask};
+use exec_roots::invalid_exec_roots;
 #[cfg(target_os = "macos")]
 pub(crate) use exec_roots::MacosJailMembers;
 
@@ -143,7 +144,8 @@ pub mod egress_forwarder;
 #[cfg(test)]
 pub(crate) mod egress_tests;
 mod exec_roots;
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod exec_roots_tests;
 #[cfg(unix)]
 pub(crate) mod inherited_descriptors;
@@ -578,8 +580,9 @@ pub struct GovernedJailExecRootsAudit {
     pub process_fork_allowed: bool,
     /// Enforced by the profile: nothing inside a root is writable.
     pub root_writes_denied: bool,
-    /// Enforced by the profile: excluded subpaths are unreadable (macOS: a
-    /// deny rule, also for paths created later; Linux: masked at launch).
+    /// Enforced by the profile: excluded directories are unreadable (macOS:
+    /// a deny rule; Linux: an empty read-only tmpfs over each, which must
+    /// exist at launch).
     pub excluded_read_denied: bool,
     /// Equal to [`governed_process_jail_exec_roots_profile_identity`].
     pub profile_identity: GovernedProcessJailDigest,
@@ -598,6 +601,10 @@ pub struct GovernedProcessJail {
     egress: Option<BrokeredEgress>,
     interpreter: Option<GovernedJailInterpreter>,
     exec_roots: Option<GovernedJailExecRoots>,
+    /// macOS exec-roots jails: membership by sandbox, shared with the
+    /// watchdog and teardown of each run.
+    #[cfg(target_os = "macos")]
+    macos_members: Option<std::sync::Arc<MacosJailMembers>>,
     linux_helper: Option<LinuxJailHelper>,
     /// Serializes staging: the quota check and the write happen as one.
     staging: std::sync::Mutex<()>,
@@ -766,6 +773,8 @@ impl GovernedProcessJail {
             egress,
             interpreter: None,
             exec_roots: None,
+            #[cfg(target_os = "macos")]
+            macos_members: None,
             linux_helper,
             staging: std::sync::Mutex::new(()),
             #[cfg(test)]
@@ -814,7 +823,12 @@ impl GovernedProcessJail {
     /// paths, and [`GOVERNED_JAIL_EXEC_ROOTS_ENVIRONMENT`] is overlaid.
     /// Network, limits, workdir, staging and the Linux helper are unchanged.
     /// The declaration is revalidated here and before every launch; a root
-    /// that overlaps the workdir is refused. A jail takes one declaration.
+    /// that overlaps the workdir is refused. A jail takes one declaration,
+    /// before any input is staged: inputs then go to `in/` (see
+    /// [`Self::stage_input_file`]). On macOS the jail also gets a member
+    /// sentinel by which its watchdog and teardown find processes that left
+    /// the launcher's process group; a run whose teardown cannot prove
+    /// every member dead fails with `JailTeardownIncomplete`.
     pub fn with_exec_roots(
         mut self,
         roots: GovernedJailExecRoots,
@@ -825,7 +839,22 @@ impl GovernedProcessJail {
         if self.exec_roots.is_some() || roots.overlaps(&self.canonical_workdir) {
             return Err(invalid_exec_roots());
         }
+        // Inputs staged before this call would sit in the working directory
+        // itself; take exec roots before staging.
+        if fs::read_dir(&self.canonical_workdir)
+            .map_err(|_| private_workdir_unavailable())?
+            .next()
+            .is_some()
+        {
+            return Err(invalid_exec_roots());
+        }
         roots.revalidate()?;
+        #[cfg(target_os = "macos")]
+        if self.platform == GovernedProcessJailPlatform::MacosSandboxExec {
+            self.macos_members = Some(std::sync::Arc::new(
+                MacosJailMembers::new().ok_or_else(private_workdir_unavailable)?,
+            ));
+        }
         self.exec_roots = Some(roots);
         Ok(self)
     }
@@ -1010,8 +1039,9 @@ impl GovernedProcessJail {
     }
 
     /// Write one input file into the jail's private workdir before launch and
-    /// return the plain name the child opens relative to its working
-    /// directory. The host path is never returned. The name is a single
+    /// return the relative path the child opens from its working directory:
+    /// the plain name, or `in/<name>` in a jail with exec roots (whose
+    /// Python children may put the working directory on `sys.path`). The host path is never returned. The name is a single
     /// component (`[A-Za-z0-9._-]`, not hidden, not starting with `-` since it
     /// is passed as an argument, at most 128 bytes); the file
     /// is created fresh (never overwriting or following a link), read-only to
@@ -1050,7 +1080,26 @@ impl GovernedProcessJail {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o400).custom_flags(libc::O_NOFOLLOW);
         }
-        let path = self.canonical_workdir.join(name);
+        // Exec roots run Python without `-I`: a `-c`/`-m` child puts its
+        // cwd (the workdir) first on `sys.path`, so staged inputs go to
+        // `in/` instead of the cwd itself.
+        let (directory, returned) = if self.exec_roots.is_some() {
+            let directory = self.canonical_workdir.join(GOVERNED_JAIL_EXEC_ROOTS_INPUT_DIRECTORY);
+            match fs::create_dir(&directory) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+                        .map_err(|_| private_workdir_unavailable())?;
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(_) => return Err(private_workdir_unavailable()),
+            }
+            validate_real_absolute_directory(&directory).map_err(|_| private_workdir_unavailable())?;
+            (directory, format!("{GOVERNED_JAIL_EXEC_ROOTS_INPUT_DIRECTORY}/{name}"))
+        } else {
+            (self.canonical_workdir.clone(), name.to_owned())
+        };
+        let path = directory.join(name);
         // An existing name or a planted link fails here (O_EXCL, O_NOFOLLOW)
         // and is the caller's input error; any other failure is the workdir's.
         let mut file = options.open(&path).map_err(|error| {
@@ -1069,7 +1118,7 @@ impl GovernedProcessJail {
             let _ = fs::remove_file(&path);
             return Err(private_workdir_unavailable());
         }
-        Ok(name.to_owned())
+        Ok(returned)
     }
 
     pub(crate) fn watch(&self) -> GovernedProcessJailWatch {
@@ -1078,11 +1127,7 @@ impl GovernedProcessJail {
             limits: self.limits,
             overhead: self.watchdog_overhead(),
             #[cfg(target_os = "macos")]
-            macos_members: (self.exec_roots.is_some()
-                && self.platform == GovernedProcessJailPlatform::MacosSandboxExec)
-                .then(|| MacosJailMembers::new(&self.canonical_workdir))
-                .flatten()
-                .map(std::sync::Arc::new),
+            macos_members: self.macos_members.clone(),
         }
     }
 
@@ -1237,11 +1282,13 @@ impl GovernedProcessJail {
                 Some(interpreter) => sbpl_path(&interpreter.executable)?,
                 None => installed.clone(),
             };
+            let members = self.macos_members.as_ref().ok_or_else(invalid_exec_roots)?;
             let profile = macos_exec_roots_profile(
                 &program,
                 grants.as_ref(),
                 roots,
                 &workdir,
+                &sbpl_path(members.sentinel())?,
                 egress.as_ref().map(|(port, bundle)| (port.as_str(), *bundle)),
             )?;
             let mut command = Command::new(&self.launcher);
@@ -1379,7 +1426,7 @@ impl GovernedProcessJail {
             .map(Path::new)
             .filter(|path| path.exists())
             .collect::<Vec<_>>();
-        let masks = roots.linux_masks()?;
+        let masks = roots.masks();
         let mounts = LinuxExecRootMounts {
             system,
             roots,
@@ -2219,8 +2266,7 @@ pub fn governed_process_jail_interpreter_profile_identity(
 /// and `PATH`, and additionally binds the exec-roots schema, the
 /// declaration digest, the environment overlay and the interpreter flags.
 /// A consumer can lock it; any change to the roots, their exclusions or the
-/// `PATH` entries changes it. Linux renders every exclusion as a directory
-/// mask whatever exists on the host. It is never equal to an identity
+/// `PATH` entries changes it. It is never equal to an identity
 /// without exec roots.
 pub fn governed_process_jail_exec_roots_profile_identity(
     platform: GovernedProcessJailPlatform,
@@ -2264,6 +2310,7 @@ fn profile_identity(
                     grants,
                     roots,
                     workdir,
+                    Path::new("/<member-sentinel>"),
                     brokered.then_some(("<broker-port>", true)),
                 ),
                 (Some(grants), None) => macos_interpreter_profile(
@@ -2330,7 +2377,7 @@ fn profile_identity(
                     grants,
                 ),
                 Some(roots) => {
-                    let masks = roots.template_masks();
+                    let masks = roots.masks();
                     let mounts = LinuxExecRootMounts {
                         system: exec_roots::LINUX_EXEC_ROOTS_SYSTEM_MOUNTS.map(Path::new).to_vec(),
                         roots,
@@ -2511,7 +2558,7 @@ enum LinuxJailProgram<'a> {
 struct LinuxExecRootMounts<'a> {
     system: Vec<&'a Path>,
     roots: &'a GovernedJailExecRoots,
-    masks: &'a [(PathBuf, LinuxMask)],
+    masks: &'a [PathBuf],
     path: OsString,
 }
 
@@ -2519,8 +2566,7 @@ struct LinuxExecRootMounts<'a> {
 /// byte-for-byte the strict, brokered and interpreter argv (their goldens
 /// pin it). [`LinuxJailProgram::ExecRoots`] mounts no `/app`; it binds the
 /// system exec directories and each root read-only at its own path, masks
-/// each existing excluded subpath (a directory with an empty tmpfs remounted
-/// read-only, a file with `/dev/null` bound read-only), sets the declared
+/// each excluded directory with an empty tmpfs remounted read-only, sets the declared
 /// `PATH` and the exec-roots environment overlay, and runs the installed
 /// program (or `<interpreter> -s -B <script>`) through the same helper.
 fn linux_bwrap_args_for(
@@ -2561,20 +2607,13 @@ fn linux_bwrap_args_for(
             {
                 args.extend([OsString::from("--ro-bind"), path.into(), path.into()]);
             }
-            for (path, mask) in mounts.masks {
-                match mask {
-                    LinuxMask::Directory => args.extend([
-                        OsString::from("--tmpfs"),
-                        path.into(),
-                        OsString::from("--remount-ro"),
-                        path.into(),
-                    ]),
-                    LinuxMask::File => args.extend([
-                        OsString::from("--ro-bind"),
-                        OsString::from("/dev/null"),
-                        path.into(),
-                    ]),
-                }
+            for path in mounts.masks {
+                args.extend([
+                    OsString::from("--tmpfs"),
+                    path.into(),
+                    OsString::from("--remount-ro"),
+                    path.into(),
+                ]);
             }
         },
     }
@@ -2770,6 +2809,7 @@ fn macos_exec_roots_profile(
     interpreter: Option<&InterpreterGrants<'_>>,
     roots: &GovernedJailExecRoots,
     workdir: &Path,
+    sentinel: &Path,
     egress: Option<(&str, bool)>,
 ) -> Result<String, GovernedProcessJailError> {
     let mut profile = macos_profile(program, None, workdir)?;
@@ -2781,7 +2821,7 @@ fn macos_exec_roots_profile(
             profile.push_str(&format!("(allow file-read* (subpath \"{}\"))\n", sbpl_escape(root)?));
         }
     }
-    profile.push_str(&roots.macos_allow_rules(workdir)?);
+    profile.push_str(&roots.macos_allow_rules(workdir, sentinel)?);
     profile.push_str(&roots.macos_deny_rules()?);
     if let Some(interpreter) = interpreter {
         for denied in &interpreter.denied_roots {
@@ -3205,6 +3245,8 @@ mod tests {
             egress: None,
             interpreter: None,
             exec_roots: None,
+            #[cfg(target_os = "macos")]
+            macos_members: None,
             linux_helper: None,
             staging: std::sync::Mutex::new(()),
             missing_program_for_test: false,
@@ -3917,6 +3959,8 @@ mod tests {
             egress: None,
             interpreter: None,
             exec_roots: None,
+            #[cfg(target_os = "macos")]
+            macos_members: None,
             linux_helper: Some(LinuxJailHelper {
                 identity: HelperFileIdentity::of(&helper),
                 path: helper,
