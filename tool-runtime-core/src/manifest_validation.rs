@@ -479,7 +479,8 @@ fn validate_fixed_environment(
                 | "GIT_CONFIG_GLOBAL"
                 | "GIT_CONFIG_SYSTEM"
         ) || name.starts_with("LD_")
-            || name.starts_with("DYLD_");
+            || name.starts_with("DYLD_")
+            || is_interpreter_injection_environment_name(name);
         let injection_collision = contract.auth.injections.iter().any(|injection| {
             matches!(
                 &injection.target,
@@ -1704,6 +1705,41 @@ fn is_safe_injection_environment_name(value: &str) -> bool {
             | "SSLKEYLOGFILE"
     ) && !upper.starts_with("DYLD_")
         && !upper.starts_with("GIT_CONFIG_")
+        && !is_interpreter_injection_environment_name(&upper)
+}
+
+/// Upper-case names through which an environment value becomes code or
+/// changes where an interpreter or tool loads code from: startup hooks,
+/// module search paths, option injection, and command overrides. Refused as
+/// fixed values and as credential injection targets (`npm_config_*` is
+/// matched upper-cased).
+fn is_interpreter_injection_environment_name(upper: &str) -> bool {
+    matches!(
+        upper,
+        "PYTHONSTARTUP"
+            | "PYTHONINSPECT"
+            | "PYTHONBREAKPOINT"
+            | "PYTHONUSERBASE"
+            | "PYTHONWARNINGS"
+            | "PYTHONPATH"
+            | "PYTHONHOME"
+            | "NODE_PATH"
+            | "NODE_OPTIONS"
+            | "JAVA_TOOL_OPTIONS"
+            | "RUBYLIB"
+            | "RUBYOPT"
+            | "PERLLIB"
+            | "PERL5LIB"
+            | "PERL5OPT"
+            | "GIT_SSH_COMMAND"
+            | "GIT_EXEC_PATH"
+            | "BASH_ENV"
+            | "ENV"
+            | "OPENSSL_CONF"
+            | "OPENSSL_ENGINES"
+            | "OPENSSL_MODULES"
+    ) || upper.starts_with("NPM_CONFIG_")
+        || upper.starts_with("LUA_INIT")
 }
 
 fn is_relative_path(value: &str) -> bool {
@@ -2828,6 +2864,48 @@ mod tests {
             validation_error(&contract).code,
             ManifestValidationErrorCode::InvalidEnvironment
         );
+    }
+
+    /// Names through which a value becomes code or redirects code loading
+    /// are refused both as fixed values and as injection targets.
+    #[test]
+    fn interpreter_injection_names_are_refused() {
+        for name in [
+            "PYTHONSTARTUP",
+            "PYTHONINSPECT",
+            "PYTHONBREAKPOINT",
+            "PYTHONUSERBASE",
+            "PYTHONWARNINGS",
+            "NODE_PATH",
+            "NODE_OPTIONS",
+            "NPM_CONFIG_SCRIPT_SHELL",
+            "JAVA_TOOL_OPTIONS",
+            "LUA_INIT",
+            "LUA_INIT_5_4",
+            "RUBYLIB",
+            "RUBYOPT",
+            "PERLLIB",
+            "PERL5LIB",
+            "PERL5OPT",
+            "GIT_SSH_COMMAND",
+            "GIT_EXEC_PATH",
+            "BASH_ENV",
+            "ENV",
+            "OPENSSL_CONF",
+            "OPENSSL_ENGINES",
+            "OPENSSL_MODULES",
+        ] {
+            let mut contract = cli_contract("provider-cli");
+            contract.requires.environment = BTreeMap::from([(name.to_owned(), "x".to_owned())]);
+            assert_eq!(
+                validation_error(&contract).code,
+                ManifestValidationErrorCode::InvalidEnvironment,
+                "{name}"
+            );
+            assert!(!is_safe_injection_environment_name(name), "{name}");
+            assert!(!is_safe_injection_environment_name(&name.to_ascii_lowercase()), "{name}");
+        }
+        assert!(is_safe_injection_environment_name("PROVIDER_API_KEY"));
     }
 
     #[test]

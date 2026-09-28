@@ -21,6 +21,11 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # The exec-roots Node test must not skip where a jail and node exist,
+      # and the macOS exec-roots Python tests must find a trusted python3.
+      MAGICRUN_REQUIRE_EXEC_ROOTS_NODE: "1"
+      MAGICRUN_REQUIRE_EXEC_ROOTS_PYTHON: ${{ matrix.os == 'macos-latest' && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,6 +34,9 @@ jobs:
       - run: make test-architecture
       - run: make check
       - run: make test
+      # Show that the macOS exec-roots jail tests ran rather than skipped.
+      - if: runner.os == 'macOS'
+        run: cargo test -p tool-runtime-core --lib exec_roots -- --nocapture
   # The Linux jail paths (bubblewrap, the in-jail helper and egress forwarder,
   # interpreter mode, staged inputs) run for real here: skipped Linux jail
   # tests fail (MAGICRUN_REQUIRE_LINUX_JAIL=1). Three launch configurations:
@@ -49,6 +57,8 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       MAGICRUN_REQUIRE_LINUX_JAIL: "1"
+      MAGICRUN_REQUIRE_EXEC_ROOTS_NODE: "1"
+      MAGICRUN_REQUIRE_EXEC_ROOTS_PYTHON: "1"
       MAGICRUN_EXPECT_PROCESS_CEILING: ${{ matrix.process_ceiling }}
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +74,7 @@ jobs:
         run: sudo sysctl -w user.max_user_namespaces=0
       - run: cargo build -p tool-runtime-core --bin magicrun-jail-egress-forwarder
       - run: sudo install -D -o root -g root -m 0755 target/debug/magicrun-jail-egress-forwarder /usr/libexec/magicrun/magicrun-jail-egress-forwarder
-      - run: ls -ld /usr/libexec /usr/libexec/magicrun && python3 --version && bwrap --version && cat /proc/sys/user/max_user_namespaces
+      - run: ls -ld /usr/libexec /usr/libexec/magicrun && python3 --version && bwrap --version && cat /proc/sys/user/max_user_namespaces && which node && node --version
       - run: cargo test -p tool-runtime-core --lib governed_process_jail -- --nocapture
       - run: cargo test -p tool-runtime-core --lib governed_batch_process -- --nocapture
       - run: cargo test -p tool-runtime-core --test jail_egress_forwarder -- --nocapture

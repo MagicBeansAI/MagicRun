@@ -8,7 +8,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.80`._
+_Current development version: `0.1.81`._
+
+### Declared exec roots (`0.1.81`)
+
+- **New:** `GovernedProcessJail::with_exec_roots(GovernedJailExecRoots)`, an
+  opt-in jail mode that runs any installed program in place, whatever its
+  language or toolchain (a Python wrapper spawning `yt-dlp` from its own
+  `site-packages`; a wrapper spawning a Node CLI from `node_modules/.bin`).
+  It composes with `strict_app`, `strict_app_with_brokered_egress` and
+  `with_interpreter`.
+- **Trust model:** the code under a declared root (the skill, its runtime,
+  its packages) is trusted as installed; the untrusted party is the caller,
+  who chooses the arguments. The jail confines the run's authority and data
+  flow, not the program's code: it reads and execs only the declared roots
+  (less their excluded subpaths) and `/bin`, `/usr/bin`; writes only its
+  private workdir; and reaches the network only through the broker of a
+  brokered jail, or not at all. Everything inside a root is readable, so a
+  secret there must be excluded. Only the program's identity is pinned; the
+  rest of each root's tree is trusted as installed. Roots must be runtime
+  and skill directories only, never a prefix holding data (`/opt/homebrew`
+  holds `var/` databases and `etc/`); the consumer must assert this and can
+  pass its data roots to `GovernedJailExecRoots::new_with_forbidden`. A root
+  must not contain directories others can write; `PATH` entries and every
+  directory between an entry and its root must be owned by root or this user
+  and not group/other-writable.
+- **API:** `GovernedJailExecRoot::new(path).excluding(relative)`,
+  `GovernedJailExecRoots::new(roots, search_path)`,
+  `GovernedJailExecRoots::new_with_forbidden(roots, search_path, forbidden)`,
+  `sweep_stale_jail_members() -> GovernedJailSweep` (with `roots()`,
+  `search_path()`, `declaration_digest()`),
+  `GovernedProcessJail::with_exec_roots`,
+  `governed_process_jail_exec_roots_profile_identity(platform, network,
+  interpreter, &roots)`, the audit `GovernedProcessJailAudit::exec_roots`
+  (`GovernedJailExecRootsAudit`, value-free), the error codes
+  `GovernedProcessJailErrorCode::InvalidExecRoots` and
+  `GovernedBatchProcessErrorCode::{ExecRootsRefused, JailTeardownIncomplete}`,
+  and the constants `GOVERNED_JAIL_EXEC_ROOTS_V1`,
+  `GOVERNED_JAIL_EXEC_ROOTS_INPUT_DIRECTORY`,
+  `GOVERNED_JAIL_EXEC_ROOTS_SYSTEM_PATH`, `GOVERNED_JAIL_EXEC_ROOTS_ENVIRONMENT`,
+  `GOVERNED_JAIL_PYTHON3_EXEC_ROOTS_FLAGS` and the `MAX_GOVERNED_JAIL_EXEC_*`
+  bounds.
+- **Roots:** at most 16, canonicalized, existing directories owned by root
+  or this user and not group/other-writable, with ancestors owned by root or
+  this user and not group/other-writable (a root-owned sticky directory such
+  as `/tmp` is accepted); never `/`, the home directory (`$HOME` or the
+  password database's) or its ancestors, nested roots, the jail's workdir
+  or its own paths. At most 16 exclusions per root and 16 `PATH` entries
+  inside the roots. An exclusion must exist as a real directory at
+  declaration and at every launch, and its regular files must have one link
+  each (bounded walk); file exclusions are refused, because on Linux a
+  rename over a file mask detaches it (since 3.18) and an absent path gets
+  no mask.
+- **Program:** the contract still resolves, hashes and snapshots the
+  program, but the jail launches its canonical installed path, which must lie
+  inside a root outside its exclusions (its file identity is rechecked right
+  before spawn). With an interpreter: `<interpreter> -s -B <script>`. `-I` and
+  `-S` are dropped in this mode so the script's directory is on `sys.path`
+  and `site` runs; `PYTHONNOUSERSITE=1`, `PYTHONDONTWRITEBYTECODE=1` and
+  `OPENSSL_CONF=/dev/null` are overlaid for every process the run starts. Staged inputs go to `in/`
+  (`stage_input_file` returns `in/<name>`), so a `-c`/`-m` child's cwd entry
+  on `sys.path` holds no caller input; `with_exec_roots` refuses a workdir
+  that already holds inputs. The child's `PATH` is the
+  declared entries then `/usr/bin:/bin`. `guarantees.exact_executable_snapshot`
+  is `false` in this mode; the interpreter audit's `launch_flags` is now a
+  slice (serialized identically) and reads `["-s", "-B"]` here.
+- **macOS:** the strict profile for the program, then `(allow process-fork)`,
+  `(allow signal (target same-sandbox))`, `/dev/null` writes, a read of the
+  jail's member sentinel (an empty directory), read and exec
+  of `/bin` and `/usr/bin`, per root
+  `(allow file-read* process-exec file-map-executable (subpath …))`, metadata
+  of every ancestor of a root or the workdir, and finally
+  `(deny file-read* process-exec file-map-executable (subpath …))` per
+  exclusion. Because fork is allowed and macOS has no pid namespace, the
+  watchdog and teardown of an exec-roots jail also find processes that left
+  the process group (`setsid`) by their sandbox (`sandbox_check` against a
+  per-jail member sentinel that lives until teardown proves every member
+  dead and records its owning host process). Teardown stops each member the
+  moment a scan finds it (unseen pids first), rechecks and kills it; only
+  "unsandboxed" answers are cached, and it ends only after three
+  consecutive uncached confirmation scans, 10 ms apart, find no member and
+  no unclassifiable process. If that does not happen within 3 s the run
+  fails closed with `JailTeardownIncomplete` (effect uncertain). The
+  watchdog counts members outside the group, accumulates CPU per member
+  identity, and fails closed if it stops recognizing the leader once the
+  leader has exec'd past `sandbox-exec`. `sweep_stale_jail_members()`
+  cleans up after a host that died mid-teardown; it keeps a sentinel whose
+  owner cannot be read. Transitional limits: a legacy sentinel without an
+  owner record is swept on mtime age alone (600 s), and only the current
+  `temp_dir()` is scanned.
+- **Linux:** no `/app`; `/bin`, `/usr/bin`, `/usr/lib`, `/usr/lib64` and each
+  root are bound read-only at their own paths; each excluded directory is
+  masked with an empty read-only tmpfs; the program runs through the
+  in-jail helper, whose task ceiling every descendant inherits.
+- **Manifest environment:** fixed values and credential injection targets
+  now both refuse `PYTHONSTARTUP`, `PYTHONINSPECT`, `PYTHONBREAKPOINT`,
+  `PYTHONUSERBASE`, `PYTHONWARNINGS`, `PYTHONPATH`, `PYTHONHOME`,
+  `NODE_PATH`, `NODE_OPTIONS`, `NPM_CONFIG_*`, `JAVA_TOOL_OPTIONS`,
+  `LUA_INIT*`, `RUBYLIB`, `RUBYOPT`, `PERLLIB`, `PERL5LIB`, `PERL5OPT`,
+  `GIT_SSH_COMMAND`, `GIT_EXEC_PATH`, `BASH_ENV`, `ENV`, `OPENSSL_CONF`,
+  `OPENSSL_ENGINES` and `OPENSSL_MODULES`.
+- **Identities:** new exec-roots identities fold in the exact canonical roots,
+  exclusions and `PATH` entries. Goldens for a fixed declaration of a skill
+  plus a Node keg (`exec_roots_profile_identities_match_the_reviewed_goldens`):
+  macOS denied `blake3:50105988…28a936`, brokered `blake3:c0db917a…fc1967`,
+  with Python 3.9 `blake3:9656a7e6…dcf88d` and `blake3:dea9780e…2afc27`;
+  Linux denied `blake3:22306cb6…3f1afa`, brokered `blake3:1846bedd…c27ded`,
+  with Python 3.12 `blake3:cca1a8a6…efc27e` and `blake3:866f5206…1517b0`. Every
+  existing strict, brokered and interpreter profile, argv, audit and
+  identity is unchanged.
+- **Refactor:** the Linux bubblewrap argv has one builder for every mode;
+  the strict, brokered and interpreter goldens pin it byte for byte.
 
 ### Smaller macOS descriptor-listing buffer (`0.1.80`)
 
