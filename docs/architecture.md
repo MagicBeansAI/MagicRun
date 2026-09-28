@@ -647,7 +647,10 @@ flowchart LR
     sentinels of this user in the temp directory whose owner is gone (or,
     without an owner record, older than 10 minutes), kills their members,
     removes them and returns `GovernedJailSweep` counts; consumers call it
-    at startup and, if wanted, periodically. On Linux it returns zeros.
+    at startup and, if wanted, periodically. A sentinel whose owner cannot
+    be read is kept, never swept. On Linux it returns zeros. Transitional
+    limits: a legacy sentinel without an owner record is swept on mtime
+    age alone (600 s), and only the current `temp_dir()` is scanned.
   - *In-sandbox reaper, evaluated and not used.* A process inside the same
     sandbox looping `kill(-1, SIGKILL)` would reach only same-sandbox
     processes, but it has to be a member of the jail's own tree, and any

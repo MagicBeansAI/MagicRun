@@ -93,7 +93,10 @@ _Current development version: `0.1.81`._
   watchdog counts members outside the group, accumulates CPU per member
   identity, and fails closed if it stops recognizing the leader once the
   leader has exec'd past `sandbox-exec`. `sweep_stale_jail_members()`
-  cleans up after a host that died mid-teardown.
+  cleans up after a host that died mid-teardown; it keeps a sentinel whose
+  owner cannot be read. Transitional limits: a legacy sentinel without an
+  owner record is swept on mtime age alone (600 s), and only the current
+  `temp_dir()` is scanned.
 - **Linux:** no `/app`; `/bin`, `/usr/bin`, `/usr/lib`, `/usr/lib64` and each
   root are bound read-only at their own paths; each excluded directory is
   masked with an empty read-only tmpfs; the program runs through the

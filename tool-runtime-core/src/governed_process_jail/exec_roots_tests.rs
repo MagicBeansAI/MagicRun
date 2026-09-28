@@ -1251,6 +1251,22 @@ fn a_setsid_exec_loop_leaves_no_survivors() {
     assert_chain_leaves_no_survivors(&skill, &marker, rounds);
 }
 
+/// The owner check behind the sweep: gone, alive, or unknown (kept).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_sentinel_owner_is_gone_only_when_proven() {
+    use super::exec_roots::owner_is_gone_for_test as gone;
+    let owner = (4242, 1_000_000);
+    // The pid is gone, another user's or a zombie.
+    assert_eq!(gone(owner, Some(None)), Some(true));
+    // The pid now belongs to another process (reused).
+    assert_eq!(gone(owner, Some(Some((4242, 2_000_000)))), Some(true));
+    // The owner itself, alive.
+    assert_eq!(gone(owner, Some(Some(owner))), Some(false));
+    // `proc_pidinfo` failed unexpectedly: nothing is concluded.
+    assert_eq!(gone(owner, None), None);
+}
+
 /// A member sentinel left by a host that is gone is swept: its members are
 /// killed and it is removed. A live jail's sentinel is left alone.
 #[cfg(target_os = "macos")]

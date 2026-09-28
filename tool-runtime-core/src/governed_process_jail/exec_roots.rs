@@ -648,10 +648,16 @@ pub struct GovernedJailSweep {
 /// crashed or was killed before its jail's teardown finished), kill every
 /// process still in those jails and remove the sentinels. A sentinel whose
 /// recorded owner process is still running belongs to a live jail and is
-/// left alone; one without an owner record (from before owner records) is
-/// swept only when older than [`STALE_SENTINEL_WITHOUT_OWNER`]. Call it at
-/// startup and, if wanted, periodically. Other hosts: nothing to do (a
-/// Linux jail's processes die with its pid namespace); returns zeros.
+/// left alone; one whose owner cannot be read is kept (counted in
+/// `sentinels_kept`). Call it at startup and, if wanted, periodically.
+/// Other hosts: nothing to do (a Linux jail's processes die with its pid
+/// namespace); returns zeros.
+///
+/// Transitional limits: a legacy sentinel without an owner record (made
+/// before owner records) is judged by age alone and swept once its mtime is
+/// older than [`STALE_SENTINEL_WITHOUT_OWNER`] (600 s), live or not; and
+/// only the current [`std::env::temp_dir`] is scanned, so a sentinel made
+/// by a host with another `TMPDIR` is not found.
 pub fn sweep_stale_jail_members() -> GovernedJailSweep {
     #[cfg(target_os = "macos")]
     {
@@ -1140,7 +1146,15 @@ impl MacosJailMembers {
                 Some((parts.next()?.parse::<libc::pid_t>().ok()?, parts.next()?.parse::<u64>().ok()?))
             });
             let stale = match owner {
-                Some(owner) => probe(uid, owner.0) != Probe::Ours(owner),
+                Some(owner) => match owner_is_gone(owner, probe(uid, owner.0)) {
+                    Some(gone) => gone,
+                    None => {
+                        // The owner could not be read: it may be alive, so
+                        // its jail is left alone.
+                        sweep.sentinels_kept += 1;
+                        continue;
+                    },
+                },
                 None => metadata
                     .modified()
                     .ok()
@@ -1163,6 +1177,31 @@ impl MacosJailMembers {
         }
         sweep
     }
+}
+
+/// Whether a sentinel's recorded owner is gone, given a probe of its pid:
+/// `Some(true)` when that pid is gone, another user's or a zombie, or now a
+/// different process (another start time); `Some(false)` when it is the
+/// owner, alive; `None` when the probe failed, so nothing can be concluded.
+#[cfg(target_os = "macos")]
+fn owner_is_gone(owner: ProcessKey, probed: Probe) -> Option<bool> {
+    match probed {
+        Probe::NotOurs => Some(true),
+        Probe::Ours(key) => Some(key != owner),
+        Probe::Unknown => None,
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+pub(super) fn owner_is_gone_for_test(owner: (libc::pid_t, u64), probed: Option<Option<(libc::pid_t, u64)>>) -> Option<bool> {
+    owner_is_gone(
+        owner,
+        match probed {
+            None => Probe::Unknown,
+            Some(None) => Probe::NotOurs,
+            Some(Some(key)) => Probe::Ours(key),
+        },
+    )
 }
 
 #[cfg(target_os = "macos")]
