@@ -1,15 +1,15 @@
 {
   "schema_version": 1,
   "project": "MagicRun",
-  "architecture_version": "0.1.79",
+  "architecture_version": "0.1.80",
   "document": "docs/architecture.md",
-  "document_sha256": "2259241dd805a6ffe034f861e3d0b0f0171d5594c7e8675d0961461fe4a32091",
+  "document_sha256": "5eb439d1f8a04fe967bbcf990b97170d17d8dcf5f07ae817352821862327a9c5",
   "component_versions": {
-    "tool-runtime-core": "0.1.79"
+    "tool-runtime-core": "0.1.80"
   },
   "source_sha256": {
     "Cargo.toml": "42097db7277fb53f8c0536875c35f007c8e88083e6b1062b78f6f6599f6a2bb0",
-    "tool-runtime-core/Cargo.toml": "01e06762eafa56675b9f8e5b665904b24785938178738a0d1363ac8c34bfaafa",
+    "tool-runtime-core/Cargo.toml": "0906b192101e453516b92bd29a704decee12771186c95db592e1be0d0362e489",
     "tool-runtime-core/src/action_overrides.rs": "14dfb943e95be143acef5db15af4be31e4621dad9f78346f5c23421904c526e1",
     "tool-runtime-core/src/bin/magicrun-jail-egress-forwarder.rs": "0001802efdac75b367b3d98145870b2b1dce990cc65e60b468af31c3f06df311",
     "tool-runtime-core/src/bin/tool-runtime-classification.rs": "0e8d63cb63deea58890f7b30b61b1e9f6229598146dee00c1b4db9266083d858",
@@ -41,7 +41,7 @@
     "tool-runtime-core/src/governed_process_jail.rs": "2ae34e01c8562dd6e53d9ffe07bc6e51104b3ee5b5ca373fd3d66eab62b904c4",
     "tool-runtime-core/src/governed_process_jail/egress_forwarder.rs": "bb893fd104f8495aacac451bdec9488df26218d18ca659f70b483de2fb414a88",
     "tool-runtime-core/src/governed_process_jail/egress_tests.rs": "949129515706da7cdefaedf6531cd87f9c43dd49a8ce0c3e324307dd73a8fe97",
-    "tool-runtime-core/src/governed_process_jail/inherited_descriptors.rs": "2059fd6fa890116931cdb9906e303a38f1b6fed9d1691507495086fcc5aabb40",
+    "tool-runtime-core/src/governed_process_jail/inherited_descriptors.rs": "d5a6e4e127d3f62e09d7e305a9bb2d1b5e4d6751492e65ef80d1b640f9fb2bb9",
     "tool-runtime-core/src/governed_process_jail/interpreter_tests.rs": "3db6a4424a235740ff18177f7b5df7b79e8875616cb4abee84be007284169714",
     "tool-runtime-core/src/governed_pty_process.rs": "5be0567c50cb74e15c4dcc84df4e1a5d9a619bd1bef358b59a608be875a38fff",
     "tool-runtime-core/src/inventory.rs": "6de35bebad840060369faebe7046c7b19db10d86d0ba432ce3fe2186d1b1b054",

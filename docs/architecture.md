@@ -1,6 +1,6 @@
 # MagicRun architecture
 
-Architecture version: `0.1.79`
+Architecture version: `0.1.80`
 
 Original immutable baseline tag: `architecture/v0.1.73`. The current reviewed
 source/document fingerprints are in [architecture-baseline.json](architecture-baseline.json).
@@ -302,11 +302,16 @@ host process reached the jailed command, which could read or write it.
     kills the process on `close_range` (rather than returning an errno)
     makes the launch fail with `SIGSYS` instead of falling back.
   - *macOS:* the exact list from `proc_pidinfo(PROC_PIDLISTFDS)` into a
-    4096-entry stack buffer; if the call fails or the buffer fills, every
-    number below `kern.maxfilesperproc`, above which `F_DUPFD` fails and no
-    descriptor can exist. The soft `RLIMIT_NOFILE` is not a usable bound
-    there: it can exceed `kern.maxfilesperproc` many times over (a scan to
-    it cost about 100 ms per launch) or be lowered below an open descriptor.
+    1024-entry (8 KiB, uninitialized) stack buffer, small enough for a
+    small-stack spawning thread; if the call fails or the buffer fills (a
+    process holding 1024 or more descriptors), every number below
+    `kern.maxfilesperproc` (about 18 ms at 184320), above which `F_DUPFD`
+    fails and no descriptor can exist, unless root lowered
+    `kern.maxfilesperproc` after a higher descriptor was opened; that only
+    matters when the exact listing also fails. The soft `RLIMIT_NOFILE` is
+    not a usable bound there: it is the launching shell's limit, e.g.
+    1048576 or unlimited (a scan to 1048576 cost about 100 ms per launch;
+    launchd's default is 256), and can be lowered below an open descriptor.
   - Flags are only set, so the child's own exec-error pipe and
     working-directory handle stay usable until exec.
 - **Defence in depth (Linux).** The exec shim marks every descriptor from 3
