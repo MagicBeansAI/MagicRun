@@ -25,13 +25,16 @@
 //!    stack buffer, each marked with `fcntl(F_SETFD)`. Exact, whatever the
 //!    descriptor limit. Needs a mounted `/proc`.
 //! 3. macOS: `proc_pidinfo(PROC_PIDLISTFDS)` into a stack buffer of
-//!    [`MACOS_LISTED_DESCRIPTORS`] entries, each marked. Exact; a full buffer
-//!    or an error moves on.
+//!    [`MACOS_LISTED_DESCRIPTORS`] entries (8 KiB), each marked. Exact; a
+//!    full buffer or an error moves on.
 //! 4. Every descriptor number from 3 up to the scan bound. On macOS the
 //!    bound is `kern.maxfilesperproc`: no descriptor can be opened at or above
 //!    it (`F_DUPFD` fails with `EINVAL`), whatever the soft `RLIMIT_NOFILE`
-//!    says, so this is exact too, even after the soft limit was lowered below
-//!    an open descriptor. Elsewhere, and if the sysctl cannot be read, the
+//!    says (the launching shell's limit, e.g. 1048576 or unlimited;
+//!    launchd's default is 256), so this is exact too, even after the soft
+//!    limit was lowered below an open descriptor, unless root lowered
+//!    `kern.maxfilesperproc` after a higher descriptor was opened; that only
+//!    matters when the exact listing also fails. Elsewhere, and if the sysctl cannot be read, the
 //!    bound is the soft `RLIMIT_NOFILE`, capped at
 //!    [`DESCRIPTOR_SCAN_CEILING`]: exact unless the limit was lowered after a
 //!    higher descriptor was opened, or exceeds the cap. On Linux it runs only
@@ -45,10 +48,13 @@ use std::{io, os::fd::RawFd};
 /// `fs.nr_open` and the process its limit.
 pub(crate) const DESCRIPTOR_SCAN_CEILING: RawFd = 1 << 20;
 
-/// Entries of the macOS descriptor listing buffer (8 bytes each, on the
-/// forked child's stack). A process holding more falls back to the scan.
+/// Entries of the macOS descriptor listing buffer: 8 bytes each, 8 KiB in
+/// all, on the stack of the forked child, which may be a small thread stack
+/// (the spawning thread's). A process holding at least this many
+/// descriptors falls back to the scan bounded by `kern.maxfilesperproc`
+/// (about 18 ms at 184320); a running Magician holds about 137.
 #[cfg(target_os = "macos")]
-pub(crate) const MACOS_LISTED_DESCRIPTORS: usize = 4096;
+pub(crate) const MACOS_LISTED_DESCRIPTORS: usize = 1024;
 
 /// Serializes the tests that change this process's `RLIMIT_NOFILE`.
 #[cfg(test)]
@@ -260,8 +266,10 @@ unsafe fn parse_descriptor(name: *const u8) -> Option<RawFd> {
 /// `false` if the call fails or the buffer may have been too small.
 #[cfg(target_os = "macos")]
 pub(crate) fn mark_by_pid_listing() -> bool {
-    // SAFETY: `proc_fdinfo` is two plain integers; all-zero is valid.
-    let mut buffer: [libc::proc_fdinfo; MACOS_LISTED_DESCRIPTORS] = unsafe { std::mem::zeroed() };
+    // Uninitialized: no zeroed temporary doubles the stack use in debug
+    // builds. Only the entries the kernel writes are read.
+    let mut buffer =
+        std::mem::MaybeUninit::<[libc::proc_fdinfo; MACOS_LISTED_DESCRIPTORS]>::uninit();
     let size = std::mem::size_of_val(&buffer) as libc::c_int;
     // SAFETY: `getpid` cannot fail; `proc_pidinfo` writes at most `size`
     // bytes into the live buffer.
@@ -278,7 +286,11 @@ pub(crate) fn mark_by_pid_listing() -> bool {
         return false;
     }
     let entries = filled as usize / std::mem::size_of::<libc::proc_fdinfo>();
-    for entry in &buffer[..entries] {
+    let first = buffer.as_ptr().cast::<libc::proc_fdinfo>();
+    for index in 0..entries {
+        // SAFETY: the kernel wrote `filled` bytes, so the first `entries`
+        // records are initialized; `index` stays below that count.
+        let entry = unsafe { first.add(index).read() };
         if entry.proc_fd >= 3 {
             // SAFETY: flag change only; a descriptor closed meanwhile fails
             // with `EBADF`, which is ignored.
@@ -478,6 +490,48 @@ mod tests {
         assert_marks("proc_pidinfo(PROC_PIDLISTFDS)", mark_by_pid_listing);
     }
 
+    /// macOS: a process holding more descriptors than the listing buffer
+    /// fits gets no listing (`false`), and the combined helper still marks
+    /// the stray through the scan. The extra descriptors are close-on-exec
+    /// duplicates made in the forked child only (so exec closes them).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_full_pid_listing_falls_back_to_the_scan() {
+        let descriptors = InheritedDescriptors::prepare();
+        assert_marks("the listing fallback", move || {
+            // Room for the duplicates beyond the listing buffer.
+            const WANTED: libc::rlim_t = 4096;
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: `getrlimit`/`setrlimit`/`fcntl` are async-signal-safe
+            // and touch only this forked child.
+            unsafe {
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) != 0 {
+                    return false;
+                }
+                if current.rlim_cur < WANTED {
+                    let raised = libc::rlimit {
+                        rlim_cur: WANTED.min(current.rlim_max),
+                        rlim_max: current.rlim_max,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) != 0 {
+                        return false;
+                    }
+                }
+                for _ in 0..MACOS_LISTED_DESCRIPTORS + 64 {
+                    if libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 300) < 0 {
+                        return false;
+                    }
+                }
+            }
+            // The listing must report itself incomplete; the helper then
+            // scans.
+            !mark_by_pid_listing() && descriptors.mark_cloexec(&[]).is_ok()
+        });
+    }
+
     /// macOS: the scan bound is `kern.maxfilesperproc`, not the soft limit
     /// (which can be far higher, or lower than an open descriptor).
     #[cfg(target_os = "macos")]
@@ -540,7 +594,7 @@ mod tests {
         let seen = listing_after(|| true, stray.as_raw_fd(), kept.as_raw_fd(), Some(64)).unwrap();
         assert!(seen.contains(&stray.as_raw_fd()), "{seen:?}");
         let descriptors = InheritedDescriptors::prepare();
-        let mut methods: Vec<(&str, Box<dyn Fn() -> bool + Send + Sync>)> = vec![(
+        let mut methods: Vec<(&str, Marking)> = vec![(
             "the combined helper",
             Box::new(move || descriptors.mark_cloexec(&[]).is_ok()),
         )];
@@ -575,6 +629,9 @@ mod tests {
             assert!(seen.contains(&kept.as_raw_fd()), "{method}: {seen:?}");
         }
     }
+
+    /// A marking method run in the forked child.
+    type Marking = Box<dyn Fn() -> bool + Send + Sync>;
 
     /// Keeping a descriptor that is not open is an error: the caller must
     /// not exec without the descriptor it meant to pass.

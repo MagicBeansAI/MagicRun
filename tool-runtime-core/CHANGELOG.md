@@ -8,7 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.79`._
+_Current development version: `0.1.80`._
+
+### Smaller macOS descriptor-listing buffer (`0.1.80`)
+
+- The macOS listing of inherited descriptors (`proc_pidinfo(PROC_PIDLISTFDS)`
+  in the forked child) used a 4096-entry, 32 KiB stack buffer, plus a 32 KiB
+  zeroed temporary in debug builds: a launch from a thread with a small
+  stack (64 KiB or less) could overflow in the child. It is now 1024 entries
+  (8 KiB), uninitialized, and only the entries the kernel wrote are read. A
+  process holding 1024 or more descriptors falls back to the scan bounded by
+  `kern.maxfilesperproc` (about 18 ms). No behaviour, argv or profile
+  change; every golden is unchanged.
 
 ### Security: host descriptors leaked into every jail (`0.1.79`)
 
@@ -34,11 +45,14 @@ _Current development version: `0.1.79`._
     `close_range` instead of returning an error makes the launch fail with
     `SIGSYS`, with no fallback.
   - macOS: the exact descriptor list from `proc_pidinfo(PROC_PIDLISTFDS)`
-    into a 4096-entry stack buffer; if it fails or fills, every number below
-    `kern.maxfilesperproc` (read before `fork`), above which no descriptor
-    can exist. The soft `RLIMIT_NOFILE` is not the bound: it can be far
-    higher (1048576 on current macOS, which made a scan to it cost about
-    100 ms per launch) or lowered below a descriptor still open.
+    into a stack buffer (1024 entries since `0.1.80`); if it fails or fills,
+    every number below `kern.maxfilesperproc` (read before `fork`), above
+    which no descriptor can exist unless root lowered
+    `kern.maxfilesperproc` after a higher descriptor was opened; that only
+    matters when the exact listing also fails. The soft `RLIMIT_NOFILE` is
+    not the bound: it is the launching shell's limit, e.g. 1048576 or
+    unlimited (a scan to 1048576 cost about 100 ms per launch; launchd's
+    default is 256), and can be lowered below a descriptor still open.
   - A failure to keep the passed descriptor fails the launch.
 - Defence in depth on Linux: the in-jail exec shim marks every descriptor
   from 3 up close-on-exec before it execs, and the forwarder does the same in
