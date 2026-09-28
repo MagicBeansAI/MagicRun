@@ -1,6 +1,6 @@
 # MagicRun architecture
 
-Architecture version: `0.1.80`
+Architecture version: `0.1.81`
 
 Original immutable baseline tag: `architecture/v0.1.73`. The current reviewed
 source/document fingerprints are in [architecture-baseline.json](architecture-baseline.json).
@@ -466,6 +466,134 @@ flowchart LR
   a missing or different one is a changed directory (fail closed). macOS
   leaves it out: `touch -t` to an earlier time moves APFS birth time.
 
+## Declared exec roots (`0.1.81`)
+
+`GovernedProcessJail::with_exec_roots(GovernedJailExecRoots)` is an opt-in
+that runs any installed program in place, whatever its language or
+toolchain: a Python wrapper that spawns `yt-dlp` (a Python app with its own
+`site-packages`), or one that spawns a Node CLI from `node_modules/.bin`
+run by `node`. It composes with `strict_app`,
+`strict_app_with_brokered_egress` and `with_interpreter`; the strict,
+brokered and interpreter profiles, argv and identities are unchanged.
+
+**Trust model.** The code under a declared root (the skill, its runtime, its
+packages) is trusted as installed. The untrusted party is the caller, who
+chooses the arguments. The jail confines the run's authority and data flow,
+not the program's code: it reads and execs only the declared roots (less
+their excluded subpaths) and the fixed system exec paths, writes only its
+private workdir, and reaches the network only through the broker of a
+brokered jail, or not at all.
+
+```mermaid
+flowchart LR
+    declaration["GovernedJailExecRoots::new (canonical, trust checks)"] -->|"with_exec_roots: overlap + recheck"| jail["GovernedProcessJail"]
+    authority["Contract PATH resolves the program; hash + identity"] --> jail
+    jail -->|"recheck roots; program inside a root"| launch["program in place, or interpreter -s -B script"]
+```
+
+- **Declaration.** `GovernedJailExecRoot::new(path).excluding(relative)`;
+  `GovernedJailExecRoots::new(roots, search_path)`. At most 16 roots, 16
+  exclusions per root and 16 `PATH` entries, each at most 1024 bytes. A root
+  is canonicalized (a symlink resolves to its target) and must be an
+  existing directory owned by root or this user and not group/other-writable;
+  every ancestor must be owned by root or this user and not
+  group/other-writable, or be a root-owned sticky directory (`/tmp`). It may
+  not be `/`, the home directory or one of its ancestors, overlap another
+  root, or overlap `/app`, `/work`, `/proc`, `/dev` or `/run/magicrun` (the
+  jail's own paths). Exclusions are relative plain components; one that
+  exists may not be or sit below a symlink. `PATH` entries lie inside a root
+  outside its exclusions and contain no `:`. `with_exec_roots` refuses a
+  root that overlaps the jail's workdir. The tree under a root is not walked:
+  its contents are trusted as installed. Violations are
+  `GovernedProcessJailErrorCode::InvalidExecRoots`.
+- **Program.** The governed pipeline is unchanged: the contract `PATH`
+  resolves the program, which is hashed and snapshotted as before. The jail
+  then launches the snapshot's canonical installed path in place (a copy
+  would lose its relative imports, `node_modules` and `@loader_path`), which
+  must lie inside a root outside its exclusions; the authority rechecks that
+  file's identity (device, inode, size, times) immediately before spawn.
+  With a pinned interpreter the installed path is the script:
+  `<interpreter> -s -B <script> <args...>`. The run may exec other programs
+  inside the roots or the system exec paths; the launcher and the program
+  are always absolute, so no bare name is ever searched on the host side.
+- **Interpreter and `site-packages`.** `-I` and `-S` are dropped in this mode
+  on purpose: `-I` would keep the script's directory off `sys.path` and `-S`
+  would skip `site`, so a skill could not import the packages beside it.
+  `-s` (no user site) and `-B` (no bytecode) remain, and the environment
+  overlay sets `PYTHONNOUSERSITE=1` and `PYTHONDONTWRITEBYTECODE=1` so every
+  Python the run starts (a venv `python`, `yt-dlp`'s) behaves the same. The
+  user site would be under `HOME`, the writable workdir. Manifest validation
+  still refuses `PYTHONPATH` and `PYTHONHOME`, so the environment stays the
+  consumer's; a package inside a root is imported from the script's own
+  directory, a venv interpreter inside a root, or a `sys.path` entry the
+  (trusted) script adds. Nothing inside a root is writable, so `-B` is
+  hygiene there. On macOS the pinned interpreter's own `site-packages` stays
+  denied.
+- **`PATH`.** The child's `PATH` is the declared entries followed by
+  `/usr/bin:/bin` (`GOVERNED_JAIL_EXEC_ROOTS_SYSTEM_PATH`). It is set in the
+  child environment only (and inside bubblewrap); lookups of bare names
+  happen inside the jail, in the child.
+- **macOS (SBPL).** The strict profile is rendered for the program (or the
+  interpreter) as its exec literal, without a private bundle. Appended:
+  `(allow process-fork)` (after the base `(deny process-fork)`; the later rule
+  wins), `(allow signal (target same-sandbox))`,
+  `(allow file-write-data (literal "/dev/null"))`,
+  `(allow file-read* process-exec (subpath "/bin"))` and the same for
+  `/usr/bin`, then per root
+  `(allow file-read* process-exec file-map-executable (subpath "<root>"))`,
+  then `(allow file-read-metadata (literal …))` for every ancestor of a root
+  or the workdir (Node's `realpath` `lstat`s each component; no listing is
+  granted), then per exclusion
+  `(deny file-read* process-exec file-map-executable (subpath "<root>/<excluded>"))`
+  last so it wins (also for a path created later), then the interpreter's
+  `site-packages` denial and the brokered rules. No `mach-lookup` or write
+  rule is added; paths use the strict profile's SBPL escaping.
+- **Linux (bubblewrap).** No `/app` is mounted. On top of `/lib` and
+  `/lib64`, `/bin`, `/usr/bin`, `/usr/lib` and `/usr/lib64` (those that
+  exist) and every root are bound read-only at their own paths. Each
+  exclusion that exists at launch is masked: a directory by an empty tmpfs
+  remounted read-only (`--tmpfs P --remount-ro P`), a file by `/dev/null`
+  bound read-only; an absent one is skipped (the jail cannot create it).
+  `PATH` and the overlay are set with `--setenv`; the program still runs
+  through the trusted helper, whose `RLIMIT_NPROC` task ceiling every
+  descendant inherits. Bubblewrap has no exec control: anything mounted
+  (the roots, the system directories, the workdir) is executable, and
+  anything not mounted does not exist in the jail.
+- **Fork and the process ceiling.** Fork is allowed, so `max_processes` and
+  `max_tasks` are what bound the tree. Linux already samples every
+  descendant by parent links inside the jail's pid namespace. macOS has no
+  pid namespace and its watchdog sampled the launcher's process group, which
+  a process can leave with `setsid`/`setpgid`. For exec-roots jails the
+  macOS watchdog and teardown also find members by their sandbox
+  (`MacosJailMembers`, private `sandbox_check` from `libsystem_sandbox`): a
+  process of this user that is sandboxed, may read the jail's unique workdir
+  and may not read the workdir's parent (no jail grants that) belongs to this
+  jail. Members outside the group are counted against the ceilings, and
+  every member is SIGKILLed when the leader exits or the run is torn down
+  (bounded rounds, so a member forking meanwhile is caught).
+- **Unchanged.** Private workdir, limits, Linux watchdog, task ceiling,
+  descriptor marking, brokered egress, `stage_input_file` and the
+  exec-status channel.
+- **Identity and audit.** `profile_identity()` equals
+  `governed_process_jail_exec_roots_profile_identity(platform, network,
+  interpreter, &roots)`: the exec-roots profile/argv rendered with
+  placeholder program, workdir and helper paths but the declaration's real
+  roots, exclusions and `PATH` (Linux renders every exclusion as a directory
+  mask), plus the exec-roots schema, the declaration digest, the overlay and
+  the interpreter flags. A consumer can lock it. `GovernedProcessJailAudit`
+  gains `exec_roots` (counts, declaration digest, `program_in_place`,
+  `process_fork_allowed`, `root_writes_denied`, `excluded_read_denied`,
+  profile identity; no host path), omitted otherwise, and
+  `guarantees.exact_executable_snapshot` is `false` in this mode. The
+  interpreter audit's `launch_flags` becomes a slice (serialized the same)
+  that reads `["-s", "-B"]`, and `script_exec_denied` is `false`.
+- **Limits.** Everything a root contains is readable and executable,
+  including a secret the consumer did not exclude. macOS reveals metadata
+  (not contents or listings) of each root's ancestors. On Linux, `/usr/lib`
+  is readable and an excluded path created after launch is visible. Native
+  code the run writes to the workdir can be executed on Linux (as in the
+  other modes) but not mapped executable on macOS.
+
 ## Declared login prompts
 
 `0.1.75` lets a skill's `auth.lifecycle.login_prompts` name the prompts its
@@ -629,7 +757,7 @@ fail-fast qualification evidence.
 ### Baseline review
 
 [architecture-baseline.json](architecture-baseline.json) binds this document to
-package `tool-runtime-core 0.1.77`, workspace/package manifests and production
+package `tool-runtime-core 0.1.81`, workspace/package manifests and production
 `src/` fingerprints. The local, ignored Cargo lockfile is not a published
 library architecture input. Dependency declarations still participate through
 the manifest fingerprints.

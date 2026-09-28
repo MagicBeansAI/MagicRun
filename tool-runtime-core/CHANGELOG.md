@@ -8,7 +8,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.80`._
+_Current development version: `0.1.81`._
+
+### Declared exec roots (`0.1.81`)
+
+- **New:** `GovernedProcessJail::with_exec_roots(GovernedJailExecRoots)`, an
+  opt-in jail mode that runs any installed program in place, whatever its
+  language or toolchain (a Python wrapper spawning `yt-dlp` from its own
+  `site-packages`; a wrapper spawning a Node CLI from `node_modules/.bin`).
+  It composes with `strict_app`, `strict_app_with_brokered_egress` and
+  `with_interpreter`.
+- **Trust model:** the code under a declared root (the skill, its runtime,
+  its packages) is trusted as installed; the untrusted party is the caller,
+  who chooses the arguments. The jail confines the run's authority and data
+  flow, not the program's code: it reads and execs only the declared roots
+  (less their excluded subpaths) and `/bin`, `/usr/bin`; writes only its
+  private workdir; and reaches the network only through the broker of a
+  brokered jail, or not at all. Everything inside a root is readable, so a
+  secret there must be excluded.
+- **API:** `GovernedJailExecRoot::new(path).excluding(relative)`,
+  `GovernedJailExecRoots::new(roots, search_path)` (with `roots()`,
+  `search_path()`, `declaration_digest()`),
+  `GovernedProcessJail::with_exec_roots`,
+  `governed_process_jail_exec_roots_profile_identity(platform, network,
+  interpreter, &roots)`, the audit `GovernedProcessJailAudit::exec_roots`
+  (`GovernedJailExecRootsAudit`, value-free), the error code
+  `InvalidExecRoots`, and the constants `GOVERNED_JAIL_EXEC_ROOTS_V1`,
+  `GOVERNED_JAIL_EXEC_ROOTS_SYSTEM_PATH`, `GOVERNED_JAIL_EXEC_ROOTS_ENVIRONMENT`,
+  `GOVERNED_JAIL_PYTHON3_EXEC_ROOTS_FLAGS` and the `MAX_GOVERNED_JAIL_EXEC_*`
+  bounds.
+- **Roots:** at most 16, canonicalized, existing directories owned by root
+  or this user and not group/other-writable, with ancestors owned by root or
+  this user and not group/other-writable (a root-owned sticky directory such
+  as `/tmp` is accepted); never `/`, the home directory or its ancestors,
+  nested roots, the jail's workdir or its own paths. At most 16 exclusions
+  per root (relative, not symlinked) and 16 `PATH` entries inside the roots.
+- **Program:** the contract still resolves, hashes and snapshots the
+  program, but the jail launches its canonical installed path, which must lie
+  inside a root outside its exclusions (its file identity is rechecked right
+  before spawn). With an interpreter: `<interpreter> -s -B <script>`. `-I` and
+  `-S` are dropped in this mode so the script's directory is on `sys.path`
+  and `site` runs; `PYTHONNOUSERSITE=1` and `PYTHONDONTWRITEBYTECODE=1` are
+  overlaid for every Python the run starts. The child's `PATH` is the
+  declared entries then `/usr/bin:/bin`. `guarantees.exact_executable_snapshot`
+  is `false` in this mode; the interpreter audit's `launch_flags` is now a
+  slice (serialized identically) and reads `["-s", "-B"]` here.
+- **macOS:** the strict profile for the program, then `(allow process-fork)`,
+  `(allow signal (target same-sandbox))`, `/dev/null` writes, read and exec
+  of `/bin` and `/usr/bin`, per root
+  `(allow file-read* process-exec file-map-executable (subpath …))`, metadata
+  of every ancestor of a root or the workdir, and finally
+  `(deny file-read* process-exec file-map-executable (subpath …))` per
+  exclusion. Because fork is allowed and macOS has no pid namespace, the
+  watchdog and teardown of an exec-roots jail also find processes that left
+  the process group (`setsid`) by their sandbox (`sandbox_check`), count
+  them against the ceilings and kill them.
+- **Linux:** no `/app`; `/bin`, `/usr/bin`, `/usr/lib`, `/usr/lib64` and each
+  root are bound read-only at their own paths; an existing excluded
+  directory is masked with an empty read-only tmpfs and an excluded file
+  with `/dev/null`; the program runs through the in-jail helper, whose task
+  ceiling every descendant inherits.
+- **Identities:** new exec-roots identities fold in the exact canonical roots,
+  exclusions and `PATH` entries. Goldens for a fixed declaration
+  (`exec_roots_profile_identities_match_the_reviewed_goldens`): macOS denied
+  `blake3:882dea3f…f17758`, brokered `blake3:d24d5fbd…e33ab3`, with Python
+  3.9 `blake3:f9adb289…b8525a` and `blake3:5cad5cae…1263e4`; Linux denied
+  `blake3:d2a6631a…ab9368`, brokered `blake3:a49b01f6…ba1f96`, with Python
+  3.12 `blake3:92c3ee15…679465` and `blake3:9ad41a99…fc3cce`. Every
+  existing strict, brokered and interpreter profile, argv, audit and
+  identity is unchanged.
+- **Refactor:** the Linux bubblewrap argv has one builder for every mode;
+  the strict, brokered and interpreter goldens pin it byte for byte.
 
 ### Smaller macOS descriptor-listing buffer (`0.1.80`)
 

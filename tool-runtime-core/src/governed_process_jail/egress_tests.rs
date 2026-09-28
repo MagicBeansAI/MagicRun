@@ -577,11 +577,15 @@ pub(super) mod linux {
 
     pub(in crate::governed_process_jail) struct UnixBroker {
         _directory: tempfile::TempDir,
-        path: PathBuf,
+        pub(in crate::governed_process_jail) path: PathBuf,
         requests: Arc<Mutex<Vec<String>>>,
     }
 
     impl UnixBroker {
+        pub(in crate::governed_process_jail) fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
+        }
+
         pub(in crate::governed_process_jail) fn start() -> Self {
             let directory = tempfile::tempdir().unwrap();
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();

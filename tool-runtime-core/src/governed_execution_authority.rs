@@ -458,6 +458,7 @@ impl ResolvedExecutable {
         if executes_in_place_on_sealed_system_volume(&self.path) {
             return Ok(GovernedExecutableSnapshot {
                 path: self.path.clone(),
+                source: self.path.clone(),
                 _directory: None,
                 canonical_bundle_root: None,
             });
@@ -525,6 +526,7 @@ impl ResolvedExecutable {
         drop(output);
         Ok(GovernedExecutableSnapshot {
             path,
+            source: self.path.clone(),
             _directory: Some(directory),
             canonical_bundle_root: Some(canonical_bundle_root),
         })
@@ -784,6 +786,10 @@ fn executes_in_place_on_sealed_system_volume(_path: &Path) -> bool {
 /// migrated through this capability.
 pub struct GovernedExecutableSnapshot {
     path: PathBuf,
+    /// The canonical installed path the snapshot was taken from, whose file
+    /// identity the authority rechecks immediately before spawn. Only a jail
+    /// with declared exec roots launches it in place.
+    source: PathBuf,
     _directory: Option<TempDir>,
     canonical_bundle_root: Option<PathBuf>,
 }
@@ -850,6 +856,13 @@ impl GovernedExecutableSnapshot {
     /// access over its whole host directory.
     pub(crate) fn private_bundle_root(&self) -> Option<&Path> {
         self.canonical_bundle_root.as_deref()
+    }
+
+    /// The canonical installed path the bytes were resolved and hashed at.
+    /// Equal to [`Self::as_path`] for a sealed-system executable.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    pub(crate) fn source_path(&self) -> &Path {
+        &self.source
     }
 }
 

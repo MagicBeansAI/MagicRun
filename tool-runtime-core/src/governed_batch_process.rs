@@ -685,6 +685,13 @@ fn execute_spawned(
         status.close_write();
     }
     let mut tree = ProcessTreeGuard::new(child);
+    #[cfg(target_os = "macos")]
+    {
+        tree.jail_members = jail_watch
+            .as_ref()
+            .and_then(|watch| watch.macos_members())
+            .map(std::sync::Arc::clone);
+    }
     let stdout = tree
         .child_mut()?
         .stdout
@@ -1203,6 +1210,9 @@ fn append_bounded(
 struct ProcessTreeGuard {
     child: Option<Child>,
     pid: Option<u32>,
+    /// macOS exec-roots jails: members that may have left the group.
+    #[cfg(target_os = "macos")]
+    jail_members: Option<std::sync::Arc<crate::governed_process_jail::MacosJailMembers>>,
 }
 
 impl ProcessTreeGuard {
@@ -1213,6 +1223,17 @@ impl ProcessTreeGuard {
         Self {
             child: Some(child),
             pid,
+            #[cfg(target_os = "macos")]
+            jail_members: None,
+        }
+    }
+
+    /// Kill every member of a macOS exec-roots jail that is still alive,
+    /// wherever its process group or session is. No-op otherwise.
+    fn kill_jail_members(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(members) = self.jail_members.as_ref() {
+            members.kill_all();
         }
     }
 
@@ -1227,6 +1248,7 @@ impl ProcessTreeGuard {
                 return Ok(None);
             }
             terminate_exited_process_group_before_reap(self.pid);
+            self.kill_jail_members();
             let result = self.child_mut()?.wait();
             #[cfg(magicrun_test_diagnostics)]
             crate::process_test_diagnostics::reaped(&result);
@@ -1248,6 +1270,7 @@ impl ProcessTreeGuard {
         #[cfg(magicrun_test_diagnostics)]
         crate::process_test_diagnostics::cleanup(false);
         terminate_process_group(self.pid);
+        self.kill_jail_members();
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _result = child.wait();
@@ -1262,6 +1285,8 @@ impl Drop for ProcessTreeGuard {
     fn drop(&mut self) {
         if self.child.is_some() {
             self.terminate_and_reap();
+        } else {
+            self.kill_jail_members();
         }
     }
 }
@@ -1669,6 +1694,13 @@ fn observe_jail_limits(
     if !watch.workdir_within_limits()? {
         return Ok(Some(GovernedExecutionTerminal::FileLimitExceeded));
     }
+    #[cfg(target_os = "macos")]
+    let usage = match watch.macos_members() {
+        Some(members) => jail_member_usage(pid, members),
+        None => owned_group_usage(pid),
+    }
+    .ok_or(())?;
+    #[cfg(not(target_os = "macos"))]
     let usage = owned_group_usage(pid).ok_or(())?;
     let limits = watch.limits();
     // Both counts allow the jail's own machinery: on Linux the launcher,
@@ -1806,6 +1838,16 @@ const MAX_PROC_ENTRIES: usize = 1 << 20;
 
 #[cfg(target_os = "macos")]
 fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
+    match owned_group_pids(pid)? {
+        Err(overflow) => Some(overflow),
+        Ok(members) => macos_usage_of(&members),
+    }
+}
+
+/// macOS: members of the owned process group, or (as `Err`) a breach
+/// sample when the group has more members than the fixed buffer holds.
+#[cfg(target_os = "macos")]
+fn owned_group_pids(pid: Option<u32>) -> Option<Result<Vec<libc::pid_t>, OwnedGroupUsage>> {
     const PROC_PGRP_ONLY: u32 = 2;
     const PID_BYTES: usize = std::mem::size_of::<libc::pid_t>();
     const GROWTH_HEADROOM: usize = 8;
@@ -1835,18 +1877,45 @@ fn owned_group_usage(pid: Option<u32>) -> Option<OwnedGroupUsage> {
     }
     let live = (usize::try_from(written).ok()? / PID_BYTES).min(members.len());
     if live >= members.len() {
-        return Some(OwnedGroupUsage {
+        return Some(Err(OwnedGroupUsage {
             processes: live as u64,
             tasks: live as u64,
             cpu_micros: 0,
             memory_bytes: 0,
-        });
+        }));
     }
+    members.truncate(live);
+    members.retain(|value| *value > 0);
+    Some(Ok(members))
+}
+
+/// macOS exec-roots jails: the owned group plus every process of the jail's
+/// sandbox that left it (`setsid`, `setpgid`), each counted once.
+#[cfg(target_os = "macos")]
+fn jail_member_usage(
+    pid: Option<u32>,
+    members: &crate::governed_process_jail::MacosJailMembers,
+) -> Option<OwnedGroupUsage> {
+    let mut pids = match owned_group_pids(pid) {
+        Some(Err(overflow)) => return Some(overflow),
+        Some(Ok(pids)) => pids,
+        None => Vec::new(),
+    };
+    pids.extend(members.pids()?);
+    pids.sort_unstable();
+    pids.dedup();
+    macos_usage_of(&pids)
+}
+
+/// macOS: processes, threads, CPU and footprint of `members`. A member
+/// that exited meanwhile is skipped; `None` when none could be sampled.
+#[cfg(target_os = "macos")]
+fn macos_usage_of(members: &[libc::pid_t]) -> Option<OwnedGroupUsage> {
     let mut processes = 0_u64;
     let mut tasks = 0_u64;
     let mut cpu_nanos = 0_u64;
     let mut memory_bytes = 0_u64;
-    for member in members[..live].iter().copied().filter(|value| *value > 0) {
+    for member in members.iter().copied().filter(|value| *value > 0) {
         let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
         // SAFETY: RUSAGE_INFO_V2 selects exactly this initialized output type.
         let rc = unsafe {
