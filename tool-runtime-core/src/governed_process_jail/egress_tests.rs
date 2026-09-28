@@ -545,7 +545,7 @@ mod macos {
 /// forwarder installed root-owned at one of
 /// `GOVERNED_JAIL_EGRESS_FORWARDER_PATHS`; they skip otherwise.
 #[cfg(target_os = "linux")]
-mod linux {
+pub(super) mod linux {
     use std::os::unix::net::UnixListener;
 
     use super::*;
@@ -575,14 +575,14 @@ mod linux {
         assert_eq!(run.stdout.trim(), "3");
     }
 
-    struct UnixBroker {
+    pub(in crate::governed_process_jail) struct UnixBroker {
         _directory: tempfile::TempDir,
         path: PathBuf,
         requests: Arc<Mutex<Vec<String>>>,
     }
 
     impl UnixBroker {
-        fn start() -> Self {
+        pub(in crate::governed_process_jail) fn start() -> Self {
             let directory = tempfile::tempdir().unwrap();
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let path = fs::canonicalize(directory.path())
@@ -606,7 +606,7 @@ mod linux {
         }
     }
 
-    fn brokered(broker: &UnixBroker) -> Option<GovernedProcessJail> {
+    pub(in crate::governed_process_jail) fn brokered(broker: &UnixBroker) -> Option<GovernedProcessJail> {
         match GovernedProcessJail::strict_app_with_brokered_egress(
             GovernedProcessJailLimits::default(),
             GovernedEgressBrokerEndpoint::UnixSocket {
@@ -672,6 +672,131 @@ mod linux {
         );
         assert_eq!(run.exit_code, Some(6), "stderr={}", run.stderr);
         assert_eq!(tripwire.hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The jailed command's own descriptor table, as `find` reads it: one
+    /// `(fd, readlink target)` pair per entry of `/proc/self/fd`.
+    fn descriptors_seen_by(run: &JailedRun) -> Vec<(u32, String)> {
+        assert_eq!(run.exit_code, Some(0), "stdout={} stderr={}", run.stdout, run.stderr);
+        eprintln!("jailed descriptors: {}", run.stdout.trim().replace('\n', "; "));
+        run.stdout
+            .lines()
+            .map(|line| {
+                let (fd, target) = line
+                    .split_once(' ')
+                    .unwrap_or_else(|| panic!("unexpected listing line: {line:?}"));
+                (fd.parse().unwrap(), target.to_owned())
+            })
+            .collect()
+    }
+
+    /// List `/proc/self/fd` from inside `jail` with `find`, which resolves
+    /// every link (`%l` is its `readlink`). `find` holds a few directory
+    /// descriptors of its own while it walks.
+    fn list_descriptors_in(jail: GovernedProcessJail) -> Vec<(u32, String)> {
+        let run = run_in_jail(
+            jail,
+            "find",
+            &["/proc/self/fd/", "-mindepth", "1", "-maxdepth", "1", "-printf", "%f %l\\n"],
+        );
+        descriptors_seen_by(&run)
+    }
+
+    /// Descriptors above 2 that this test process holds without
+    /// close-on-exec, by `readlink` target (`pipe:[inode]`, `socket:[inode]`,
+    /// a path). The runner does not close them, so the launcher and the
+    /// jailed command inherit them too: under GitHub Actions, the runner's
+    /// own channel is one. They exist before the run, whereas the exec-status
+    /// socket pair is created per run, close-on-exec, so its `socket:[inode]`
+    /// can never be among them.
+    pub(in crate::governed_process_jail) fn inherited_host_descriptors() -> BTreeSet<String> {
+        let mut inherited = BTreeSet::new();
+        for entry in fs::read_dir("/proc/self/fd").unwrap() {
+            let entry = entry.unwrap();
+            let Some(fd) = entry.file_name().to_str().and_then(|name| name.parse::<i32>().ok()) else {
+                continue;
+            };
+            // SAFETY: `F_GETFD` only queries a descriptor number; one closed
+            // meanwhile (this listing's own) fails with `EBADF`.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if fd <= 2 || flags < 0 || flags & libc::FD_CLOEXEC != 0 {
+                continue;
+            }
+            if let Ok(target) = fs::read_link(entry.path()) {
+                inherited.insert(target.to_string_lossy().into_owned());
+            }
+        }
+        eprintln!("host descriptors inherited across exec: {inherited:?}");
+        inherited
+    }
+
+    /// The exec-status channel is a Unix socket pair created for this run;
+    /// the program must never hold its write end. Stdio is `/dev/null` and
+    /// two pipes, never a socket. Above 2, a descriptor is either one this
+    /// test process already held across exec (`inherited`, by target, so by
+    /// socket or pipe inode) or, when `lister_directories` is set, a
+    /// directory the lister opened itself (a path). The channel's
+    /// `socket:[inode]` is neither: if the helper did not mark it
+    /// close-on-exec before exec, bubblewrap (whose launcher clears
+    /// close-on-exec on it) would pass it to the program and this fails.
+    pub(in crate::governed_process_jail) fn assert_no_status_channel(
+        entries: &[(u32, String)],
+        inherited: &BTreeSet<String>,
+        lister_directories: bool,
+    ) {
+        for fd in 0..=2 {
+            let target = entries
+                .iter()
+                .find(|(seen, _)| *seen == fd)
+                .map(|(_, target)| target)
+                .unwrap_or_else(|| panic!("the listing must show fd {fd}: {entries:?}"));
+            assert!(!target.starts_with("socket:"), "stdio fd {fd} is a socket: {entries:?}");
+        }
+        for (fd, target) in entries.iter().filter(|(fd, _)| *fd > 2) {
+            assert!(
+                inherited.contains(target) || (lister_directories && target.starts_with('/')),
+                "fd {fd} ({target}) is neither the lister's own nor held by the host \
+                 before the run ({inherited:?}): {entries:?}"
+            );
+        }
+    }
+
+    /// Strict mode: the helper execs the command directly, and the status
+    /// channel's write end is not among the command's descriptors.
+    #[test]
+    fn the_status_channel_is_absent_inside_the_strict_jail() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let jail = match GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) {
+            Ok(jail) => jail,
+            Err(error) => {
+                skip(&format!("no Linux strict jail on this host: {error}"));
+                return;
+            },
+        };
+        let inherited = inherited_host_descriptors();
+        assert_no_status_channel(&list_descriptors_in(jail), &inherited, true);
+    }
+
+    /// Brokered mode: the helper execs the forwarder, which spawns the
+    /// command. The forwarder's own sockets (its listener, its relays) are
+    /// close-on-exec and the channel was closed when the helper exec'd, so
+    /// the command inherits stdio (and whatever the host process itself
+    /// passes across exec) alone: it reaches the broker through the proxy
+    /// environment, not through any descriptor.
+    #[test]
+    fn the_status_channel_is_absent_from_the_brokered_child() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let broker = UnixBroker::start();
+        let Some(jail) = brokered(&broker) else {
+            return;
+        };
+        let inherited = inherited_host_descriptors();
+        assert_no_status_channel(&list_descriptors_in(jail), &inherited, true);
+        assert!(broker.requests.lock().unwrap().is_empty());
     }
 
     #[test]
