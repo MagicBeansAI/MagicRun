@@ -621,33 +621,64 @@ mod macos {
     /// macOS jails launch `sandbox-exec` through the forked runner, not the
     /// `POSIX_SPAWN_CLOEXEC_DEFAULT` path of unjailed commands, so a pipe the
     /// host held without close-on-exec reached the jailed command before
-    /// `0.1.79`. The script probes descriptor numbers with `fstat` (the
-    /// profile denies listing `/dev/fd`) and writes to none of them.
+    /// `0.1.79`. The soft `RLIMIT_NOFILE` is raised as high as allowed first
+    /// (the scan fallback is bounded by `kern.maxfilesperproc`, not by it),
+    /// and one stray descriptor sits far above the usual range. The script
+    /// probes descriptor numbers with `fstat` (the profile denies listing
+    /// `/dev/fd`) and writes to none of them.
     #[test]
     fn a_stray_host_pipe_is_absent_inside_the_macos_jail() {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+        use crate::governed_process_jail::inherited_descriptors::FILE_LIMIT_TEST_LOCK;
+
         let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _limit = FILE_LIMIT_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         let Some(jail) = host_interpreter().and_then(strict_jail) else {
             return;
         };
+        let mut previous = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes only the live `previous`.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut previous) }, 0);
+        let raised = [libc::RLIM_INFINITY, previous.rlim_max, 1 << 20, 184_320, 10_240]
+            .into_iter()
+            .filter(|soft| *soft <= previous.rlim_max && *soft > previous.rlim_cur)
+            .find(|soft| {
+                let limit = libc::rlimit {
+                    rlim_cur: *soft,
+                    rlim_max: previous.rlim_max,
+                };
+                // SAFETY: `setrlimit` reads only the live `limit`.
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 }
+            });
+        eprintln!("soft RLIMIT_NOFILE {} raised to {raised:?}", previous.rlim_cur);
         let mut fds = [0; 2];
         // SAFETY: `pipe` writes two fresh descriptors into the live array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            // SAFETY: flag change on a fresh descriptor this test owns (no
+            // `pipe2` on macOS: set at once).
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+        }
         // SAFETY: both descriptors are fresh and owned by nothing else.
         let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        // SAFETY: duplicates a live descriptor, close-on-exec, at >= 200.
-        let stray = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
-        assert!(stray >= 200);
-        drop(write);
-        // SAFETY: `stray` is fresh and owned by nothing else.
-        let stray = unsafe { OwnedFd::from_raw_fd(stray) };
-        // SAFETY: flag change on a descriptor this test owns: from here on
-        // the host process holds it without close-on-exec.
-        assert_eq!(unsafe { libc::fcntl(stray.as_raw_fd(), libc::F_SETFD, 0) }, 0);
-        let script = Script::new(
+        let high = |minimum: i32| {
+            // SAFETY: duplicates a live descriptor, close-on-exec, at >= minimum.
+            let fd = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, minimum) };
+            assert!(fd >= minimum, "{}", std::io::Error::last_os_error());
+            // SAFETY: `fd` is fresh and owned by nothing else.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        };
+        let strays = [high(200), high(5000)];
+        let numbers = strays.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
+        let script = Script::new(&format!(
             "import json, os\n\
              def is_open(fd):\n\
              \x20   try:\n\
@@ -655,12 +686,35 @@ mod macos {
              \x20       return True\n\
              \x20   except OSError:\n\
              \x20       return False\n\
-             print(json.dumps([fd for fd in range(1024) if is_open(fd)]))\n",
+             print(json.dumps([fd for fd in list(range(1024)) + {numbers:?} if is_open(fd)]))\n"
+        ));
+        // Inheritable only for the run: the host process holds both strays
+        // without close-on-exec from here until the run returns.
+        for fd in &numbers {
+            // SAFETY: flag change on a descriptor this test owns.
+            assert_eq!(unsafe { libc::fcntl(*fd, libc::F_SETFD, 0) }, 0);
+        }
+        let started = std::time::Instant::now();
+        let run = script.run(jail, &[]);
+        let elapsed = started.elapsed();
+        drop(strays);
+        drop((read, write));
+        // SAFETY: `setrlimit` reads only the live `previous`.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &previous) }, 0);
+        eprintln!("jailed run with a raised descriptor limit took {elapsed:?}");
+        let output = json(&run);
+        let open = output
+            .as_array()
+            .unwrap_or_else(|| panic!("{output}"))
+            .iter()
+            .map(|fd| fd.as_i64().unwrap())
+            .collect::<Vec<_>>();
+        let extra = open.iter().filter(|fd| **fd > 2).collect::<Vec<_>>();
+        assert_eq!(
+            open,
+            [0, 1, 2],
+            "the script must hold stdio alone; extra descriptors {extra:?} (strays {numbers:?})"
         );
-        let output = json(&script.run(jail, &[]));
-        drop(stray);
-        drop(read);
-        assert_eq!(output, serde_json::json!([0, 1, 2]), "the script must hold stdio alone");
     }
 
     /// A reviewed Python script prints JSON in the strict jail. The expected

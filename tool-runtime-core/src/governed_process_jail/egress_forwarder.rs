@@ -330,7 +330,10 @@ mod unix {
         // but the status channel close-on-exec before bubblewrap; whatever
         // still reached this process, the program holds none of it. Nothing
         // is kept: the status channel is marked too, just below.
-        if super::super::inherited_descriptors::mark_inherited_descriptors_cloexec(&[]).is_err() {
+        if super::super::inherited_descriptors::InheritedDescriptors::prepare()
+            .mark_cloexec(&[])
+            .is_err()
+        {
             return refuse();
         }
         // The program must never hold the status channel.
@@ -383,13 +386,12 @@ mod unix {
         // Defence in depth: the child inherits stdio alone. The forwarder's
         // own sockets are already close-on-exec; anything else this process
         // inherited is made so in the child before exec.
+        let descriptors = super::super::inherited_descriptors::InheritedDescriptors::prepare();
         // SAFETY: the marking is async-signal-safe (raw system calls on a
         // stack buffer) and only touches the post-fork, pre-exec child.
         unsafe {
             use std::os::unix::process::CommandExt;
-            command.pre_exec(|| {
-                super::super::inherited_descriptors::mark_inherited_descriptors_cloexec(&[])
-            });
+            command.pre_exec(move || descriptors.mark_cloexec(&[]));
         }
         let mut child = command.spawn().map_err(|_| FORWARDER_EXIT_SPAWN)?;
         let mut connections: Vec<Connection> = Vec::new();

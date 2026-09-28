@@ -588,7 +588,9 @@ fn execute_spawned(
         command.process_group(0);
         let directory_fd = cwd.as_ref().map(|cwd| cwd.raw_fd());
         let jail_limits = process.jail.as_ref().map(GovernedProcessJail::limits);
-        let jailed = process.jail.is_some();
+        // Read before `fork`: the child marks without allocating or sysctl.
+        let inherited_descriptors =
+            crate::governed_process_jail::inherited_descriptors::InheritedDescriptors::prepare();
         #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
         let child_launch_probe = launch_probe.clone(); // parent-only Arc clone
                                                        // SAFETY: `setrlimit`, `fchdir` and the descriptor marking
@@ -602,17 +604,14 @@ fn execute_spawned(
                 if let Some(probe) = child_launch_probe.as_ref() {
                     probe.entered();
                 }
-                // A jail launcher passes every descriptor it inherits on to
-                // the jailed command. Only the status channel's helper end
-                // (Linux) is meant to cross; every other descriptor from 3 up
-                // becomes close-on-exec here. This runs before the jail's
-                // `RLIMIT_NOFILE` is applied, so the fallback scan still
-                // covers descriptors above the jail's own limit.
-                if jailed {
-                    crate::governed_process_jail::inherited_descriptors::mark_inherited_descriptors_cloexec(
-                        status_fd.as_slice(),
-                    )?;
-                }
+                // The child (a jail launcher, which passes on everything it
+                // inherits, or an unjailed command) receives stdio and, for a
+                // Linux jail, the status channel's helper end: every other
+                // descriptor from 3 up becomes close-on-exec here, as
+                // `POSIX_SPAWN_CLOEXEC_DEFAULT` does for unjailed macOS
+                // launches. This runs before the jail's `RLIMIT_NOFILE` is
+                // applied.
+                inherited_descriptors.mark_cloexec(status_fd.as_slice())?;
                 // This branch is reached with `Some` only under
                 // `KernelAddressSpace`, where the target is known to accept a
                 // finite `RLIMIT_AS`. It therefore stays exactly as written: a
@@ -2432,6 +2431,49 @@ mod tests {
         assert!(text.ends_with("stdin-value"));
         assert!(stderr.is_empty());
         assert!(!fixture.workspace.join("should-not-exist").exists());
+    }
+
+    /// Linux unjailed launches mark every host descriptor above stdio
+    /// close-on-exec too (parity with macOS `POSIX_SPAWN_CLOEXEC_DEFAULT`):
+    /// a pipe this process holds without close-on-exec, only for the run and
+    /// never written to, does not reach the governed child.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unjailed_linux_child_inherits_no_stray_host_descriptor() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        let _budget = TEST_PROCESS_BUDGET.lock().unwrap();
+        let fixture = Fixture::new(b"#!/bin/sh\nexec /bin/ls /proc/self/fd/\n");
+        let mut fds = [0; 2];
+        // SAFETY: `pipe2` writes two fresh close-on-exec descriptors.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: both descriptors are fresh and owned by nothing else.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        // SAFETY: duplicates a live descriptor, close-on-exec, at >= 200.
+        let stray = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+        assert!(stray >= 200);
+        // SAFETY: `stray` is fresh and owned by nothing else.
+        let stray = unsafe { OwnedFd::from_raw_fd(stray) };
+        let number = stray.as_raw_fd();
+        let process = fixture.process(vec![], None, 5, 64 * 1024, 64 * 1024);
+        // SAFETY: flag change on a descriptor this test owns; inheritable
+        // from here until the run returns.
+        assert_eq!(unsafe { libc::fcntl(number, libc::F_SETFD, 0) }, 0);
+        let result = GovernedBatchExecutor::execute(process, &GovernedBatchCancellation::new());
+        drop((stray, read, write));
+        let result = result.unwrap();
+        assert_eq!(
+            result.terminal().terminal(),
+            GovernedExecutionTerminal::Success
+        );
+        let listing = String::from_utf8_lossy(result.stdout.as_slice()).into_owned();
+        eprintln!("unjailed child's descriptors: {}", listing.split_whitespace().collect::<Vec<_>>().join(" "));
+        let seen = listing
+            .split_whitespace()
+            .map(|name| name.parse::<i32>().unwrap())
+            .collect::<Vec<_>>();
+        assert!(seen.contains(&0) && seen.contains(&1) && seen.contains(&2), "{seen:?}");
+        assert!(!seen.contains(&number), "stray fd {number} reached the child: {seen:?}");
     }
 
     #[test]

@@ -278,35 +278,50 @@ macOS (jail launches fork; only unjailed macOS launches use
 `POSIX_SPAWN_CLOEXEC_DEFAULT`). Before `0.1.79` any such descriptor of the
 host process reached the jailed command, which could read or write it.
 
-- **Launcher.** The batch runner's pre-exec step of every jail launch marks
-  every descriptor from 3 up close-on-exec, before the jail's
-  `RLIMIT_NOFILE` applies, then clears the flag on exactly the descriptors
-  the jail passes on. On Linux that is one: the exec-status channel's helper
-  end (the only descriptor named in the bubblewrap argv; no `--sync-fd`,
-  `--info-fd`, `--block-fd`, `--seccomp`, `--file` or `--bind-data`; the
-  broker socket and the trust bundle are path binds). On macOS it is none.
-  Failing to keep a passed descriptor fails the launch.
-- **Method** (async-signal-safe: raw system calls and a stack buffer, no
-  allocation). Linux: `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)` (5.11+); on
-  any failure (`ENOSYS`, `EINVAL`, a seccomp `EPERM`) the entries of
-  `/proc/self/fd`, read with `getdents64`; without `/proc`, and always on
-  macOS, `fcntl(F_SETFD, FD_CLOEXEC)` on every number below the soft
-  `RLIMIT_NOFILE`, capped at 2^20 (Linux `fs.nr_open` default). The scan
-  misses only a descriptor above a limit lowered after it was opened, or
-  above the cap. Flags are only set, so the child's own exec-error pipe and
-  working-directory handle stay usable until exec.
+- **Launcher.** The batch runner's pre-exec step of every forked launch
+  (every jail launch, and Linux unjailed launches for parity with macOS
+  `POSIX_SPAWN_CLOEXEC_DEFAULT`) marks every descriptor from 3 up
+  close-on-exec, before a jail's `RLIMIT_NOFILE` applies, then clears the
+  flag on exactly the descriptors the launch passes on. For a Linux jail that
+  is one: the exec-status channel's helper end (the only descriptor named in
+  the bubblewrap argv; no `--sync-fd`, `--info-fd`, `--block-fd`,
+  `--seccomp`, `--file` or `--bind-data`; the broker socket and the trust
+  bundle are path binds). Otherwise it is none. Failing to keep a passed
+  descriptor fails the launch. Nothing in this crate hands a descriptor to
+  an unjailed child on purpose.
+- **Method.** The scan bound is read in the parent before `fork`; the
+  child's step is async-signal-safe (raw system calls and a stack buffer, no
+  allocation).
+  - *Linux:* `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)` (5.11+); on any error
+    return (`ENOSYS`, `EINVAL`, a seccomp `EPERM`) the entries of
+    `/proc/self/fd`, read with `getdents64` (a malformed record makes the
+    listing incomplete); without `/proc`, `fcntl(F_SETFD, FD_CLOEXEC)` on
+    every number below the soft `RLIMIT_NOFILE`, capped at 2^20 (the
+    `fs.nr_open` default), which misses only a descriptor above a limit
+    lowered after it was opened, or above the cap. A seccomp filter that
+    kills the process on `close_range` (rather than returning an errno)
+    makes the launch fail with `SIGSYS` instead of falling back.
+  - *macOS:* the exact list from `proc_pidinfo(PROC_PIDLISTFDS)` into a
+    4096-entry stack buffer; if the call fails or the buffer fills, every
+    number below `kern.maxfilesperproc`, above which `F_DUPFD` fails and no
+    descriptor can exist. The soft `RLIMIT_NOFILE` is not a usable bound
+    there: it can exceed `kern.maxfilesperproc` many times over (a scan to
+    it cost about 100 ms per launch) or be lowered below an open descriptor.
+  - Flags are only set, so the child's own exec-error pipe and
+    working-directory handle stay usable until exec.
 - **Defence in depth (Linux).** The exec shim marks every descriptor from 3
   up close-on-exec before it execs (the status channel too, as before), and
   the forwarder does the same in its child before the command's exec. The
   command starts with stdio alone.
-- **Not jail paths.** The Linux unjailed batch runner still passes the host's
-  descriptors without close-on-exec, as before; the PTY path closes every
-  descriptor above 2 in `portable-pty`'s pre-exec step.
+- **PTY.** Unchanged: `portable-pty`'s pre-exec step closes every
+  descriptor above 2.
 - **Tests.** The Linux real-jail tests require that the command, in every
   mode, hold stdio alone (apart from a lister's own directories), and that a
   pipe the test process holds without close-on-exec is absent in strict,
-  brokered and interpreter jails; a macOS interpreter test probes the same.
-  Each marking method has a fork-and-exec unit test.
+  brokered and interpreter jails and from an unjailed Linux child; a macOS
+  interpreter test probes the same with the soft limit raised as high as
+  allowed. Each marking method has a fork-and-exec unit test, including a
+  descriptor above a soft limit lowered after it was opened.
 
 ## Staged input files (`0.1.78`)
 

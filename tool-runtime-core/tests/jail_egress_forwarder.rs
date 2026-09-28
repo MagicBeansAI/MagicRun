@@ -498,21 +498,10 @@ fn exec_shim_with(
     program: &[&str],
     stray: Option<i32>,
 ) -> (Output, Vec<u8>, i32) {
-    use std::os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::process::CommandExt,
-    };
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
 
-    let mut fds = [0; 2];
-    // SAFETY: `pipe` writes two fresh descriptors into the live array.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: both descriptors are fresh and owned by nothing else.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    for fd in fds {
-        // SAFETY: flags on descriptors this test owns.
-        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    }
-    // SAFETY: as above.
+    let (read, write) = cloexec_pipe();
+    // SAFETY: flags on a descriptor this test owns.
     unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
     let status_fd = write.as_raw_fd();
     let mut command = Command::new(FORWARDER);
@@ -561,23 +550,38 @@ fn the_exec_shim_without_a_ceiling_only_execs() {
     assert_eq!(status, [DISPATCHING]);
 }
 
-/// A fresh close-on-exec pipe whose write end sits at 200 or above, so no
+/// A fresh pipe, both ends close-on-exec from creation (`pipe2` on Linux;
+/// macOS has none, so the flag is set at once).
+fn cloexec_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let mut fds = [0; 2];
+    #[cfg(target_os = "linux")]
+    // SAFETY: `pipe2` writes two fresh descriptors into the live array.
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: `pipe` writes two fresh descriptors into the live array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            // SAFETY: flag change on a descriptor this test owns.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+        }
+    }
+    // SAFETY: both descriptors are fresh and owned by nothing else.
+    unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+}
+
+/// A close-on-exec pipe whose write end sits at 200 or above, so no
 /// descriptor a listed program opens itself can take its number. Tests make
 /// it inheritable only inside the process they spawn, and never write to it.
 fn stray_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    let mut fds = [0; 2];
-    // SAFETY: `pipe` writes two fresh descriptors into the live array.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: both descriptors are fresh and owned by nothing else.
-    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let (read, write) = cloexec_pipe();
     // SAFETY: duplicates a live descriptor, close-on-exec, at >= 200.
     let high = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
     assert!(high >= 200);
-    drop(write);
-    // SAFETY: flags on the read end this test owns.
-    unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
     // SAFETY: `high` is fresh and owned by nothing else.
     (read, unsafe { OwnedFd::from_raw_fd(high) })
 }

@@ -730,9 +730,13 @@ pub(super) mod linux {
 
     /// A pipe this test process holds with close-on-exec deliberately
     /// cleared on its write end, as a stray host descriptor would be, until
-    /// dropped. Nothing is ever written to it. Hold `JAIL_PROCESS_BUDGET`
-    /// while it exists: every child this process spawns meanwhile inherits
-    /// it, jailed or not, unless the launch marks it close-on-exec.
+    /// dropped. Both ends are created close-on-exec (`pipe2(O_CLOEXEC)`);
+    /// only the write end is then made inheritable. That end is inheritable
+    /// process-wide for as long as the value lives: any child this test
+    /// process spawns meanwhile, from any thread, would inherit it unless its
+    /// launch marks it close-on-exec. So open it right before the run, drop
+    /// it right after, and hold `JAIL_PROCESS_BUDGET` meanwhile. No test ever
+    /// writes to it (or to any descriptor it did not create).
     pub(in crate::governed_process_jail) struct StrayHostPipe {
         _read: std::os::fd::OwnedFd,
         write: std::os::fd::OwnedFd,
