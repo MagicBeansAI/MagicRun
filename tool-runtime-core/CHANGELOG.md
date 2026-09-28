@@ -8,15 +8,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.78`._
+_Current development version: `0.1.79`._
 
-### Exec-status channel regression tests (test-only)
+### Security: host descriptors leaked into every jail (`0.1.79`)
 
-- Real-jail Linux tests assert that the exec-status channel's write end is
-  never among the jailed command's descriptors, in strict, interpreter and
-  brokered mode (the brokered child is spawned by the forwarder), and that
-  a brokered command forging a helper refusal is recorded as its own
-  non-zero exit. No runtime or API change.
+- **Fixed:** every descriptor the host process held without close-on-exec
+  reached the jailed command. Linux: bubblewrap, the in-jail helper and, in
+  brokered mode, the forwarder passed them through, so a jailed command could
+  read or write them (under GitHub Actions: the runner's own channel pipes).
+  macOS was affected too: jail launches fork and exec `sandbox-exec` (only
+  unjailed commands use `POSIX_SPAWN_CLOEXEC_DEFAULT`). Upgrade if the host
+  process can hold such a descriptor.
+- The batch runner's pre-exec step of every jail launch now marks every
+  descriptor from 3 up close-on-exec, before the jail's `RLIMIT_NOFILE`
+  applies, then clears the flag on the one descriptor deliberately passed:
+  on Linux the exec-status channel's helper end (bubblewrap is given no other
+  descriptor; the broker socket is a path bind). It is async-signal-safe:
+  Linux `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)`; if that fails, the
+  entries of `/proc/self/fd` read with `getdents64` into a stack buffer;
+  otherwise (and always on macOS) every number below the soft
+  `RLIMIT_NOFILE`, capped at 2^20. A failure to keep the passed descriptor
+  fails the launch.
+- Defence in depth on Linux: the in-jail exec shim marks every descriptor
+  from 3 up close-on-exec before it execs, and the forwarder does the same in
+  its child before the command's exec. The command starts with stdio alone.
+- Unjailed launches are unchanged: macOS already spawns them with
+  `POSIX_SPAWN_CLOEXEC_DEFAULT`; the Linux unjailed batch path still passes
+  host descriptors without close-on-exec (not a jail boundary); the PTY path
+  closes every descriptor above 2 in `portable-pty`'s pre-exec step.
+- No argv, profile or audit change: every golden and profile identity is
+  unchanged from `0.1.78`.
+- Tests: the Linux real-jail descriptor tests (strict, brokered, interpreter,
+  brokered forged refusal) now require that the command hold stdio alone,
+  apart from the lister's own directories; the allowance for host-inherited
+  descriptors is gone, and none of them may appear. New:
+  `a_stray_host_pipe_is_absent_inside_strict_and_brokered_jails` and the
+  strict interpreter test create a pipe without close-on-exec in the test
+  process and assert its `pipe:[inode]` is absent in the jail;
+  `a_stray_host_pipe_is_absent_inside_the_macos_jail`; unit tests of each
+  marking method through a real fork and exec; and shim and forwarder
+  tests with a stray descriptor. These extend the exec-status channel
+  regression tests of PR #4 (test-only), which assert that the channel's
+  write end is never among the jailed command's descriptors in any mode and
+  that a brokered command forging a helper refusal is recorded as its own
+  non-zero exit.
 
 ### Staged input files (`0.1.78`)
 

@@ -48,6 +48,12 @@
 //! run, conservatively, as dispatched. It never forks and never writes to
 //! stdio.
 //!
+//! Descriptors: the runner marks every host descriptor except the status
+//! channel close-on-exec before it execs bubblewrap. As defence in depth the
+//! shim marks every descriptor from 3 up close-on-exec before it execs, and
+//! the forwarder does the same in its child before the command's exec, so
+//! the command starts with stdio alone.
+//!
 //! bubblewrap's in-jail init (pid 1, outside `--as-pid-1`) closes the
 //! inherited descriptors it does not need, but still holds this one briefly
 //! after it forks the shim, and in an unprivileged user namespace it is the
@@ -320,6 +326,13 @@ mod unix {
                 return refuse();
             }
         }
+        // Defence in depth: the runner already made every host descriptor
+        // but the status channel close-on-exec before bubblewrap; whatever
+        // still reached this process, the program holds none of it. Nothing
+        // is kept: the status channel is marked too, just below.
+        if super::super::inherited_descriptors::mark_inherited_descriptors_cloexec(&[]).is_err() {
+            return refuse();
+        }
         // The program must never hold the status channel.
         // SAFETY: `F_SETFD` on the inherited descriptor checked above.
         if unsafe { libc::fcntl(status, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
@@ -366,6 +379,17 @@ mod unix {
                     Ok(())
                 });
             }
+        }
+        // Defence in depth: the child inherits stdio alone. The forwarder's
+        // own sockets are already close-on-exec; anything else this process
+        // inherited is made so in the child before exec.
+        // SAFETY: the marking is async-signal-safe (raw system calls on a
+        // stack buffer) and only touches the post-fork, pre-exec child.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                super::super::inherited_descriptors::mark_inherited_descriptors_cloexec(&[])
+            });
         }
         let mut child = command.spawn().map_err(|_| FORWARDER_EXIT_SPAWN)?;
         let mut connections: Vec<Connection> = Vec::new();

@@ -131,6 +131,8 @@ const MAX_GOVERNED_JAIL_INTERPRETER_TREE_ENTRIES: usize = 200_000;
 pub mod egress_forwarder;
 #[cfg(test)]
 pub(crate) mod egress_tests;
+#[cfg(unix)]
+pub(crate) mod inherited_descriptors;
 #[cfg(all(test, unix))]
 mod interpreter_tests;
 

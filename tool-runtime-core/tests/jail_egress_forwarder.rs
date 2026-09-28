@@ -486,6 +486,18 @@ fn the_minimum_descriptor_budget_serves_concurrent_clients_in_turn() {
 /// the write end; the parent closes its copy after spawn and reads the pipe
 /// after exit.
 fn exec_shim(tasks: &str, namespace: &str, program: &[&str]) -> (Output, Vec<u8>, i32) {
+    exec_shim_with(tasks, namespace, program, None)
+}
+
+/// [`exec_shim`], where the shim also inherits `stray` (a descriptor made
+/// inheritable in the shim's process only), as a host descriptor that
+/// reached the jail would be.
+fn exec_shim_with(
+    tasks: &str,
+    namespace: &str,
+    program: &[&str],
+    stray: Option<i32>,
+) -> (Output, Vec<u8>, i32) {
     use std::os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::process::CommandExt,
@@ -514,8 +526,10 @@ fn exec_shim(tasks: &str, namespace: &str, program: &[&str]) -> (Output, Vec<u8>
     // SAFETY: `fcntl` is async-signal-safe and touches only the child's copy.
     unsafe {
         command.pre_exec(move || {
-            if libc::fcntl(status_fd, libc::F_SETFD, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
+            for fd in std::iter::once(status_fd).chain(stray) {
+                if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
             Ok(())
         });
@@ -545,6 +559,96 @@ fn the_exec_shim_without_a_ceiling_only_execs() {
     let open = String::from_utf8_lossy(&output.stdout);
     assert!(!open.split_whitespace().any(|entry| entry == fd.to_string()), "fd {fd} leaked: {open}");
     assert_eq!(status, [DISPATCHING]);
+}
+
+/// A fresh close-on-exec pipe whose write end sits at 200 or above, so no
+/// descriptor a listed program opens itself can take its number. Tests make
+/// it inheritable only inside the process they spawn, and never write to it.
+fn stray_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` writes two fresh descriptors into the live array.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: both descriptors are fresh and owned by nothing else.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // SAFETY: duplicates a live descriptor, close-on-exec, at >= 200.
+    let high = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+    assert!(high >= 200);
+    drop(write);
+    // SAFETY: flags on the read end this test owns.
+    unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    // SAFETY: `high` is fresh and owned by nothing else.
+    (read, unsafe { OwnedFd::from_raw_fd(high) })
+}
+
+fn listed_descriptors(listing: &str) -> Vec<i32> {
+    listing
+        .split_whitespace()
+        .map(|name| name.parse().unwrap_or_else(|_| panic!("unexpected entry {name:?} in {listing:?}")))
+        .collect()
+}
+
+/// Defence in depth: a descriptor the shim inherited without close-on-exec
+/// (one that got past the runner's marking) does not reach the program. The
+/// same inheritance without the shim is the positive control.
+#[test]
+fn the_exec_shim_passes_no_stray_descriptor_to_the_program() {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+    let (_read, write) = stray_pipe();
+    let stray = write.as_raw_fd();
+    let mut control = Command::new("/bin/ls");
+    control.arg("/dev/fd/");
+    // SAFETY: `fcntl` on the child's own copy only.
+    unsafe {
+        control.pre_exec(move || {
+            if libc::fcntl(stray, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let control = control.output().unwrap();
+    assert!(listed_descriptors(&String::from_utf8_lossy(&control.stdout)).contains(&stray));
+    let (output, status, _) = exec_shim_with("-", "-", &["/bin/ls", "/dev/fd/"], Some(stray));
+    assert_eq!(output.status.code(), Some(0), "stderr={}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(status, [DISPATCHING]);
+    let seen = listed_descriptors(&String::from_utf8_lossy(&output.stdout));
+    assert!(!seen.contains(&stray), "stray fd {stray} reached the program: {seen:?}");
+}
+
+/// Defence in depth: a descriptor the forwarder inherited without
+/// close-on-exec does not reach the child it spawns.
+#[test]
+fn the_forwarder_passes_no_stray_descriptor_to_its_child() {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+    let (_read, write) = stray_pipe();
+    let stray = write.as_raw_fd();
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("unused.sock");
+    // The forwarder appends its port as `$1`, which the listing ignores.
+    let (code, _, listing) = run_forwarder_with(
+        &socket,
+        &["/bin/sh", "-c", "ls /dev/fd/", "sh"],
+        20,
+        |command| {
+            // SAFETY: `fcntl` on the forwarder's own copy only.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(stray, libc::F_SETFD, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        },
+    )
+    .expect("the forwarder exits");
+    assert_eq!(code, 0, "{listing}");
+    let seen = listed_descriptors(&listing);
+    assert!(!seen.contains(&stray), "stray fd {stray} reached the child: {seen:?}");
 }
 
 const DISPATCHING: u8 =

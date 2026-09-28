@@ -588,9 +588,12 @@ fn execute_spawned(
         command.process_group(0);
         let directory_fd = cwd.as_ref().map(|cwd| cwd.raw_fd());
         let jail_limits = process.jail.as_ref().map(GovernedProcessJail::limits);
+        let jailed = process.jail.is_some();
         #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
         let child_launch_probe = launch_probe.clone(); // parent-only Arc clone
-                                                       // SAFETY: `setrlimit` and `fchdir` are async-signal-safe. The optional
+                                                       // SAFETY: `setrlimit`, `fchdir` and the descriptor marking
+                                                       // (`close_range`/`getdents64`/`fcntl` on a stack buffer) are
+                                                       // async-signal-safe. The optional
                                                        // descriptor belongs to the identity-checked handle retained across
                                                        // `spawn` and is used only in the post-fork, pre-exec child.
         unsafe {
@@ -598,6 +601,17 @@ fn execute_spawned(
                 #[cfg(all(target_os = "macos", magicrun_test_diagnostics))]
                 if let Some(probe) = child_launch_probe.as_ref() {
                     probe.entered();
+                }
+                // A jail launcher passes every descriptor it inherits on to
+                // the jailed command. Only the status channel's helper end
+                // (Linux) is meant to cross; every other descriptor from 3 up
+                // becomes close-on-exec here. This runs before the jail's
+                // `RLIMIT_NOFILE` is applied, so the fallback scan still
+                // covers descriptors above the jail's own limit.
+                if jailed {
+                    crate::governed_process_jail::inherited_descriptors::mark_inherited_descriptors_cloexec(
+                        status_fd.as_slice(),
+                    )?;
                 }
                 // This branch is reached with `Some` only under
                 // `KernelAddressSpace`, where the target is known to accept a
@@ -616,14 +630,6 @@ fn execute_spawned(
                 }
                 if let Some(limits) = jail_limits {
                     apply_jail_rlimits(limits)?;
-                }
-                // Only this child (bubblewrap) inherits the status channel's
-                // helper end; everywhere else it stays close-on-exec.
-                #[cfg(target_os = "linux")]
-                if let Some(fd) = status_fd {
-                    if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
                 }
                 if let Some(directory_fd) = directory_fd {
                     if libc::fchdir(directory_fd) == 0 {
