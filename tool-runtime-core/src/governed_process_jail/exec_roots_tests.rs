@@ -924,10 +924,30 @@ fn node_install() -> Option<NodeInstall> {
                 environment: vec![("OPENSSL_CONF", "/dev/null")],
             }
         },
-        None => NodeInstall {
-            root: GovernedJailExecRoot::new(&bin),
-            bin,
-            environment: Vec::new(),
+        None => {
+            // The binary's own directory, or (when that directory fails the
+            // trust checks, as a group-writable `/usr/local/bin` does) the
+            // install prefix above it.
+            let candidates = [bin.clone(), bin.parent()?.to_path_buf()];
+            let root = candidates.iter().find(|candidate| {
+                let accepted = GovernedJailExecRoots::new([GovernedJailExecRoot::new(candidate)], []);
+                if let Err(error) = &accepted {
+                    use std::os::unix::fs::MetadataExt;
+                    let metadata = fs::metadata(candidate).ok();
+                    eprintln!(
+                        "node root candidate {} refused ({error}): uid {:?} mode {:o}",
+                        candidate.display(),
+                        metadata.as_ref().map(MetadataExt::uid),
+                        metadata.as_ref().map_or(0, MetadataExt::mode),
+                    );
+                }
+                accepted.is_ok()
+            })?;
+            NodeInstall {
+                root: GovernedJailExecRoot::new(root),
+                bin,
+                environment: Vec::new(),
+            }
         },
     })
 }
