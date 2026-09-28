@@ -618,6 +618,105 @@ mod macos {
         assert_eq!(again.version(), interpreter.version());
     }
 
+    /// macOS jails launch `sandbox-exec` through the forked runner, not the
+    /// `POSIX_SPAWN_CLOEXEC_DEFAULT` path of unjailed commands, so a pipe the
+    /// host held without close-on-exec reached the jailed command before
+    /// `0.1.79`. The soft `RLIMIT_NOFILE` is raised as high as allowed first
+    /// (the scan fallback is bounded by `kern.maxfilesperproc`, not by it),
+    /// and one stray descriptor sits far above the usual range. The script
+    /// probes descriptor numbers with `fstat` (the profile denies listing
+    /// `/dev/fd`) and writes to none of them.
+    #[test]
+    fn a_stray_host_pipe_is_absent_inside_the_macos_jail() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        use crate::governed_process_jail::inherited_descriptors::FILE_LIMIT_TEST_LOCK;
+
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let _limit = FILE_LIMIT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(jail) = host_interpreter().and_then(strict_jail) else {
+            return;
+        };
+        let mut previous = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` writes only the live `previous`.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut previous) }, 0);
+        let raised = [libc::RLIM_INFINITY, previous.rlim_max, 1 << 20, 184_320, 10_240]
+            .into_iter()
+            .filter(|soft| *soft <= previous.rlim_max && *soft > previous.rlim_cur)
+            .find(|soft| {
+                let limit = libc::rlimit {
+                    rlim_cur: *soft,
+                    rlim_max: previous.rlim_max,
+                };
+                // SAFETY: `setrlimit` reads only the live `limit`.
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == 0 }
+            });
+        eprintln!("soft RLIMIT_NOFILE {} raised to {raised:?}", previous.rlim_cur);
+        let mut fds = [0; 2];
+        // SAFETY: `pipe` writes two fresh descriptors into the live array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            // SAFETY: flag change on a fresh descriptor this test owns (no
+            // `pipe2` on macOS: set at once).
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+        }
+        // SAFETY: both descriptors are fresh and owned by nothing else.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let high = |minimum: i32| {
+            // SAFETY: duplicates a live descriptor, close-on-exec, at >= minimum.
+            let fd = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_DUPFD_CLOEXEC, minimum) };
+            assert!(fd >= minimum, "{}", std::io::Error::last_os_error());
+            // SAFETY: `fd` is fresh and owned by nothing else.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        };
+        let strays = [high(200), high(5000)];
+        let numbers = strays.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
+        let script = Script::new(&format!(
+            "import json, os\n\
+             def is_open(fd):\n\
+             \x20   try:\n\
+             \x20       os.fstat(fd)\n\
+             \x20       return True\n\
+             \x20   except OSError:\n\
+             \x20       return False\n\
+             print(json.dumps([fd for fd in list(range(1024)) + {numbers:?} if is_open(fd)]))\n"
+        ));
+        // Inheritable only for the run: the host process holds both strays
+        // without close-on-exec from here until the run returns.
+        for fd in &numbers {
+            // SAFETY: flag change on a descriptor this test owns.
+            assert_eq!(unsafe { libc::fcntl(*fd, libc::F_SETFD, 0) }, 0);
+        }
+        let started = std::time::Instant::now();
+        let run = script.run(jail, &[]);
+        let elapsed = started.elapsed();
+        drop(strays);
+        drop((read, write));
+        // SAFETY: `setrlimit` reads only the live `previous`.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &previous) }, 0);
+        eprintln!("jailed run with a raised descriptor limit took {elapsed:?}");
+        let output = json(&run);
+        let open = output
+            .as_array()
+            .unwrap_or_else(|| panic!("{output}"))
+            .iter()
+            .map(|fd| fd.as_i64().unwrap())
+            .collect::<Vec<_>>();
+        let extra = open.iter().filter(|fd| **fd > 2).collect::<Vec<_>>();
+        assert_eq!(
+            open,
+            [0, 1, 2],
+            "the script must hold stdio alone; extra descriptors {extra:?} (strays {numbers:?})"
+        );
+    }
+
     /// A reviewed Python script prints JSON in the strict jail. The expected
     /// executable digest binds the script bytes; the audit names the
     /// interpreter; the strict schema is unchanged.
@@ -1342,14 +1441,14 @@ mod linux {
 
     /// A script's report: `fds` (its descriptors, taken before anything else
     /// opened one), `status_fd` (the channel's number) and `status_fd_open`.
-    /// The number is at least 3 and not open in the script, and no
-    /// descriptor is a socket this test process did not already hold across
-    /// exec (see `assert_no_status_channel`).
+    /// The number is at least 3 and not open in the script, and the script
+    /// holds stdio alone: no status channel and no host descriptor (see
+    /// `assert_only_stdio`).
     fn assert_no_status_channel_in(
         output: &serde_json::Value,
         inherited: &std::collections::BTreeSet<String>,
     ) {
-        use super::super::egress_tests::linux::assert_no_status_channel;
+        use super::super::egress_tests::linux::assert_only_stdio;
 
         eprintln!("jailed script report: {output}");
         let entries = output["fds"]
@@ -1358,18 +1457,18 @@ mod linux {
             .iter()
             .map(|(fd, target)| (fd.parse().unwrap(), target.as_str().unwrap().to_owned()))
             .collect::<Vec<(u32, String)>>();
-        assert_no_status_channel(&entries, inherited, false);
+        assert_only_stdio(&entries, inherited, false);
         assert!(output["status_fd"].as_u64().is_some_and(|fd| fd >= 3), "{output}");
         assert_eq!(output["status_fd_open"], false, "{output}");
     }
 
-    /// Interpreter mode: the status channel is not among the script's
-    /// descriptors. A socket pair the script then opens shows up as
-    /// `socket:[...]`: the listing does see an inherited socket if there
-    /// were one.
+    /// Interpreter mode: the script holds stdio alone, neither the status
+    /// channel nor a stray pipe the host holds without close-on-exec. A
+    /// socket pair the script then opens shows up as `socket:[...]`: the
+    /// listing does see an inherited socket if there were one.
     #[test]
     fn the_status_channel_is_absent_from_a_jailed_script() {
-        use super::super::egress_tests::linux::inherited_host_descriptors;
+        use super::super::egress_tests::linux::{inherited_host_descriptors, StrayHostPipe};
 
         let _budget = JAIL_PROCESS_BUDGET
             .lock()
@@ -1384,8 +1483,11 @@ mod linux {
              control = [target for fd, target in FDS().items() if fd not in before]\n\
              print(json.dumps({{'fds': before, 'status_fd': STATUS, 'status_fd_open': STATUS in before, 'control': control}}))\n"
         ));
+        let stray = StrayHostPipe::open();
+        stray.assert_inheritable();
         let inherited = inherited_host_descriptors();
         let output = json(&script.run(jail, &[]));
+        drop(stray);
         assert_no_status_channel_in(&output, &inherited);
         let control = output["control"].as_array().unwrap();
         assert_eq!(control.len(), 2, "{output}");
@@ -1401,8 +1503,9 @@ mod linux {
     /// that number directly and through `/proc/1` (the jail init) and its
     /// parent (the forwarder), prints the old stderr marker and exits 126.
     /// The run is its own non-zero exit, never `JailHelperRefused`. It
-    /// writes to no other descriptor: under CI one is the runner's own
-    /// channel, inherited across exec.
+    /// writes to no other descriptor: a test must never write to one it
+    /// did not create (under CI the runner's own channel pipes are open in
+    /// this test process), and the script holds stdio alone anyway.
     #[test]
     fn a_forged_refusal_in_the_brokered_jail_is_the_commands_own_exit() {
         use super::super::egress_tests::linux::{brokered, inherited_host_descriptors, UnixBroker};

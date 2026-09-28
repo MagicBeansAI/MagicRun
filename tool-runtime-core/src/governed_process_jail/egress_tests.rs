@@ -704,11 +704,9 @@ pub(super) mod linux {
 
     /// Descriptors above 2 that this test process holds without
     /// close-on-exec, by `readlink` target (`pipe:[inode]`, `socket:[inode]`,
-    /// a path). The runner does not close them, so the launcher and the
-    /// jailed command inherit them too: under GitHub Actions, the runner's
-    /// own channel is one. They exist before the run, whereas the exec-status
-    /// socket pair is created per run, close-on-exec, so its `socket:[inode]`
-    /// can never be among them.
+    /// a path). Under GitHub Actions the runner's own channel pipes are among
+    /// them. The runner marks them close-on-exec before it execs the jail
+    /// launcher, so the jailed command must hold none of them.
     pub(in crate::governed_process_jail) fn inherited_host_descriptors() -> BTreeSet<String> {
         let mut inherited = BTreeSet::new();
         for entry in fs::read_dir("/proc/self/fd").unwrap() {
@@ -726,20 +724,69 @@ pub(super) mod linux {
                 inherited.insert(target.to_string_lossy().into_owned());
             }
         }
-        eprintln!("host descriptors inherited across exec: {inherited:?}");
+        eprintln!("host descriptors without close-on-exec: {inherited:?}");
         inherited
     }
 
-    /// The exec-status channel is a Unix socket pair created for this run;
-    /// the program must never hold its write end. Stdio is `/dev/null` and
-    /// two pipes, never a socket. Above 2, a descriptor is either one this
-    /// test process already held across exec (`inherited`, by target, so by
-    /// socket or pipe inode) or, when `lister_directories` is set, a
-    /// directory the lister opened itself (a path). The channel's
-    /// `socket:[inode]` is neither: if the helper did not mark it
-    /// close-on-exec before exec, bubblewrap (whose launcher clears
-    /// close-on-exec on it) would pass it to the program and this fails.
-    pub(in crate::governed_process_jail) fn assert_no_status_channel(
+    /// A pipe this test process holds with close-on-exec deliberately
+    /// cleared on its write end, as a stray host descriptor would be, until
+    /// dropped. Both ends are created close-on-exec (`pipe2(O_CLOEXEC)`);
+    /// only the write end is then made inheritable. That end is inheritable
+    /// process-wide for as long as the value lives: any child this test
+    /// process spawns meanwhile, from any thread, would inherit it unless its
+    /// launch marks it close-on-exec. So open it right before the run, drop
+    /// it right after, and hold `JAIL_PROCESS_BUDGET` meanwhile. No test ever
+    /// writes to it (or to any descriptor it did not create).
+    pub(in crate::governed_process_jail) struct StrayHostPipe {
+        _read: std::os::fd::OwnedFd,
+        write: std::os::fd::OwnedFd,
+        /// `pipe:[inode]`, as `readlink` shows it in any process.
+        pub(in crate::governed_process_jail) target: String,
+    }
+
+    impl StrayHostPipe {
+        pub(in crate::governed_process_jail) fn open() -> Self {
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+            let mut fds = [0; 2];
+            // SAFETY: `pipe2` writes two fresh descriptors into the live array.
+            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            // SAFETY: both descriptors are fresh and owned by nothing else.
+            let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+            // SAFETY: flag change on a descriptor this struct owns.
+            assert_eq!(unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFD, 0) }, 0);
+            let target = fs::read_link(format!("/proc/self/fd/{}", write.as_raw_fd()))
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            assert!(target.starts_with("pipe:["), "{target}");
+            Self {
+                _read: read,
+                write,
+                target,
+            }
+        }
+
+        /// Positive control: the host process does hold it across exec.
+        pub(in crate::governed_process_jail) fn assert_inheritable(&self) {
+            use std::os::fd::AsRawFd;
+
+            // SAFETY: `F_GETFD` only queries a descriptor this struct owns.
+            let flags = unsafe { libc::fcntl(self.write.as_raw_fd(), libc::F_GETFD) };
+            assert_eq!(flags & libc::FD_CLOEXEC, 0, "the stray pipe must lack close-on-exec");
+            assert!(inherited_host_descriptors().contains(&self.target));
+        }
+    }
+
+    /// The jailed command holds stdio and nothing else. Stdio is `/dev/null`
+    /// and two pipes, never a socket (the exec-status channel is a Unix
+    /// socket pair). Above 2 the only descriptors allowed are directories
+    /// the lister opened itself (a path), when `lister_directories` is set;
+    /// none of them may be one this test process holds without close-on-exec
+    /// (`inherited`, by target, so by pipe or socket inode). The status
+    /// channel's `socket:[inode]` is never a path, so if the helper did not
+    /// mark it close-on-exec before exec this fails too.
+    pub(in crate::governed_process_jail) fn assert_only_stdio(
         entries: &[(u32, String)],
         inherited: &BTreeSet<String>,
         lister_directories: bool,
@@ -754,15 +801,20 @@ pub(super) mod linux {
         }
         for (fd, target) in entries.iter().filter(|(fd, _)| *fd > 2) {
             assert!(
-                inherited.contains(target) || (lister_directories && target.starts_with('/')),
-                "fd {fd} ({target}) is neither the lister's own nor held by the host \
-                 before the run ({inherited:?}): {entries:?}"
+                !inherited.contains(target),
+                "fd {fd} ({target}) is a host descriptor inherited into the jail: {entries:?}"
+            );
+            assert!(
+                lister_directories && target.starts_with('/'),
+                "fd {fd} ({target}) is not the lister's own; nothing above stdio may be \
+                 inherited: {entries:?}"
             );
         }
     }
 
-    /// Strict mode: the helper execs the command directly, and the status
-    /// channel's write end is not among the command's descriptors.
+    /// Strict mode: the helper execs the command directly. It holds stdio
+    /// alone: neither the status channel's write end nor any host
+    /// descriptor.
     #[test]
     fn the_status_channel_is_absent_inside_the_strict_jail() {
         let _budget = JAIL_PROCESS_BUDGET
@@ -776,15 +828,14 @@ pub(super) mod linux {
             },
         };
         let inherited = inherited_host_descriptors();
-        assert_no_status_channel(&list_descriptors_in(jail), &inherited, true);
+        assert_only_stdio(&list_descriptors_in(jail), &inherited, true);
     }
 
     /// Brokered mode: the helper execs the forwarder, which spawns the
     /// command. The forwarder's own sockets (its listener, its relays) are
     /// close-on-exec and the channel was closed when the helper exec'd, so
-    /// the command inherits stdio (and whatever the host process itself
-    /// passes across exec) alone: it reaches the broker through the proxy
-    /// environment, not through any descriptor.
+    /// the command inherits stdio alone: it reaches the broker through the
+    /// proxy environment, not through any descriptor.
     #[test]
     fn the_status_channel_is_absent_from_the_brokered_child() {
         let _budget = JAIL_PROCESS_BUDGET
@@ -795,8 +846,42 @@ pub(super) mod linux {
             return;
         };
         let inherited = inherited_host_descriptors();
-        assert_no_status_channel(&list_descriptors_in(jail), &inherited, true);
+        assert_only_stdio(&list_descriptors_in(jail), &inherited, true);
         assert!(broker.requests.lock().unwrap().is_empty());
+    }
+
+    /// A pipe the host process holds without close-on-exec does not reach
+    /// the jailed command, in the strict jail (helper, then the command) or
+    /// the brokered jail (helper, forwarder, then the command). Before
+    /// `0.1.79` bubblewrap passed it through.
+    #[test]
+    fn a_stray_host_pipe_is_absent_inside_strict_and_brokered_jails() {
+        let _budget = JAIL_PROCESS_BUDGET
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let strict = match GovernedProcessJail::strict_app(GovernedProcessJailLimits::default()) {
+            Ok(jail) => jail,
+            Err(error) => {
+                skip(&format!("no Linux strict jail on this host: {error}"));
+                return;
+            },
+        };
+        let broker = UnixBroker::start();
+        let Some(brokered) = brokered(&broker) else {
+            return;
+        };
+        let stray = StrayHostPipe::open();
+        stray.assert_inheritable();
+        let inherited = inherited_host_descriptors();
+        for (mode, jail) in [("strict", strict), ("brokered", brokered)] {
+            let entries = list_descriptors_in(jail);
+            assert!(
+                entries.iter().all(|(_, target)| *target != stray.target),
+                "{mode}: the stray host pipe {} reached the jailed command: {entries:?}",
+                stray.target
+            );
+            assert_only_stdio(&entries, &inherited, true);
+        }
     }
 
     #[test]

@@ -8,15 +8,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.78`._
+_Current development version: `0.1.79`._
 
-### Exec-status channel regression tests (test-only)
+### Security: host descriptors leaked into every jail (`0.1.79`)
 
-- Real-jail Linux tests assert that the exec-status channel's write end is
-  never among the jailed command's descriptors, in strict, interpreter and
-  brokered mode (the brokered child is spawned by the forwarder), and that
-  a brokered command forging a helper refusal is recorded as its own
-  non-zero exit. No runtime or API change.
+- **Fixed:** every descriptor the host process held without close-on-exec
+  reached the jailed command. Linux: bubblewrap, the in-jail helper and, in
+  brokered mode, the forwarder passed them through, so a jailed command could
+  read or write them (under GitHub Actions: the runner's own channel pipes).
+  macOS was affected too: jail launches fork and exec `sandbox-exec` (only
+  unjailed commands use `POSIX_SPAWN_CLOEXEC_DEFAULT`). Upgrade if the host
+  process can hold such a descriptor.
+- The batch runner's pre-exec step of every standard (forked) launch, jail
+  launches and Linux unjailed launches alike, now marks every descriptor
+  from 3 up close-on-exec, before a jail's `RLIMIT_NOFILE` applies, then
+  clears the flag on the one descriptor deliberately passed: on Linux jails
+  the exec-status channel's helper end (bubblewrap is given no other
+  descriptor; the broker socket is a path bind). The bound is read in the
+  parent; the child's step is async-signal-safe (raw system calls, a stack
+  buffer, no allocation):
+  - Linux: `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)`; on an error return
+    the entries of `/proc/self/fd` read with `getdents64` (a malformed record
+    counts as incomplete); without `/proc` every number below the soft
+    `RLIMIT_NOFILE`, capped at 2^20. A seccomp filter that kills on
+    `close_range` instead of returning an error makes the launch fail with
+    `SIGSYS`, with no fallback.
+  - macOS: the exact descriptor list from `proc_pidinfo(PROC_PIDLISTFDS)`
+    into a 4096-entry stack buffer; if it fails or fills, every number below
+    `kern.maxfilesperproc` (read before `fork`), above which no descriptor
+    can exist. The soft `RLIMIT_NOFILE` is not the bound: it can be far
+    higher (1048576 on current macOS, which made a scan to it cost about
+    100 ms per launch) or lowered below a descriptor still open.
+  - A failure to keep the passed descriptor fails the launch.
+- Defence in depth on Linux: the in-jail exec shim marks every descriptor
+  from 3 up close-on-exec before it execs, and the forwarder does the same in
+  its child before the command's exec. The command starts with stdio alone.
+- Unjailed launches: Linux unjailed batch launches now get the same marking
+  (parity with macOS, which already spawns them with
+  `POSIX_SPAWN_CLOEXEC_DEFAULT`); nothing in this crate passes a descriptor
+  to an unjailed child on purpose, and the child environment is cleared, so
+  no `LISTEN_FDS` or jobserver hand-off is lost. The PTY path is unchanged:
+  it closes every descriptor above 2 in `portable-pty`'s pre-exec step.
+- The `libc` requirement is now `0.2.171`, the first release with every
+  symbol used here (`proc_pidinfo`, `PROC_PIDLISTFDS` and `proc_fdinfo` on
+  Apple; `close_range` and `CLOSE_RANGE_CLOEXEC` on Linux are older).
+- No argv, profile or audit change: every golden and profile identity is
+  unchanged from `0.1.78`.
+- Tests: the Linux real-jail descriptor tests (strict, brokered, interpreter,
+  brokered forged refusal) now require that the command hold stdio alone,
+  apart from the lister's own directories; the allowance for host-inherited
+  descriptors is gone, and none of them may appear. New:
+  `a_stray_host_pipe_is_absent_inside_strict_and_brokered_jails` and the
+  strict interpreter test create a pipe without close-on-exec in the test
+  process and assert its `pipe:[inode]` is absent in the jail;
+  `a_stray_host_pipe_is_absent_inside_the_macos_jail` (with the soft
+  `RLIMIT_NOFILE` raised as high as allowed and a stray at 5000);
+  `an_unjailed_linux_child_inherits_no_stray_host_descriptor`; unit tests of
+  each marking method through a real fork and exec, including a descriptor
+  above a soft limit lowered after it was opened; and shim and forwarder
+  tests with a stray descriptor. Test pipes are created close-on-exec and
+  made inheritable only for the run. These extend the exec-status channel
+  regression tests of PR #4 (test-only), which assert that the channel's
+  write end is never among the jailed command's descriptors in any mode and
+  that a brokered command forging a helper refusal is recorded as its own
+  non-zero exit.
 
 ### Staged input files (`0.1.78`)
 
