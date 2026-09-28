@@ -38,14 +38,14 @@ fn exec_roots_profile_identities_match_the_reviewed_goldens() {
     let python = |minor| Some((GovernedJailInterpreterKind::Python3, GovernedJailInterpreterVersion { major: 3, minor }));
     let roots = declared_roots();
     for (platform, network, interpreter, expected) in [
-        (MacosSandboxExec, Denied, None, "blake3:2f54bcf8e3a11be7f5b1e0a6400868aa0eb8a232f77b488befaa4000e9d54a91"),
-        (MacosSandboxExec, BrokeredEgress, None, "blake3:ab20ab27096be74d37f98f1ffc1fb27078f965cbbaea70c68448abf83df63af1"),
-        (MacosSandboxExec, Denied, python(9), "blake3:5675e991b882e662f6257eefde51e64f46b8f8f15473a6a2aab543dd22fe0787"),
-        (MacosSandboxExec, BrokeredEgress, python(9), "blake3:22bf9c6a638b59607fb4eb92883bd110b7c950d34495d367b69e9d275d3fc9bf"),
-        (LinuxBubblewrap, Denied, None, "blake3:a1102fbfa45d1c6d6103186a55d8cdad6de15a9659bf9cc573a0231a2341c5cd"),
-        (LinuxBubblewrap, BrokeredEgress, None, "blake3:2d4d426c362ffe4983d08b7dbf9513798d33760b60a9fab550add74c87b092f7"),
-        (LinuxBubblewrap, Denied, python(12), "blake3:1f6be66afd82de6e3fe39350d07ba5065d091870f080695c19dbba531e3bc6da"),
-        (LinuxBubblewrap, BrokeredEgress, python(12), "blake3:776ee9e7734662d8c4819b0d13229d11814f779bd08ef0fa0619e64ca460f35a"),
+        (MacosSandboxExec, Denied, None, "blake3:50105988b6a7b18f64fd78fa9a57ca563c88fcaf41efb2e1eeb874774e28a936"),
+        (MacosSandboxExec, BrokeredEgress, None, "blake3:c0db917a53a94f17480f6fb8bccac86293559b2b1183bf348d58078b88fc1967"),
+        (MacosSandboxExec, Denied, python(9), "blake3:9656a7e60155e51f80ea19a72b23203f269340c204a77583b40f4dbed5dcf88d"),
+        (MacosSandboxExec, BrokeredEgress, python(9), "blake3:dea9780eac6201a02ffcf60cf02a403c5f15eb8b7b24a539df61b200782afc27"),
+        (LinuxBubblewrap, Denied, None, "blake3:22306cb6bfd8b049886e79e5f6e215bc8a6cbd7ca134c4294434f7186c3f1afa"),
+        (LinuxBubblewrap, BrokeredEgress, None, "blake3:1846beddfe508fba7e53f52b49fe39d891b3ec29f65ae6da4000ec2241c27ded"),
+        (LinuxBubblewrap, Denied, python(12), "blake3:cca1a8a64e89a20872ca2c849f9e34cedd68a53ceea0bc4cd15cd8157cefc27e"),
+        (LinuxBubblewrap, BrokeredEgress, python(12), "blake3:866f5206e3936a5c2f9f39f1063b45066d09c458a0a6f3117b42c233d31517b0"),
     ] {
         let identity = governed_process_jail_exec_roots_profile_identity(platform, network, interpreter, &roots);
         assert_eq!(identity.to_string(), expected, "{platform:?} {network:?} {interpreter:?}");
@@ -261,7 +261,8 @@ fn linux_exec_roots_argv_is_identical_to_the_reviewed_golden() {
             "/work", "--setenv", "HOME", "/work", "--setenv", "TMPDIR", "/work", "--setenv", "TMP",
             "/work", "--setenv", "TEMP", "/work", "--setenv", "PATH",
             "/opt/skills/yt-dlp/bin:/opt/homebrew/Cellar/node/24.1.0/bin:/usr/bin:/bin", "--setenv",
-            "PYTHONNOUSERSITE", "1", "--setenv", "PYTHONDONTWRITEBYTECODE", "1", "--",
+            "PYTHONNOUSERSITE", "1", "--setenv", "PYTHONDONTWRITEBYTECODE", "1", "--setenv",
+            "OPENSSL_CONF", "/dev/null", "--",
             "/run/magicrun/jail-helper", "--magicrun-jail-exec-v1", "257", "4026531837", "5", "--",
             "/opt/skills/yt-dlp/bin/yt",
         ]
@@ -435,6 +436,23 @@ fn host_declarations_refuse_unsafe_roots() {
     invalid(forbid(skill.parent().unwrap().to_path_buf()));
     invalid(forbid(PathBuf::from("relative")));
     forbid(skill.parent().unwrap().join("elsewhere-absent")).unwrap();
+    // A forbidden path not created yet, spelled through a symlinked
+    // ancestor (`/var` -> `/private/var` for the macOS temp directory).
+    let spelled = std::env::temp_dir().join(skill.file_name().unwrap()).join("not-yet");
+    invalid(forbid(spelled));
+    // A PATH entry, and every directory between it and its root, must be
+    // owned by root or this user and not group/other-writable.
+    fs::create_dir_all(skill.join("tools/bin")).unwrap();
+    let path_entry = |entry: &Path| {
+        GovernedJailExecRoots::new([GovernedJailExecRoot::new(&skill)], [entry.to_path_buf()])
+    };
+    path_entry(&skill.join("tools/bin")).unwrap();
+    for (directory, mode) in [("tools/bin", 0o777), ("tools/bin", 0o775), ("tools", 0o777), ("tools", 0o775)] {
+        fs::set_permissions(skill.join(directory), fs::Permissions::from_mode(mode)).unwrap();
+        invalid(path_entry(&skill.join("tools/bin")));
+        fs::set_permissions(skill.join(directory), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path_entry(&skill.join("tools/bin")).unwrap();
     // A missing root or PATH entry.
     invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(path.join("absent"))], []));
     invalid(GovernedJailExecRoots::new([GovernedJailExecRoot::new(&path)], [path.join("absent")]));
@@ -537,6 +555,7 @@ fn exec_roots_audit_is_value_free() {
     );
     assert_eq!(environment["PYTHONNOUSERSITE"], Some(OsString::from("1")));
     assert_eq!(environment["PYTHONDONTWRITEBYTECODE"], Some(OsString::from("1")));
+    assert_eq!(environment["OPENSSL_CONF"], Some(OsString::from("/dev/null")));
 }
 
 // ---------------------------------------------------------------------------
@@ -851,13 +870,9 @@ fn an_installed_node_cli_runs_in_place_from_its_root() {
          attempt('work', () => { fs.writeFileSync('node-result.txt', 'x'); return 'ok'; });\n\
          console.log(JSON.stringify(out));\n",
     );
-    let roots = match GovernedJailExecRoots::new(
-        [
-            node.root.clone(),
-            GovernedJailExecRoot::new(&cli).excluding("config"),
-        ],
-        [node.bin.clone(), cli.join("bin")],
-    ) {
+    let mut declared = vec![node.fixture_root.clone(), GovernedJailExecRoot::new(&cli).excluding("config")];
+    declared.extend(node.root.clone());
+    let roots = match GovernedJailExecRoots::new(declared, [node.bin.clone(), cli.join("bin")]) {
         Ok(roots) => roots,
         Err(error) => {
             assert!(!required, "node root {:?} refused: {error}", node.root);
@@ -871,7 +886,7 @@ fn an_installed_node_cli_runs_in_place_from_its_root() {
         cli.join("bin").to_str().unwrap(),
         "mmx",
         &["--flag", "value"],
-        &node.environment,
+        &[],
         None,
     )
     .unwrap();
@@ -886,69 +901,62 @@ fn an_installed_node_cli_runs_in_place_from_its_root() {
     assert!(!cli.join("bin/planted").exists());
 }
 
-/// The first `node` on `PATH` as an exec root: runtime directories only.
+/// The first `node` on `PATH` as exec roots: runtime directories only.
 struct NodeInstall {
-    root: GovernedJailExecRoot,
-    /// Canonical directory of the `node` binary.
+    /// The install's own root, when `node` is not copied (Homebrew).
+    root: Option<GovernedJailExecRoot>,
+    /// A trusted fixture directory holding `node`, the declared `PATH`
+    /// entry; it lives inside `fixture_root`.
     bin: PathBuf,
-    environment: Vec<(&'static str, &'static str)>,
+    fixture_root: GovernedJailExecRoot,
+    _fixture: tempfile::TempDir,
 }
 
-/// A standalone install (the official tarball, `/usr/local/bin` on CI)
-/// is self-contained: the binary's own directory is the root. A Homebrew
-/// keg is not: `node` links libraries from a dozen other kegs through the
-/// `opt/` symlinks, and `Cellar/` and `opt/` are `admin`-group-writable, so
-/// neither a keg nor they pass the root trust checks. The Homebrew prefix is
-/// then the root with its data (`var/`) and configuration (`etc/`) excluded;
-/// Homebrew's OpenSSL reads its configuration from `etc/`, so it is pointed
-/// at `/dev/null`.
+/// `node` comes from a trusted fixture directory rather than its install's
+/// own `bin/`, which may be writable by others (`/usr/local/bin` is 0777 on
+/// GitHub's Linux runners) and so fail the `PATH` trust check.
+///
+/// A standalone install (the official build) is self-contained: the binary
+/// is copied into the fixture, which is the only root. A Homebrew keg is
+/// not: `node` links libraries from a dozen other kegs through the `opt/`
+/// symlinks, and `Cellar/` and `opt/` are `admin`-group-writable, so neither
+/// a keg nor they pass the root trust checks. The Homebrew prefix is then
+/// the root with its data (`var/`) and configuration (`etc/`) excluded, and
+/// the fixture holds a symlink to the keg's `node`. OpenSSL reads no
+/// configuration in this mode (`OPENSSL_CONF=/dev/null`).
 fn node_install() -> Option<NodeInstall> {
     let node = std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|directory| directory.join("node"))
         .find(|candidate| candidate.is_file())?;
     let node = fs::canonicalize(node).ok()?;
-    let bin = node.parent()?.to_path_buf();
     let text = node.to_str()?;
-    Some(match text.find("/Cellar/") {
-        Some(index) => {
+    let (fixture, fixture_path) = root_directory();
+    let bin = fixture_path.join("bin");
+    fs::create_dir(&bin).ok()?;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).ok()?;
+    let root = match text.find("/Cellar/") {
+        Some(index) => Some({
             let prefix = PathBuf::from(&text[..index]);
+            std::os::unix::fs::symlink(&node, bin.join("node")).ok()?;
             let mut root = GovernedJailExecRoot::new(&prefix);
             for data in ["var", "etc"] {
                 if prefix.join(data).is_dir() {
                     root = root.excluding(data);
                 }
             }
-            NodeInstall {
-                root,
-                bin,
-                environment: vec![("OPENSSL_CONF", "/dev/null")],
-            }
-        },
+            root
+        }),
         None => {
-            // The binary's own directory, or (when that directory fails the
-            // trust checks, as a group-writable `/usr/local/bin` does) the
-            // install prefix above it.
-            let candidates = [bin.clone(), bin.parent()?.to_path_buf()];
-            let root = candidates.iter().find(|candidate| {
-                let accepted = GovernedJailExecRoots::new([GovernedJailExecRoot::new(candidate)], []);
-                if let Err(error) = &accepted {
-                    use std::os::unix::fs::MetadataExt;
-                    let metadata = fs::metadata(candidate).ok();
-                    eprintln!(
-                        "node root candidate {} refused ({error}): uid {:?} mode {:o}",
-                        candidate.display(),
-                        metadata.as_ref().map(MetadataExt::uid),
-                        metadata.as_ref().map_or(0, MetadataExt::mode),
-                    );
-                }
-                accepted.is_ok()
-            })?;
-            NodeInstall {
-                root: GovernedJailExecRoot::new(root),
-                bin,
-                environment: Vec::new(),
-            }
+            fs::copy(&node, bin.join("node")).ok()?;
+            fs::set_permissions(bin.join("node"), fs::Permissions::from_mode(0o755)).ok()?;
+            None
         },
+    };
+    Some(NodeInstall {
+        root,
+        fixture_root: GovernedJailExecRoot::new(&fixture_path),
+        bin,
+        _fixture: fixture,
     })
 }
 
@@ -1123,6 +1131,55 @@ fn processes_marked(marker: &str) -> Vec<libc::pid_t> {
         .collect()
 }
 
+/// A unique marker for the processes of one chain test.
+fn chain_marker(kind: &str) -> String {
+    format!(
+        "magicrun-{kind}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )
+}
+
+/// Run `skill` (which starts a detached chain carrying `marker` and prints
+/// `chain-up` then `started`) `rounds` times; after each run, scan ten times
+/// over a second for any process carrying the marker. Survivors are killed
+/// and fail the test.
+fn assert_chain_leaves_no_survivors(skill: &Skill, marker: &str, rounds: usize) {
+    for round in 0..rounds {
+        let Some(jail) = base_jail(GovernedProcessJailLimits::default()) else {
+            return;
+        };
+        let jail = jail.with_exec_roots(skill.roots()).unwrap();
+        let run = skill.run(jail, &[]);
+        // macOS: also find the jail's processes by sandbox, keyed on the
+        // skill root (readable in the jail, its parent not), since a
+        // process mid-exec may not show its command line to `ps`.
+        #[cfg(target_os = "macos")]
+        let census = MacosJailMembers::for_directory(skill.skill.clone()).unwrap();
+        let mut survivors = BTreeSet::new();
+        let checked = std::time::Instant::now();
+        while checked.elapsed() < std::time::Duration::from_secs(1) {
+            #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+            let mut found = processes_marked(marker);
+            #[cfg(target_os = "macos")]
+            found.extend(census.census());
+            for pid in found {
+                // SAFETY: cleanup of a process this test started.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                survivors.insert(pid);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(survivors.is_empty(), "round {round}: survivors {survivors:?}");
+        let run = run.unwrap_or_else(|error| panic!("round {round}: {error:?}"));
+        assert_eq!(run.terminal, GovernedExecutionTerminal::Success, "{} {}", run.stdout, run.stderr);
+        assert_eq!(run.stdout.trim(), "chain-up\nstarted", "the chain must have run: {}", run.stderr);
+    }
+}
+
 /// A fork-and-exit chain in its own session (one short-lived member alive
 /// at a time, as `perl -e 'while(1){fork and exit}'`) leaves no survivor:
 /// macOS teardown stops each member as it is found and kills it, until
@@ -1137,14 +1194,7 @@ fn a_setsid_fork_exit_chain_leaves_no_survivors() {
         skip("no /usr/bin/perl on this host");
         return;
     }
-    let marker = format!(
-        "magicrun-chain-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let marker = chain_marker("chain");
     let skill = Skill::new(&format!(
         "#!/bin/sh\n\
          /usr/bin/perl -e 'use POSIX; if (fork) {{ exit 0 }} POSIX::setsid(); \
@@ -1156,21 +1206,99 @@ fn a_setsid_fork_exit_chain_leaves_no_survivors() {
          echo\n\
          echo started\n"
     ));
-    for round in 0..3 {
-        let Some(jail) = base_jail(GovernedProcessJailLimits::default()) else {
-            return;
-        };
-        let jail = jail.with_exec_roots(skill.roots()).unwrap();
-        let run = skill.run(jail, &[]);
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let survivors = processes_marked(&marker);
-        for pid in &survivors {
-            // SAFETY: cleanup of a process this test started.
-            unsafe { libc::kill(*pid, libc::SIGKILL) };
-        }
-        assert!(survivors.is_empty(), "round {round}: survivors {survivors:?}");
-        let run = run.unwrap_or_else(|error| panic!("round {round}: {error:?}"));
-        assert_eq!(run.terminal, GovernedExecutionTerminal::Success, "{} {}", run.stdout, run.stderr);
-        assert_eq!(run.stdout.trim(), "chain-up\nstarted", "the chain must have run: {}", run.stderr);
+    assert_chain_leaves_no_survivors(&skill, &marker, 3);
+}
+
+/// A process in its own session that re-execs itself in a tight loop keeps
+/// its pid and start time across every exec. It must not survive teardown.
+/// `MAGICRUN_EXEC_LOOP_ROUNDS` raises the round count for local soak runs.
+#[test]
+fn a_setsid_exec_loop_leaves_no_survivors() {
+    let _budget = JAIL_PROCESS_BUDGET
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !Path::new("/usr/bin/perl").is_file() {
+        skip("no /usr/bin/perl on this host");
+        return;
     }
+    let marker = chain_marker("execloop");
+    let skill = Skill::new(
+        "#!/bin/sh\n\
+         /usr/bin/perl \"$(dirname \"$0\")/loop.pl\"\n\
+         sleep 1\n\
+         cat chain-up\n\
+         echo\n\
+         echo started\n",
+    );
+    fs::write(
+        skill.skill.join("loop.pl"),
+        format!(
+            "use POSIX;\n\
+             if (!@ARGV) {{\n\
+             \x20   exit 0 if fork;\n\
+             \x20   POSIX::setsid();\n\
+             \x20   open STDIN, '<', '/dev/null'; open STDOUT, '>', '/dev/null'; open STDERR, '>', '/dev/null';\n\
+             \x20   open my $f, '>', 'chain-up'; print $f 'chain-up'; close $f;\n\
+             }}\n\
+             exec $^X, $0, '{marker}';\n"
+        ),
+    )
+    .unwrap();
+    let rounds = std::env::var("MAGICRUN_EXEC_LOOP_ROUNDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10);
+    assert_chain_leaves_no_survivors(&skill, &marker, rounds);
+}
+
+/// A member sentinel left by a host that is gone is swept: its members are
+/// killed and it is removed. A live jail's sentinel is left alone.
+#[cfg(target_os = "macos")]
+#[test]
+fn stale_member_sentinels_are_swept() {
+    let _budget = JAIL_PROCESS_BUDGET
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
+    let gone_pid = gone.id();
+    gone.wait().unwrap();
+    let temp = fs::canonicalize(std::env::temp_dir()).unwrap();
+    let sentinel = temp.join(format!("magicrun-jail-member-sweeptest-{}", chain_marker("sweep")));
+    fs::create_dir(&sentinel).unwrap();
+    fs::write(sentinel.join("owner"), format!("{gone_pid} 0\n")).unwrap();
+    // A process of that stale jail: sandboxed, may read the sentinel, not
+    // its parent.
+    let profile = format!(
+        "(version 1)\n(allow default)\n(deny file-read-data (literal \"{}\"))\n",
+        sbpl_escape(&temp).unwrap()
+    );
+    let mut member = Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", &profile, "/bin/sleep", "30"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let member_pid = member.id() as libc::pid_t;
+    let started = std::time::Instant::now();
+    loop {
+        let mut path = [0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: `proc_pidpath` writes at most the given size into `path`.
+        let written = unsafe { libc::proc_pidpath(member_pid, path.as_mut_ptr().cast(), path.len() as u32) };
+        if usize::try_from(written).is_ok_and(|written| &path[..written] == b"/bin/sleep") {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "the member never started");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let live = MacosJailMembers::new().unwrap();
+    let sweep = sweep_stale_jail_members();
+    let status = member.wait().unwrap();
+    assert!(sweep.members_killed >= 1, "{sweep:?}");
+    assert!(sweep.sentinels_removed >= 1, "{sweep:?}");
+    assert!(!sentinel.exists());
+    assert!(live.sentinel().exists());
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    drop(live);
 }

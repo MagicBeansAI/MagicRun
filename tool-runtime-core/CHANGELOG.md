@@ -29,10 +29,14 @@ _Current development version: `0.1.81`._
   rest of each root's tree is trusted as installed. Roots must be runtime
   and skill directories only, never a prefix holding data (`/opt/homebrew`
   holds `var/` databases and `etc/`); the consumer must assert this and can
-  pass its data roots to `GovernedJailExecRoots::new_with_forbidden`.
+  pass its data roots to `GovernedJailExecRoots::new_with_forbidden`. A root
+  must not contain directories others can write; `PATH` entries and every
+  directory between an entry and its root must be owned by root or this user
+  and not group/other-writable.
 - **API:** `GovernedJailExecRoot::new(path).excluding(relative)`,
   `GovernedJailExecRoots::new(roots, search_path)`,
-  `GovernedJailExecRoots::new_with_forbidden(roots, search_path, forbidden)` (with `roots()`,
+  `GovernedJailExecRoots::new_with_forbidden(roots, search_path, forbidden)`,
+  `sweep_stale_jail_members() -> GovernedJailSweep` (with `roots()`,
   `search_path()`, `declaration_digest()`),
   `GovernedProcessJail::with_exec_roots`,
   `governed_process_jail_exec_roots_profile_identity(platform, network,
@@ -61,8 +65,8 @@ _Current development version: `0.1.81`._
   inside a root outside its exclusions (its file identity is rechecked right
   before spawn). With an interpreter: `<interpreter> -s -B <script>`. `-I` and
   `-S` are dropped in this mode so the script's directory is on `sys.path`
-  and `site` runs; `PYTHONNOUSERSITE=1` and `PYTHONDONTWRITEBYTECODE=1` are
-  overlaid for every Python the run starts. Staged inputs go to `in/`
+  and `site` runs; `PYTHONNOUSERSITE=1`, `PYTHONDONTWRITEBYTECODE=1` and
+  `OPENSSL_CONF=/dev/null` are overlaid for every process the run starts. Staged inputs go to `in/`
   (`stage_input_file` returns `in/<name>`), so a `-c`/`-m` child's cwd entry
   on `sys.path` holds no caller input; `with_exec_roots` refuses a workdir
   that already holds inputs. The child's `PATH` is the
@@ -80,13 +84,16 @@ _Current development version: `0.1.81`._
   watchdog and teardown of an exec-roots jail also find processes that left
   the process group (`setsid`) by their sandbox (`sandbox_check` against a
   per-jail member sentinel that lives until teardown proves every member
-  dead). Teardown stops each member the moment a scan finds it (unseen pids
-  first, known non-members skipped by pid and start time), rechecks and
-  kills it, and ends only after three consecutive empty scans; if that does
-  not happen within 3 s the run fails closed with `JailTeardownIncomplete`
-  (effect uncertain). The watchdog counts members outside the group,
-  accumulates CPU per member identity, and fails closed if it stops
-  recognizing the live leader as a member.
+  dead and records its owning host process). Teardown stops each member the
+  moment a scan finds it (unseen pids first), rechecks and kills it; only
+  "unsandboxed" answers are cached, and it ends only after three
+  consecutive uncached confirmation scans, 10 ms apart, find no member and
+  no unclassifiable process. If that does not happen within 3 s the run
+  fails closed with `JailTeardownIncomplete` (effect uncertain). The
+  watchdog counts members outside the group, accumulates CPU per member
+  identity, and fails closed if it stops recognizing the leader once the
+  leader has exec'd past `sandbox-exec`. `sweep_stale_jail_members()`
+  cleans up after a host that died mid-teardown.
 - **Linux:** no `/app`; `/bin`, `/usr/bin`, `/usr/lib`, `/usr/lib64` and each
   root are bound read-only at their own paths; each excluded directory is
   masked with an empty read-only tmpfs; the program runs through the
@@ -96,14 +103,15 @@ _Current development version: `0.1.81`._
   `PYTHONUSERBASE`, `PYTHONWARNINGS`, `PYTHONPATH`, `PYTHONHOME`,
   `NODE_PATH`, `NODE_OPTIONS`, `NPM_CONFIG_*`, `JAVA_TOOL_OPTIONS`,
   `LUA_INIT*`, `RUBYLIB`, `RUBYOPT`, `PERLLIB`, `PERL5LIB`, `PERL5OPT`,
-  `GIT_SSH_COMMAND`, `GIT_EXEC_PATH`, `BASH_ENV` and `ENV`.
+  `GIT_SSH_COMMAND`, `GIT_EXEC_PATH`, `BASH_ENV`, `ENV`, `OPENSSL_CONF`,
+  `OPENSSL_ENGINES` and `OPENSSL_MODULES`.
 - **Identities:** new exec-roots identities fold in the exact canonical roots,
   exclusions and `PATH` entries. Goldens for a fixed declaration of a skill
   plus a Node keg (`exec_roots_profile_identities_match_the_reviewed_goldens`):
-  macOS denied `blake3:2f54bcf8…d54a91`, brokered `blake3:ab20ab27…f63af1`,
-  with Python 3.9 `blake3:5675e991…fe0787` and `blake3:22bf9c6a…3fc9bf`;
-  Linux denied `blake3:a1102fbf…41c5cd`, brokered `blake3:2d4d426c…b092f7`,
-  with Python 3.12 `blake3:1f6be66a…3bc6da` and `blake3:776ee9e7…60f35a`. Every
+  macOS denied `blake3:50105988…28a936`, brokered `blake3:c0db917a…fc1967`,
+  with Python 3.9 `blake3:9656a7e6…dcf88d` and `blake3:dea9780e…2afc27`;
+  Linux denied `blake3:22306cb6…3f1afa`, brokered `blake3:1846bedd…c27ded`,
+  with Python 3.12 `blake3:cca1a8a6…efc27e` and `blake3:866f5206…1517b0`. Every
   existing strict, brokered and interpreter profile, argv, audit and
   identity is unchanged.
 - **Refactor:** the Linux bubblewrap argv has one builder for every mode;

@@ -24,7 +24,8 @@ use serde::Serialize;
 use tempfile::{Builder, TempDir};
 
 pub use exec_roots::{
-    GovernedJailExecRoot, GovernedJailExecRoots, GOVERNED_JAIL_EXEC_ROOTS_ENVIRONMENT,
+    sweep_stale_jail_members, GovernedJailExecRoot, GovernedJailExecRoots, GovernedJailSweep,
+    STALE_SENTINEL_WITHOUT_OWNER, GOVERNED_JAIL_EXEC_ROOTS_ENVIRONMENT,
     GOVERNED_JAIL_EXEC_ROOTS_INPUT_DIRECTORY,
     GOVERNED_JAIL_EXEC_ROOTS_SYSTEM_PATH, GOVERNED_JAIL_EXEC_ROOTS_V1,
     GOVERNED_JAIL_PYTHON3_EXEC_ROOTS_FLAGS, MAX_GOVERNED_JAIL_EXEC_ROOTS,

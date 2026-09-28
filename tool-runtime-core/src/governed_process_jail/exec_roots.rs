@@ -16,6 +16,8 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use serde::Serialize;
+
 use super::{
     sbpl_escape, validate_real_absolute_directory, GovernedProcessJailDigest,
     GovernedProcessJailError, GovernedProcessJailErrorCode,
@@ -44,8 +46,14 @@ pub const GOVERNED_JAIL_PYTHON3_EXEC_ROOTS_FLAGS: [&str; 2] = ["-s", "-B"];
 /// Fixed child environment overlay of this mode, applied after every
 /// contract value so that every Python the run starts (not only the one the
 /// jail launches) skips the user site and writes no bytecode.
-pub const GOVERNED_JAIL_EXEC_ROOTS_ENVIRONMENT: [(&str, &str); 2] =
-    [("PYTHONNOUSERSITE", "1"), ("PYTHONDONTWRITEBYTECODE", "1")];
+/// `OPENSSL_CONF=/dev/null` keeps OpenSSL (Python's `ssl`, Node, `curl`)
+/// from reading a configuration file, which can load engines and providers,
+/// from a prefix whose `etc/` is excluded or not a root at all.
+pub const GOVERNED_JAIL_EXEC_ROOTS_ENVIRONMENT: [(&str, &str); 3] = [
+    ("PYTHONNOUSERSITE", "1"),
+    ("PYTHONDONTWRITEBYTECODE", "1"),
+    ("OPENSSL_CONF", "/dev/null"),
+];
 /// Directory of the workdir that receives staged inputs in exec-roots mode;
 /// `stage_input_file` returns `in/<name>`.
 pub const GOVERNED_JAIL_EXEC_ROOTS_INPUT_DIRECTORY: &str = "in";
@@ -144,7 +152,9 @@ impl GovernedJailExecRoots {
     /// As [`Self::new`], additionally refusing a root that equals, contains
     /// or lies inside any of `forbidden` (the consumer's data root, sensitive
     /// directories of the home directory). A forbidden path is compared
-    /// canonicalized when it exists, as given otherwise. It is a validation
+    /// with its longest existing ancestor canonicalized and the rest
+    /// appended, so a path not created yet still matches through a
+    /// symlinked ancestor (`/tmp`, `/var` on macOS). It is a validation
     /// input only and does not change the declaration or its identity.
     pub fn new_with_forbidden(
         roots: impl IntoIterator<Item = GovernedJailExecRoot>,
@@ -190,7 +200,7 @@ impl GovernedJailExecRoots {
             if !forbidden.is_absolute() {
                 return Err(invalid_exec_roots());
             }
-            let forbidden = fs::canonicalize(&forbidden).unwrap_or(forbidden);
+            let forbidden = canonical_prefix(&forbidden);
             if declaration
                 .roots
                 .iter()
@@ -314,6 +324,19 @@ impl GovernedJailExecRoots {
         }
         for entry in &self.search_path {
             validate_real_absolute_directory(entry).map_err(|_| invalid_exec_roots())?;
+            // The entry and every directory between it and its root are
+            // held to the root's own trust rule: nobody else may plant a
+            // program the run would find by name.
+            let root = self
+                .roots
+                .iter()
+                .find(|root| entry.starts_with(&root.path))
+                .ok_or_else(invalid_exec_roots)?;
+            let mut current = Some(entry.as_path());
+            while let Some(directory) = current.filter(|directory| *directory != root.path) {
+                trusted_directory(directory)?;
+                current = directory.parent();
+            }
         }
         Ok(())
     }
@@ -520,6 +543,49 @@ fn declared_path(path: &Path) -> Result<(), GovernedProcessJailError> {
     Ok(())
 }
 
+/// The longest existing ancestor of `path` canonicalized, the rest appended.
+fn canonical_prefix(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(canonical) = fs::canonicalize(existing) {
+            return rest.iter().rev().fold(canonical, |joined, part| joined.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                existing = parent;
+            },
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// A real directory owned by root or this user, not group/other-writable.
+fn trusted_directory(directory: &Path) -> Result<(), GovernedProcessJailError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let metadata = fs::symlink_metadata(directory).map_err(|_| invalid_exec_roots())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || (metadata.uid() != 0 && metadata.uid() != euid)
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(invalid_exec_roots());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = directory;
+        Err(super::unsupported_platform())
+    }
+}
+
 /// The root is owned by root or this user and not group/other-writable.
 /// Every ancestor is owned by root or this user and not group/other-writable,
 /// or is a root-owned sticky directory (`/tmp`), where nobody else can rename
@@ -565,6 +631,47 @@ pub(super) const fn invalid_exec_roots() -> GovernedProcessJailError {
     )
 }
 
+/// What [`sweep_stale_jail_members`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct GovernedJailSweep {
+    /// Stale member sentinels whose members were all killed and which were
+    /// removed.
+    pub sentinels_removed: u64,
+    /// Stale sentinels kept because their members could not be proven dead.
+    pub sentinels_kept: u64,
+    /// Processes killed.
+    pub members_killed: u64,
+}
+
+/// macOS: find member sentinels (`magicrun-jail-member-*` in the temp
+/// directory, owned by this user) left by a host process that is gone (it
+/// crashed or was killed before its jail's teardown finished), kill every
+/// process still in those jails and remove the sentinels. A sentinel whose
+/// recorded owner process is still running belongs to a live jail and is
+/// left alone; one without an owner record (from before owner records) is
+/// swept only when older than [`STALE_SENTINEL_WITHOUT_OWNER`]. Call it at
+/// startup and, if wanted, periodically. Other hosts: nothing to do (a
+/// Linux jail's processes die with its pid namespace); returns zeros.
+pub fn sweep_stale_jail_members() -> GovernedJailSweep {
+    #[cfg(target_os = "macos")]
+    {
+        MacosJailMembers::sweep_stale()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        GovernedJailSweep::default()
+    }
+}
+
+/// Age past which a member sentinel without an owner record is stale: more
+/// than any run's wall ceiling.
+pub const STALE_SENTINEL_WITHOUT_OWNER: std::time::Duration = std::time::Duration::from_secs(600);
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MEMBER_SENTINEL_PREFIX: &str = "magicrun-jail-member-";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MEMBER_SENTINEL_OWNER: &str = "owner";
+
 /// macOS: the processes of one exec-roots jail, wherever they are.
 ///
 /// Exec roots allow fork, and macOS has no pid namespace: a jailed process
@@ -576,10 +683,11 @@ pub(super) const fn invalid_exec_roots() -> GovernedProcessJailError {
 /// only), and may not read the sentinel's parent (which no jail profile
 /// grants). An unsandboxed process, a process of another jail or an ordinary
 /// app sandbox fails one of the three. The sentinel lives as long as this
-/// value, and is kept on disk if teardown could not prove every member dead.
-/// `sandbox_check` is exported by `libsystem_sandbox` (listed in the SDK's
-/// stub) but has no public header; the watchdog fails closed if it stops
-/// recognizing the jail's own leader.
+/// value, records its owning host process, and is kept on disk if teardown
+/// could not prove every member dead ([`sweep_stale_jail_members`] finishes
+/// the job later). `sandbox_check` is exported by `libsystem_sandbox`
+/// (listed in the SDK's stub) but has no public header; the watchdog fails
+/// closed if it stops recognizing the jail's own leader.
 #[cfg(target_os = "macos")]
 pub(crate) struct MacosJailMembers {
     sentinel: std::sync::Mutex<Option<tempfile::TempDir>>,
@@ -591,17 +699,20 @@ pub(crate) struct MacosJailMembers {
 }
 
 /// A process identity: pid and start time (microseconds), so a reused pid
-/// is never mistaken for the process first seen under it.
+/// is never mistaken for the process first seen under it. An exec keeps
+/// both.
 #[cfg(target_os = "macos")]
 type ProcessKey = (libc::pid_t, u64);
 
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct MemberState {
-    /// Same-user processes proven not to be members; membership cannot be
-    /// gained after start except by the leader, which is never cached.
-    non_members: std::collections::HashSet<ProcessKey>,
-    /// Pids of `non_members`, to examine unseen pids first.
+    /// Same-user processes proven unsandboxed: the only negative answer that
+    /// is cached. Only the leader joins a sandbox after it starts, and it is
+    /// never cached; a sandboxed non-member is asked again on every scan,
+    /// and confirmation scans ignore this cache altogether.
+    unsandboxed: std::collections::HashSet<ProcessKey>,
+    /// Pids of `unsandboxed`, to examine unseen pids first.
     known_pids: std::collections::HashSet<libc::pid_t>,
     /// Highest CPU time seen per member, including members since gone.
     cpu: std::collections::HashMap<ProcessKey, u64>,
@@ -624,10 +735,46 @@ mod sandbox_ffi {
     }
 }
 
-/// One live, same-user, non-zombie process.
+/// What one look at a pid established.
 #[cfg(target_os = "macos")]
-struct ProcessFacts {
-    key: ProcessKey,
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Probe {
+    /// A live, non-zombie process of this user.
+    Ours(ProcessKey),
+    /// Gone, a zombie, or another user's (`EPERM`): never a member.
+    NotOurs,
+    /// Could not be read: never taken as proof of absence.
+    Unknown,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Membership {
+    Member,
+    Unsandboxed,
+    /// Sandboxed, but another sandbox.
+    OtherSandbox,
+    /// `sandbox_check` failed.
+    Unknown,
+}
+
+/// How a scan uses the unsandboxed cache and whether it stops members.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanMode {
+    /// Watchdog sample: cached, no signals.
+    Sample,
+    /// Teardown: cached, SIGSTOP each member as found.
+    Stop,
+    /// Final confirmation: every pid asked afresh, SIGSTOP members.
+    Confirm,
+}
+
+#[cfg(target_os = "macos")]
+struct ScanResult {
+    members: Vec<ProcessKey>,
+    /// Some same-user process could not be classified.
+    uncertain: bool,
 }
 
 /// Resource sample of a set of members.
@@ -642,29 +789,67 @@ pub(crate) struct MacosMemberUsage {
     pub(crate) memory_bytes: u64,
 }
 
+/// pid and start time of `pid` if it is a live process of `uid`.
+#[cfg(target_os = "macos")]
+fn probe(uid: libc::uid_t, pid: libc::pid_t) -> Probe {
+    const SZOMB: u32 = 5;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: PROC_PIDTBSDINFO writes at most `size` bytes into `info`.
+    let written = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+    if written != size {
+        return match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EPERM | libc::ESRCH) => Probe::NotOurs,
+            _ => Probe::Unknown,
+        };
+    }
+    // SAFETY: the kernel filled the whole structure.
+    let info = unsafe { info.assume_init() };
+    if info.pbi_uid != uid || info.pbi_status == SZOMB {
+        return Probe::NotOurs;
+    }
+    Probe::Ours((pid, info.pbi_start_tvsec.saturating_mul(1_000_000).saturating_add(info.pbi_start_tvusec)))
+}
+
 #[cfg(target_os = "macos")]
 impl MacosJailMembers {
-    /// Teardown ends after this many consecutive scans find no member.
+    /// Teardown ends after this many consecutive confirmation scans find no
+    /// member and no unclassified process...
     const QUIET_SCANS: usize = 3;
+    /// ...spaced this far apart.
+    const QUIET_SPACING: std::time::Duration = std::time::Duration::from_millis(10);
     /// Teardown gives up (and reports survivors) after this long.
     const TEARDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
-    /// The non-member cache is cleared beyond this many entries.
+    /// The unsandboxed cache is cleared beyond this many entries.
     const MAX_CACHED: usize = 1 << 16;
 
     pub(crate) fn new() -> Option<Self> {
-        use std::os::unix::ffi::OsStrExt;
-
         let sentinel = tempfile::Builder::new()
-            .prefix("magicrun-jail-member-")
+            .prefix(MEMBER_SENTINEL_PREFIX)
             .tempdir()
             .ok()?;
+        // SAFETY: `geteuid`/`getpid` have no preconditions and cannot fail.
+        let (uid, pid) = unsafe { (libc::geteuid(), libc::getpid()) };
+        let Probe::Ours((_, started)) = probe(uid, pid) else {
+            return None;
+        };
+        fs::write(sentinel.path().join(MEMBER_SENTINEL_OWNER), format!("{pid} {started}\n")).ok()?;
         let path = fs::canonicalize(sentinel.path()).ok()?;
+        let mut members = Self::for_sentinel(path)?;
+        members.sentinel = std::sync::Mutex::new(Some(sentinel));
+        Some(members)
+    }
+
+    /// A checker for an existing sentinel it does not own.
+    fn for_sentinel(path: PathBuf) -> Option<Self> {
+        use std::os::unix::ffi::OsStrExt;
+
         let parent = path.parent()?;
         Some(Self {
             inside: std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?,
             outside: std::ffi::CString::new(parent.as_os_str().as_bytes()).ok()?,
             sentinel_path: path,
-            sentinel: std::sync::Mutex::new(Some(sentinel)),
+            sentinel: std::sync::Mutex::new(None),
             // SAFETY: `geteuid` has no preconditions and cannot fail.
             uid: unsafe { libc::geteuid() },
             state: std::sync::Mutex::new(MemberState::default()),
@@ -680,44 +865,32 @@ impl MacosJailMembers {
         self.state.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn facts(&self, pid: libc::pid_t) -> Option<ProcessFacts> {
-        const SZOMB: u32 = 5;
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        // SAFETY: PROC_PIDTBSDINFO writes at most `size` bytes into `info`.
-        let written = unsafe {
-            libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size)
-        };
-        if written != size {
-            return None;
-        }
-        // SAFETY: the kernel filled the whole structure.
-        let info = unsafe { info.assume_init() };
-        if info.pbi_uid != self.uid || info.pbi_status == SZOMB {
-            return None;
-        }
-        Some(ProcessFacts {
-            key: (pid, info.pbi_start_tvsec.saturating_mul(1_000_000).saturating_add(info.pbi_start_tvusec)),
-        })
-    }
-
-    fn in_sandbox(&self, pid: libc::pid_t) -> bool {
+    fn membership(&self, pid: libc::pid_t) -> Membership {
         use sandbox_ffi::*;
 
         // SAFETY: `sandbox_check` reads the NUL-terminated operation and
         // path (live `CString`s) and the pid; it writes nothing of ours.
         unsafe {
+            match sandbox_check(pid, std::ptr::null(), SANDBOX_FILTER_NONE) {
+                0 => return Membership::Unsandboxed,
+                1 => {},
+                _ => return Membership::Unknown,
+            }
             let flags = SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT;
             let operation = c"file-read-data".as_ptr();
-            sandbox_check(pid, std::ptr::null(), SANDBOX_FILTER_NONE) == 1
-                && sandbox_check(pid, operation, flags, self.inside.as_ptr()) == 0
-                && sandbox_check(pid, operation, flags, self.outside.as_ptr()) == 1
+            let inside = sandbox_check(pid, operation, flags, self.inside.as_ptr());
+            let outside = sandbox_check(pid, operation, flags, self.outside.as_ptr());
+            match (inside, outside) {
+                (0, 1) => Membership::Member,
+                (-1, _) | (_, -1) => Membership::Unknown,
+                _ => Membership::OtherSandbox,
+            }
         }
     }
 
-    /// Whether `pid` is a live member now with the same identity as `key`.
+    /// Whether `key` is still that live process and a member.
     fn still_member(&self, key: ProcessKey) -> bool {
-        self.facts(key.0).is_some_and(|facts| facts.key == key) && self.in_sandbox(key.0)
+        probe(self.uid, key.0) == Probe::Ours(key) && self.membership(key.0) == Membership::Member
     }
 
     fn all_pids() -> Option<Vec<libc::pid_t>> {
@@ -733,65 +906,89 @@ impl MacosJailMembers {
         Some(pids)
     }
 
-    /// One scan. Known non-members are skipped by identity, so a scan
-    /// checks only processes it has not seen before. With `stop`, each
-    /// member is sent SIGSTOP the moment it is found, so it can neither
-    /// fork nor exit before it is killed. `leader` is never cached: it is
-    /// the one process that joins the sandbox after it starts.
-    fn scan(&self, leader: Option<libc::pid_t>, stop: bool) -> Option<Vec<ProcessKey>> {
+    /// One scan. Unseen pids are examined first, right after the listing: a
+    /// fork-and-exit chain keeps only a short-lived member alive at a time.
+    /// Stopping modes send SIGSTOP to each member the moment it is found, so
+    /// it can neither fork nor exit before it is killed. `leader` is never
+    /// cached: it is the one process that joins the sandbox after it starts.
+    fn scan(&self, leader: Option<libc::pid_t>, mode: ScanMode) -> Option<ScanResult> {
         let pids = Self::all_pids()?;
         let mut state = self.state();
-        if state.non_members.len() > Self::MAX_CACHED {
-            state.non_members.clear();
+        if state.unsandboxed.len() > Self::MAX_CACHED {
+            state.unsandboxed.clear();
             state.known_pids.clear();
         }
-        // Unseen pids first, right after the listing: a fork-and-exit chain
-        // keeps only a short-lived member alive at a time, and each scan
-        // must reach it before it forks again. Known pids are still
-        // re-examined after, by identity, in case a pid was reused.
         let (fresh, known): (Vec<_>, Vec<_>) = pids
             .into_iter()
             .filter(|pid| *pid > 1)
             .partition(|pid| !state.known_pids.contains(pid));
-        let mut members = Vec::new();
+        let mut result = ScanResult {
+            members: Vec::new(),
+            uncertain: false,
+        };
         for pid in fresh.into_iter().chain(known) {
-            let Some(facts) = self.facts(pid) else {
-                continue;
+            let key = match probe(self.uid, pid) {
+                Probe::Ours(key) => key,
+                Probe::NotOurs => continue,
+                Probe::Unknown => {
+                    result.uncertain = true;
+                    continue;
+                },
             };
-            if state.non_members.contains(&facts.key) {
+            if mode != ScanMode::Confirm && state.unsandboxed.contains(&key) {
                 continue;
             }
-            if self.in_sandbox(pid) {
-                if stop {
-                    // SAFETY: a signal to a same-user process just proven
-                    // a member; SIGSTOP cannot be caught.
-                    unsafe { libc::kill(pid, libc::SIGSTOP) };
-                }
-                members.push(facts.key);
-            } else if Some(pid) != leader {
-                state.non_members.insert(facts.key);
-                state.known_pids.insert(pid);
+            match self.membership(pid) {
+                Membership::Member => {
+                    if mode != ScanMode::Sample {
+                        // SAFETY: a signal to a same-user process just
+                        // proven a member; SIGSTOP cannot be caught.
+                        unsafe { libc::kill(pid, libc::SIGSTOP) };
+                    }
+                    result.members.push(key);
+                },
+                Membership::Unsandboxed if Some(pid) != leader => {
+                    state.unsandboxed.insert(key);
+                    state.known_pids.insert(pid);
+                },
+                Membership::Unsandboxed | Membership::OtherSandbox => {},
+                Membership::Unknown => result.uncertain = true,
             }
         }
-        Some(members)
+        Some(result)
     }
 
-    /// Whether the leader, if it is still a live non-zombie process, is
-    /// recognized as a member. `None` when it is gone. The watchdog fails
-    /// closed on `Some(false)`: `sandbox_check` would otherwise fail open.
+    /// Whether the leader is recognized as a member. `None` while that
+    /// cannot be decided: the leader is gone, `sandbox_check` failed, or it
+    /// is still `sandbox-exec` itself, before the profile applies and the
+    /// program is exec'd. The watchdog fails closed on `Some(false)`:
+    /// `sandbox_check` would otherwise fail open.
     pub(crate) fn recognizes_leader(&self, leader: libc::pid_t) -> Option<bool> {
-        self.facts(leader)?;
-        Some(self.in_sandbox(leader))
+        let mut path = [0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        // SAFETY: `proc_pidpath` writes at most the given size into `path`.
+        let written = unsafe { libc::proc_pidpath(leader, path.as_mut_ptr().cast(), path.len() as u32) };
+        let written = usize::try_from(written).ok().filter(|written| *written > 0)?;
+        if &path[..written] == b"/usr/bin/sandbox-exec" {
+            return None;
+        }
+        let Probe::Ours(_) = probe(self.uid, leader) else {
+            return None;
+        };
+        match self.membership(leader) {
+            Membership::Member => Some(true),
+            Membership::Unknown => None,
+            Membership::Unsandboxed | Membership::OtherSandbox => Some(false),
+        }
     }
 
     /// Live members (and the group members given) with their usage; CPU
     /// time accumulates per member identity across samples.
     pub(crate) fn usage(&self, leader: Option<libc::pid_t>, group: &[libc::pid_t]) -> Option<MacosMemberUsage> {
-        let mut keys = self.scan(leader, false)?;
+        let mut keys = self.scan(leader, ScanMode::Sample)?.members;
         for pid in group.iter().copied().filter(|pid| *pid > 0) {
-            if let Some(facts) = self.facts(pid) {
-                if !keys.contains(&facts.key) {
-                    keys.push(facts.key);
+            if let Probe::Ours(key) = probe(self.uid, pid) {
+                if !keys.contains(&key) {
+                    keys.push(key);
                 }
             }
         }
@@ -832,32 +1029,48 @@ impl MacosJailMembers {
         (usage.processes > 0).then_some(usage)
     }
 
-    /// Kill every member: scan, stopping each member as it is found, then
-    /// recheck each stopped member's identity and membership and SIGKILL
-    /// it; repeat until [`Self::QUIET_SCANS`] consecutive scans find none.
-    /// Returns `false`, and keeps the sentinel on disk, when that does not
-    /// happen within [`Self::TEARDOWN_BOUND`] or the process list cannot
-    /// be read: the caller must then fail the run closed.
+    /// Kill every member. Stopping scans (cached) repeat while they find
+    /// members; each stopped member's identity and membership is rechecked
+    /// and it is SIGKILLed. The end needs [`Self::QUIET_SCANS`] consecutive
+    /// confirmation scans, which ask every same-user process afresh, spaced
+    /// by [`Self::QUIET_SPACING`], that find no member and no process they
+    /// could not classify. Returns `false` (and keeps the sentinel on disk)
+    /// when that does not happen within [`Self::TEARDOWN_BOUND`] or the
+    /// process list cannot be read: the caller must then fail closed.
     pub(crate) fn kill_all(&self) -> bool {
+        self.kill_all_counted().0
+    }
+
+    fn kill_all_counted(&self) -> (bool, u64) {
         let deadline = std::time::Instant::now() + Self::TEARDOWN_BOUND;
         let mut quiet = 0_usize;
+        let mut killed = 0_u64;
         let clean = loop {
-            let Some(found) = self.scan(None, true) else {
+            let mode = if quiet == 0 { ScanMode::Stop } else { ScanMode::Confirm };
+            let Some(result) = self.scan(None, mode) else {
                 break false;
             };
-            if found.is_empty() {
-                quiet += 1;
-                if quiet >= Self::QUIET_SCANS {
-                    break true;
+            if result.members.is_empty() {
+                if result.uncertain {
+                    quiet = 1;
+                } else {
+                    quiet += 1;
+                    // The first empty stopping scan starts the count; the
+                    // rest are confirmation scans.
+                    if quiet > Self::QUIET_SCANS {
+                        break true;
+                    }
                 }
+                std::thread::sleep(Self::QUIET_SPACING);
             } else {
                 quiet = 0;
-                for key in found {
+                for key in result.members {
                     if self.still_member(key) {
                         // SAFETY: a stopped member whose identity was just
                         // rechecked; a stopped process cannot exit, so its
                         // pid cannot have been reused meanwhile.
                         unsafe { libc::kill(key.0, libc::SIGKILL) };
+                        killed += 1;
                     }
                 }
             }
@@ -868,12 +1081,87 @@ impl MacosJailMembers {
         if !clean {
             self.state().survived = true;
         }
-        clean
+        (clean, killed)
+    }
+
+    /// Tests: a checker keyed on any directory the jail's profile may read
+    /// and its parent may not (a root), to find a jail's processes after
+    /// the jail and its sentinel are gone.
+    #[cfg(test)]
+    pub(crate) fn for_directory(directory: PathBuf) -> Option<Self> {
+        Self::for_sentinel(directory)
+    }
+
+    /// Tests: every live member now, asking each same-user process afresh.
+    #[cfg(test)]
+    pub(crate) fn census(&self) -> Vec<libc::pid_t> {
+        Self::all_pids()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|pid| {
+                *pid > 1
+                    && matches!(probe(self.uid, *pid), Probe::Ours(_))
+                    && self.membership(*pid) == Membership::Member
+            })
+            .collect()
     }
 
     /// Whether any teardown reported survivors.
     pub(crate) fn survived(&self) -> bool {
         self.state().survived
+    }
+
+    fn sweep_stale() -> GovernedJailSweep {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut sweep = GovernedJailSweep::default();
+        let Ok(directory) = fs::canonicalize(std::env::temp_dir()) else {
+            return sweep;
+        };
+        let Ok(entries) = fs::read_dir(&directory) else {
+            return sweep;
+        };
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let named = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(MEMBER_SENTINEL_PREFIX));
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !named || !metadata.is_dir() || metadata.uid() != uid {
+                continue;
+            }
+            let owner = fs::read_to_string(path.join(MEMBER_SENTINEL_OWNER)).ok().and_then(|text| {
+                let mut parts = text.split_whitespace();
+                Some((parts.next()?.parse::<libc::pid_t>().ok()?, parts.next()?.parse::<u64>().ok()?))
+            });
+            let stale = match owner {
+                Some(owner) => probe(uid, owner.0) != Probe::Ours(owner),
+                None => metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > STALE_SENTINEL_WITHOUT_OWNER),
+            };
+            if !stale {
+                continue;
+            }
+            let Some(members) = Self::for_sentinel(path.clone()) else {
+                continue;
+            };
+            let (clean, killed) = members.kill_all_counted();
+            sweep.members_killed += killed;
+            if clean && fs::remove_dir_all(&path).is_ok() {
+                sweep.sentinels_removed += 1;
+            } else {
+                sweep.sentinels_kept += 1;
+            }
+        }
+        sweep
     }
 }
 
@@ -881,8 +1169,8 @@ impl MacosJailMembers {
 impl Drop for MacosJailMembers {
     fn drop(&mut self) {
         if self.survived() {
-            // Keep membership decidable: survivors are still recognizable
-            // by the sentinel as long as it exists.
+            // Keep membership decidable: survivors stay recognizable by the
+            // sentinel, and `sweep_stale_jail_members` can finish the job.
             if let Some(sentinel) = self.sentinel.lock().unwrap_or_else(|poison| poison.into_inner()).take() {
                 let _ = sentinel.keep();
             }

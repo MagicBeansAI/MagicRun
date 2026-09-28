@@ -493,7 +493,11 @@ holds `var/` (user-owned Postgres, MySQL and Redis data) and `etc/`. The
 jail cannot know what a directory holds; the consumer must assert it, and
 should pass its data root and sensitive home directories to
 `GovernedJailExecRoots::new_with_forbidden`, which refuses a root equal to,
-containing or inside any of them. On a standard Homebrew install a keg is
+containing or inside any of them (a forbidden path not created yet is
+compared through its longest existing ancestor, canonicalized). A root must
+not contain directories others can write: only the root, its ancestors and
+the `PATH` entries (and every directory between an entry and its root) are
+checked, the rest of the tree is not walked. On a standard Homebrew install a keg is
 not usable alone (`node` links libraries from other kegs through `opt/`, and
 `Cellar/` and `opt/` are `admin`-group-writable, so they fail the trust
 checks); the prefix is then a root only with `var` and `etc` excluded.
@@ -521,7 +525,9 @@ flowchart LR
   a single link (a bounded walk of at most 4096 entries), since a hard link
   elsewhere in a root would reach the same bytes around the path rule.
   `PATH` entries lie inside a root outside its exclusions and contain no
-  `:`. `with_exec_roots` refuses a root that overlaps the jail's workdir and
+  `:`; each entry and every directory between it and its root must be owned
+  by root or this user and not group/other-writable, so nobody else can
+  plant a program the run finds by name. `with_exec_roots` refuses a root that overlaps the jail's workdir and
   a workdir that already holds staged inputs. Violations are
   `GovernedProcessJailErrorCode::InvalidExecRoots`; at launch they are
   `GovernedBatchProcessErrorCode::ExecRootsRefused` (not dispatched).
@@ -549,7 +555,9 @@ flowchart LR
   would skip `site`, so a skill could not import the packages beside it.
   `-s` (no user site) and `-B` (no bytecode) remain, and the environment
   overlay sets `PYTHONNOUSERSITE=1` and `PYTHONDONTWRITEBYTECODE=1` so every
-  Python the run starts (a venv `python`, `yt-dlp`'s) behaves the same. The
+  Python the run starts (a venv `python`, `yt-dlp`'s) behaves the same, and
+  `OPENSSL_CONF=/dev/null` so OpenSSL (Python's `ssl`, Node, `curl`) reads no
+  configuration, which could load engines or providers. The
   user site would be under `HOME`, the writable workdir. Manifest validation
   still refuses `PYTHONPATH` and `PYTHONHOME`, so the environment stays the
   consumer's; a package inside a root is imported from the script's own
@@ -562,7 +570,8 @@ flowchart LR
   land in the workdir. Manifest validation additionally refuses
   `PYTHONSTARTUP`, `PYTHONINSPECT`, `PYTHONBREAKPOINT`, `PYTHONUSERBASE`,
   `PYTHONWARNINGS`, `NODE_PATH`, `NPM_CONFIG_*`, `JAVA_TOOL_OPTIONS`,
-  `LUA_INIT*`, `RUBYLIB`, `PERLLIB`, `GIT_SSH_COMMAND` and `GIT_EXEC_PATH`
+  `LUA_INIT*`, `RUBYLIB`, `PERLLIB`, `GIT_SSH_COMMAND`, `GIT_EXEC_PATH`,
+  `OPENSSL_CONF`, `OPENSSL_ENGINES` and `OPENSSL_MODULES`
   (with the existing `PYTHONPATH`, `NODE_OPTIONS`, `RUBYOPT`, `PERL5*`,
   `BASH_ENV` and `ENV`) as fixed values and as injection targets.
 - **`PATH`.** The child's `PATH` is the declared entries followed by
@@ -612,19 +621,33 @@ flowchart LR
     and start time) across samples, so members that exited since still
     count; it is sampled every 200 ms, so a member that lives between two
     samples is missed (its own `RLIMIT_CPU` and the wall ceiling still
-    bound it). A leader that is alive but not recognized as a member means
-    `sandbox_check` stopped working: the watchdog then fails closed
-    (`JailUnavailable`, effect uncertain) instead of failing open.
+    bound it). A leader that is alive, has exec'd past `sandbox-exec`, and
+    is not recognized as a member means `sandbox_check` stopped working: the
+    watchdog then fails closed (`JailUnavailable`, effect uncertain) instead
+    of failing open. While the leader is still `sandbox-exec` (the profile
+    not yet applied) nothing is concluded.
   - *Teardown* (when the leader exits, on every terminal path, and once more
     after the run): scan all pids, examining unseen pids first right after
-    the listing and skipping known non-members by identity, and SIGSTOP each
-    member the moment it is found, so it can neither fork nor exit; then
-    recheck each stopped member's identity and membership and SIGKILL it.
-    Repeat until three consecutive scans find no member. A fork-and-exit
+    the listing, and SIGSTOP each member the moment it is found, so it can
+    neither fork nor exit; then recheck each stopped member's identity and
+    membership and SIGKILL it. The only negative answer ever cached is
+    "unsandboxed" for a process that is not the leader (only the leader
+    joins a sandbox after it starts); an exec keeps pid and start time, so
+    a cached answer about a member would hide it for good. The run ends
+    only after three consecutive confirmation scans, 10 ms apart, which ask
+    every same-user process afresh, find no member and no process they
+    could not classify (`proc_pidinfo` failing other than with `EPERM`,
+    another user's, or `ESRCH`, gone; or `sandbox_check` failing). A fork-and-exit
     chain in its own session is caught this way (a test runs one). If that
     does not happen within 3 s, or the process list cannot be read, the run
     fails closed with `GovernedBatchProcessErrorCode::JailTeardownIncomplete`
-    (effect uncertain), never `Success`.
+    (effect uncertain), never `Success`, and the sentinel stays on disk.
+  - *Stale sentinels.* A sentinel records its owning host process (pid and
+    start time). `sweep_stale_jail_members()` finds `magicrun-jail-member-*`
+    sentinels of this user in the temp directory whose owner is gone (or,
+    without an owner record, older than 10 minutes), kills their members,
+    removes them and returns `GovernedJailSweep` counts; consumers call it
+    at startup and, if wanted, periodically. On Linux it returns zeros.
   - *In-sandbox reaper, evaluated and not used.* A process inside the same
     sandbox looping `kill(-1, SIGKILL)` would reach only same-sandbox
     processes, but it has to be a member of the jail's own tree, and any

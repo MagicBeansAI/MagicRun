@@ -1735,6 +1735,9 @@ fn is_interpreter_injection_environment_name(upper: &str) -> bool {
             | "GIT_EXEC_PATH"
             | "BASH_ENV"
             | "ENV"
+            | "OPENSSL_CONF"
+            | "OPENSSL_ENGINES"
+            | "OPENSSL_MODULES"
     ) || upper.starts_with("NPM_CONFIG_")
         || upper.starts_with("LUA_INIT")
 }
@@ -2888,6 +2891,9 @@ mod tests {
             "GIT_EXEC_PATH",
             "BASH_ENV",
             "ENV",
+            "OPENSSL_CONF",
+            "OPENSSL_ENGINES",
+            "OPENSSL_MODULES",
         ] {
             let mut contract = cli_contract("provider-cli");
             contract.requires.environment = BTreeMap::from([(name.to_owned(), "x".to_owned())]);
