@@ -1212,12 +1212,14 @@ fn validate_runtime_parameter(
             max_item_bytes,
             ..
         } => value.as_array().is_some_and(|values| {
+            let (minimum, maximum, item_bytes) =
+                string_array_bounds(*min_items, *max_items, *max_item_bytes);
             let count = values.len() as u64;
-            count >= min_items.unwrap_or(0)
-                && count <= max_items.unwrap_or(MAX_FIXED_ARGUMENTS as u64)
+            count >= minimum
+                && count <= maximum
                 && values.iter().all(|value| {
                     value.as_str().is_some_and(|value| {
-                        value.len() <= max_item_bytes.unwrap_or(MAX_ARGUMENT_BYTES as u64) as usize
+                        value.len() <= item_bytes as usize
                             && !value.chars().any(char::is_control)
                     })
                 })
@@ -2003,9 +2005,8 @@ fn compile_parameter(
             max_item_bytes,
             ..
         } => {
-            let minimum = min_items.unwrap_or(0);
-            let maximum = max_items.unwrap_or(MAX_FIXED_ARGUMENTS as u64);
-            let item_bytes = max_item_bytes.unwrap_or(MAX_ARGUMENT_BYTES as u64);
+            let (minimum, maximum, item_bytes) =
+                string_array_bounds(*min_items, *max_items, *max_item_bytes);
             if minimum > maximum
                 || maximum > MAX_FIXED_ARGUMENTS as u64
                 || item_bytes == 0
@@ -2118,6 +2119,29 @@ fn validate_bounded_string(
         return Err(invalid_parameter_constraints());
     }
     Ok(())
+}
+
+/// Effective `(min_items, max_items, max_item_bytes)` of a string array.
+///
+/// An omitted bound is derived from the declared one so the pair fits the
+/// combined argument budget. The independent ceilings alone (128 items of
+/// 4 KiB) multiply to 512 KiB, eight times `MAX_FIXED_ARGUMENT_BYTES`, so a
+/// string array declared without bounds failed its own defaults and the whole
+/// skill was rejected. Every declaration that compiled before resolves to the
+/// same bounds; explicit bounds are returned unchanged and still validated.
+fn string_array_bounds(
+    min_items: Option<u64>,
+    max_items: Option<u64>,
+    max_item_bytes: Option<u64>,
+) -> (u64, u64, u64) {
+    let combined = MAX_FIXED_ARGUMENT_BYTES as u64;
+    let maximum = max_items.unwrap_or_else(|| {
+        let per_item = max_item_bytes.filter(|bytes| *bytes > 0).unwrap_or(1);
+        (MAX_FIXED_ARGUMENTS as u64).min(combined / per_item)
+    });
+    let item_bytes = max_item_bytes
+        .unwrap_or_else(|| (MAX_ARGUMENT_BYTES as u64).min(combined / maximum.max(1)));
+    (min_items.unwrap_or(0), maximum, item_bytes)
 }
 
 const fn invalid_parameter_constraints() -> ActionOverrideError {
@@ -2802,6 +2826,121 @@ actions:
         assert_eq!(
             catalog.actions["run"].definition.input_schema["required"],
             serde_json::json!(["args"])
+        );
+    }
+
+    /// A string array declared without bounds used to default to 128 items of
+    /// 4 KiB — 512 KiB against a 64 KiB combined budget — so the declaration
+    /// failed its own defaults and the whole skill was rejected at load.
+    #[test]
+    fn an_unbounded_string_array_derives_bounds_that_fit_the_combined_budget() {
+        let mut run = action("Run argv.");
+        run.parameters.insert(
+            "args".to_owned(),
+            TypedActionParameter::StringArray {
+                description: "Argv tokens.".to_owned(),
+                required: true,
+                min_items: None,
+                max_items: None,
+                max_item_bytes: None,
+            },
+        );
+        run.mappings.push(TypedArgumentMapping::Passthrough {
+            parameter: "args".to_owned(),
+        });
+        let catalog = compile("demo", &cli_contract("demo"), &override_set("run", run))
+            .expect("an unbounded string array must compile");
+        let action = &catalog.actions["run"];
+        let schema = &action.definition.input_schema["properties"]["args"];
+        assert_eq!(schema["maxItems"], serde_json::json!(MAX_FIXED_ARGUMENTS));
+        assert_eq!(
+            schema["items"]["maxLength"],
+            serde_json::json!(MAX_FIXED_ARGUMENT_BYTES / MAX_FIXED_ARGUMENTS)
+        );
+        assert_eq!(
+            schema["x-max-combined-utf8-bytes"],
+            serde_json::json!(MAX_FIXED_ARGUMENT_BYTES)
+        );
+
+        lower_typed_action_invocation(action, &serde_json::json!({"args": ["status", "--json"]}))
+            .expect("arguments within the derived bounds lower");
+        let item_ceiling = MAX_FIXED_ARGUMENT_BYTES / MAX_FIXED_ARGUMENTS;
+        let error = lower_typed_action_invocation(
+            action,
+            &serde_json::json!({"args": ["x".repeat(item_ceiling + 1)]}),
+        )
+        .expect_err("the derived item bound is enforced at runtime");
+        assert_eq!(error.code, TypedActionInvocationErrorCode::InvalidParameter);
+    }
+
+    #[test]
+    fn a_partly_bounded_string_array_keeps_its_declared_bound() {
+        for (max_items, max_item_bytes, expected_items, expected_item_bytes) in [
+            (Some(16), None, 16, MAX_ARGUMENT_BYTES),
+            (None, Some(512), MAX_FIXED_ARGUMENTS, 512),
+            (None, Some(2_048), MAX_FIXED_ARGUMENT_BYTES / 2_048, 2_048),
+        ] {
+            let mut run = action("Run argv.");
+            run.parameters.insert(
+                "args".to_owned(),
+                TypedActionParameter::StringArray {
+                    description: "Argv tokens.".to_owned(),
+                    required: true,
+                    min_items: None,
+                    max_items,
+                    max_item_bytes,
+                },
+            );
+            run.mappings.push(TypedArgumentMapping::Passthrough {
+                parameter: "args".to_owned(),
+            });
+            let catalog = compile("demo", &cli_contract("demo"), &override_set("run", run))
+                .expect("a partly bounded string array must compile");
+            let schema = &catalog.actions["run"].definition.input_schema["properties"]["args"];
+            assert_eq!(schema["maxItems"], serde_json::json!(expected_items));
+            assert_eq!(
+                schema["items"]["maxLength"],
+                serde_json::json!(expected_item_bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unbounded_string_array_compiles_under_canonical_json_delivery() {
+        let mut contract = cli_contract("protocol-adapter");
+        let RuntimeProtocol::Cli { stdin, limits, .. } = &mut contract.runtime else {
+            unreachable!();
+        };
+        stdin.mode = StdinMode::Required;
+        stdin.sensitivity = DataSensitivity::Private;
+        limits.stdin_bytes = Some(1_048_576);
+
+        let mut run = action("Exchange items in an order.");
+        run.parameters.insert(
+            "item_ids".to_owned(),
+            TypedActionParameter::StringArray {
+                description: "The item ids to exchange.".to_owned(),
+                required: true,
+                min_items: None,
+                max_items: None,
+                max_item_bytes: None,
+            },
+        );
+        let overrides = TypedActionOverrideSet {
+            schema_version: TYPED_ACTION_OVERRIDES_V2.to_owned(),
+            input_delivery: TypedActionInputDelivery::CanonicalJsonStdin,
+            actions: BTreeMap::from([("run".to_owned(), run)]),
+        };
+        let catalog = compile("protocol-adapter", &contract, &overrides)
+            .expect("an unbounded string array must compile on canonical JSON stdin");
+        let lowered = lower_typed_action_invocation(
+            &catalog.actions["run"],
+            &serde_json::json!({"item_ids": ["1008292230", "1008292230"]}),
+        )
+        .expect("lower canonical JSON array");
+        assert_eq!(
+            lowered.stdin.as_deref(),
+            Some(r#"{"item_ids":["1008292230","1008292230"]}"#)
         );
     }
 
