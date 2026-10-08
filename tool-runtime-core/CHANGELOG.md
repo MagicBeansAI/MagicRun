@@ -8,7 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ---
 ## [Unreleased]
 
-_Current development version: `0.1.81`._
+_Current development version: `0.1.82`._
+
+### Unbounded string-array parameters (`0.1.82`)
+
+- **Fix:** a typed-action `string_array` declared without `max_items` /
+  `max_item_bytes` no longer fails its own defaults (128 × 4 KiB against the
+  64 KiB combined argument budget) and drops the skill at load. An omitted
+  bound is derived from the declared one so the pair fits the budget (both
+  omitted: 128 × 512 B). Schema emission and runtime validation share
+  `string_array_bounds`. Previously valid declarations resolve to identical
+  bounds; explicit bounds are unchanged.
 
 ### Declared exec roots (`0.1.81`)
 

@@ -1,16 +1,16 @@
 {
   "schema_version": 1,
   "project": "MagicRun",
-  "architecture_version": "0.1.81",
+  "architecture_version": "0.1.82",
   "document": "docs/architecture.md",
-  "document_sha256": "3e1e55914e01f01ff3f2b99147506795a7b6ab36430310182936df9ed34fbe5d",
+  "document_sha256": "15fb6405aa5bbfd174e9f53f341a14e2dfdabefaa89b17e7ea1a38f065771b57",
   "component_versions": {
-    "tool-runtime-core": "0.1.81"
+    "tool-runtime-core": "0.1.82"
   },
   "source_sha256": {
     "Cargo.toml": "42097db7277fb53f8c0536875c35f007c8e88083e6b1062b78f6f6599f6a2bb0",
-    "tool-runtime-core/Cargo.toml": "5a678fb662daf5f0fc054a38ffbbf97152fc5a45ee2111a4832fb0ae424a5ab4",
-    "tool-runtime-core/src/action_overrides.rs": "14dfb943e95be143acef5db15af4be31e4621dad9f78346f5c23421904c526e1",
+    "tool-runtime-core/Cargo.toml": "e6fde018c05ee653b6eca8be7b263dc78f996a864f1dbe34a33416f4ebfb6cf4",
+    "tool-runtime-core/src/action_overrides.rs": "bf054e8eb19ccee25f00ac699faf6f2e49e2c80b4e67977666ea6673894da63b",
     "tool-runtime-core/src/bin/magicrun-jail-egress-forwarder.rs": "0001802efdac75b367b3d98145870b2b1dce990cc65e60b468af31c3f06df311",
     "tool-runtime-core/src/bin/tool-runtime-classification.rs": "0e8d63cb63deea58890f7b30b61b1e9f6229598146dee00c1b4db9266083d858",
     "tool-runtime-core/src/bin/tool-runtime-inventory.rs": "db774e641239bc03fd4ec2d51dfd345a0baebaad6bb6204c72260d9871fb690c",

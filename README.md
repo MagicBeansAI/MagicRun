@@ -2,7 +2,7 @@
   <h1>MagicRun</h1>
   <p><strong>Give agents tools. Keep execution under your control.</strong></p>
   <p>
-    <a href="tool-runtime-core/CHANGELOG.md"><img src="https://img.shields.io/badge/source-v0.1.81-7C3AED.svg" alt="Source version 0.1.81" /></a>
+    <a href="tool-runtime-core/CHANGELOG.md"><img src="https://img.shields.io/badge/source-v0.1.82-7C3AED.svg" alt="Source version 0.1.82" /></a>
     <a href="#build-on-magicrun"><img src="https://img.shields.io/badge/interface-Rust%20library-lightgrey.svg" alt="Interface: Rust library" /></a>
     <a href="#rust-toolchain"><img src="https://img.shields.io/badge/Rust-2021%20edition-orange.svg" alt="Rust language edition 2021" /></a>
     <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="MIT or Apache-2.0 license" /></a>
