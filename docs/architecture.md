@@ -1,6 +1,6 @@
 # MagicRun architecture
 
-Architecture version: `0.1.81`
+Architecture version: `0.1.82`
 
 Original immutable baseline tag: `architecture/v0.1.73`. The current reviewed
 source/document fingerprints are in [architecture-baseline.json](architecture-baseline.json).
@@ -681,6 +681,20 @@ flowchart LR
   executable on macOS. macOS teardown relies on a private API and a bounded
   scan; it fails the run closed rather than report a survivor as success.
 
+## Unbounded string-array parameters (`0.1.82`)
+
+A typed-action `string_array` parameter declared without `max_items` or
+`max_item_bytes` used to default to the independent ceilings — 128 items of
+4 KiB, 512 KiB — and then fail its own combined check against
+`MAX_FIXED_ARGUMENT_BYTES` (64 KiB), so the whole skill was refused at load.
+`string_array_bounds` now derives an omitted bound from the declared one so the
+pair fits the combined budget (both omitted: 128 × 512 B). Compile-time schema
+emission and runtime argument validation share that one helper. Every
+declaration that compiled before resolves to identical bounds, and explicit
+bounds are returned unchanged and still validated; only previously refused
+declarations change. No public type, manifest field, process or wire contract
+moves.
+
 ## Declared login prompts
 
 `0.1.75` lets a skill's `auth.lifecycle.login_prompts` name the prompts its
@@ -844,7 +858,7 @@ fail-fast qualification evidence.
 ### Baseline review
 
 [architecture-baseline.json](architecture-baseline.json) binds this document to
-package `tool-runtime-core 0.1.81`, workspace/package manifests and production
+package `tool-runtime-core 0.1.82`, workspace/package manifests and production
 `src/` fingerprints. The local, ignored Cargo lockfile is not a published
 library architecture input. Dependency declarations still participate through
 the manifest fingerprints.
